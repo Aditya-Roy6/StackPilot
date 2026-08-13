@@ -1,10 +1,15 @@
 # StackPilot backend image.
-# The Drogon base image keeps the C++ framework and runtime ABI aligned.
-FROM drogonframework/drogon:latest
+#
+# Two-stage build. The Drogon base image (1.42GB) carries the full C++ toolchain
+# and is only needed to compile; shipping it as the runtime made the final image
+# 1.86GB. Drogon and Trantor link statically into the binary, so the runtime
+# stage needs just the binary, a handful of shared libraries, and the CLIs the
+# service actually shells out to.
 
-LABEL org.opencontainers.image.title="StackPilot Backend" \
-      org.opencontainers.image.description="C++ Drogon API, build worker, Kubernetes runtime controller, and MCP backend APIs for StackPilot." \
-      org.opencontainers.image.vendor="StackPilot"
+# ---------------------------------------------------------------------------
+# Stage 1 — build
+# ---------------------------------------------------------------------------
+FROM drogonframework/drogon:latest AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG STACKPILOT_BACKEND_BUILD_PARALLELISM=auto
@@ -16,15 +21,90 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     pkg-config \
     libjsoncpp-dev \
-    git \
-    redis-tools \
-    curl \
-    ca-certificates \
-    gnupg \
-    openssh-client \
-    tar \
-    gzip \
-    sshpass \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# `auto` used to mean `--parallel` with no limit, i.e. one compile job per core.
+# Each Drogon translation unit can peak near 1.5 GB, so on an 8-core / 8 GB Docker
+# VM that reliably OOM-killed the build. Derive a job count from BOTH cores and
+# available memory, leave a core free so the host stays responsive, and cap it so
+# a big machine doesn't spike memory either.
+RUN cmake -B build -S . && \
+    if [ "$STACKPILOT_BACKEND_BUILD_PARALLELISM" = "auto" ]; then \
+        cores="$(nproc)"; \
+        mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"; \
+        mem_jobs="$((mem_kb / 1572864))"; \
+        if [ "$mem_jobs" -lt 1 ]; then mem_jobs=1; fi; \
+        if [ "$cores" -gt 1 ]; then cpu_jobs="$((cores - 1))"; else cpu_jobs=1; fi; \
+        jobs="$cpu_jobs"; \
+        if [ "$mem_jobs" -lt "$jobs" ]; then jobs="$mem_jobs"; fi; \
+        if [ "$jobs" -gt 4 ]; then jobs=4; fi; \
+        echo "Backend build: ${jobs} parallel job(s) (cores=${cores}, memory allows ${mem_jobs})"; \
+        cmake --build build --config Release --parallel "$jobs"; \
+    else \
+        cmake --build build --config Release --parallel "$STACKPILOT_BACKEND_BUILD_PARALLELISM"; \
+    fi
+
+# ---------------------------------------------------------------------------
+# Stage 2 — unit tests (not part of the runtime image)
+# ---------------------------------------------------------------------------
+# Reuses the builder so the toolchain and dependencies are already present and
+# already cached. Placed before the runtime stage on purpose: Docker treats the
+# LAST stage as the default build target, and the default must stay `runtime`.
+#
+#   docker build --target unit-tests -t stackpilot-unit-tests .
+#   docker run --rm stackpilot-unit-tests
+FROM builder AS unit-tests
+
+RUN cmake -B build-tests -S . -DSTACKPILOT_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug && \
+    cmake --build build-tests --target stackpilot_unit_tests --parallel 2
+
+# No JWT_SECRET here on purpose: the JWT tests set their own throwaway key in
+# a fixture, so the image carries nothing that looks like a credential.
+CMD ["/app/build-tests/stackpilot_unit_tests"]
+
+# ---------------------------------------------------------------------------
+# Stage 3 — runtime
+# ---------------------------------------------------------------------------
+# Must match the builder's distro (Ubuntu 22.04) so the copied binary's glibc
+# and library sonames resolve.
+FROM ubuntu:22.04 AS runtime
+
+LABEL org.opencontainers.image.title="StackPilot Backend" \
+      org.opencontainers.image.description="C++ Drogon API, build worker, Kubernetes runtime controller, and MCP backend APIs for StackPilot." \
+      org.opencontainers.image.vendor="StackPilot"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime shared libraries (from `ldd` on the built binary) plus the CLIs the
+# service shells out to: docker (141 call sites), kubectl (55), curl, git, ssh,
+# tar, sshpass and redis-cli.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      gnupg \
+      gzip \
+      libc-ares2 \
+      libcurl4 \
+      libfmt8 \
+      libhiredis0.14 \
+      libjsoncpp25 \
+      libmariadb3 \
+      libpq5 \
+      libpqxx-6.4 \
+      libspdlog1 \
+      libsqlite3-0 \
+      libssh-4 \
+      libssl3 \
+      libuuid1 \
+      openssh-client \
+      redis-tools \
+      sshpass \
+      tar \
+      zlib1g \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -32,24 +112,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     -o /usr/local/bin/kubectl \
     && chmod +x /usr/local/bin/kubectl
 
+# Run as an unprivileged user instead of root. Note this does NOT neutralise the
+# mounted docker socket — see docker-compose.yml, where group_add grants access to
+# it. Dropping root still removes the ability to write system paths, install
+# packages, or use root-only capabilities.
+RUN groupadd --gid 10001 stackpilot \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin stackpilot
+
 WORKDIR /app
 
-COPY . .
+COPY --from=builder --chown=10001:10001 /app/build/stackpilot-platform ./build/stackpilot-platform
+COPY --from=builder --chown=10001:10001 /app/sql ./sql
+COPY --from=builder --chown=10001:10001 /app/config.json ./config.json
 
-RUN cmake -B build -S . && \
-    if [ "$STACKPILOT_BACKEND_BUILD_PARALLELISM" = "auto" ]; then \
-        cmake --build build --config Release --parallel; \
-    else \
-        cmake --build build --config Release --parallel "$STACKPILOT_BACKEND_BUILD_PARALLELISM"; \
-    fi
+# `static` is an intentionally empty document_root. Drogon serves unmatched
+# paths from it, so it must NOT be /app — that exposed uploads/builds (cloned
+# user repositories) and the source tree to unauthenticated GETs.
+RUN mkdir -p logs uploads/builds uploads/source-artifacts static \
+    && chown -R 10001:10001 /app
 
-RUN mkdir -p logs uploads/builds uploads/source-artifacts
+USER 10001:10001
 
 EXPOSE 8090
 

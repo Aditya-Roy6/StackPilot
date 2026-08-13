@@ -5,8 +5,15 @@ on:
     branches: ["main", "master"]
   pull_request:
 
+# A new push to the same branch supersedes the run in flight. The integration
+# job boots the whole stack, so overlapping runs are expensive and pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   frontend:
+    name: Frontend — lint, unit, build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -20,11 +27,96 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
       - run: npm run lint
+      - run: npm test
       - run: npm run build
 
-  containers:
+  backend-unit:
+    name: Backend — C++ unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker compose config
-      - run: docker compose build backend frontend
+      - uses: docker/setup-buildx-action@v3
+      # The unit-tests stage builds on top of `builder`, so this warms the same
+      # layer cache the runtime image uses.
+      - name: Build unit test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: unit-tests
+          load: true
+          tags: stackpilot-unit-tests:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run unit tests
+        run: docker run --rm stackpilot-unit-tests:ci
+
+  config:
+    name: Compose config validity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate a throwaway .env
+        run: bash .github/scripts/write-ci-env.sh
+      # Catches the class of mistake where an env var lands in the wrong
+      # service block: `config` resolves the merged, interpolated result, so a
+      # variable defined under the wrong service shows up here and nowhere else.
+      - run: docker compose config --quiet
+      - run: docker compose -f docker-compose.prod.yml config --quiet
+
+  integration:
+    name: Integration — full stack
+    runs-on: ubuntu-latest
+    # 26 checks against a running stack: auth, SSRF guard, MCP scopes, secret
+    # confidentiality, migration ledger. Slowest job, so it does not gate the
+    # faster ones — they all run in parallel.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate a throwaway .env
+        run: bash .github/scripts/write-ci-env.sh
+
+      - name: Build and start the stack
+        # Only the services the suite exercises. Grafana, Loki, Prometheus and
+        # cAdvisor are validated by the config job and would otherwise add
+        # several minutes of pulls to every run.
+        run: docker compose up -d --build postgres redis backend ai-service frontend
+
+      - name: Wait for backend and ai-service
+        # Both must answer before the suite runs. Polling rather than a fixed
+        # sleep: an earlier local run reported the ai-service as broken purely
+        # because it was probed during its warmup.
+        run: |
+          wait_for() {
+            for attempt in $(seq 1 60); do
+              if curl -fsS "$2" >/dev/null 2>&1; then
+                echo "$1 healthy after ${attempt} attempt(s)"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "$1 never became healthy ($2)"
+            return 1
+          }
+          ok=0
+          wait_for backend    http://127.0.0.1:8090/api/v1/health || ok=1
+          wait_for ai-service http://127.0.0.1:8010/health        || ok=1
+          if [ "$ok" -ne 0 ]; then
+            docker compose ps
+            docker compose logs --tail=200
+            exit 1
+          fi
+
+      - name: Run integration suite
+        run: python tests/integration/test_platform.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail=400
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

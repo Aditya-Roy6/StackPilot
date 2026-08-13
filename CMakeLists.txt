@@ -57,3 +57,48 @@ configure_file(
     ${CMAKE_BINARY_DIR}/config.json
     COPYONLY
 )
+
+# ─── Unit Tests ─────────────────────────────────────────────────
+# Off by default so the production image build does not pay for it.
+# Enable with: cmake -DSTACKPILOT_BUILD_TESTS=ON
+option(STACKPILOT_BUILD_TESTS "Build the C++ unit test binary" OFF)
+
+if(STACKPILOT_BUILD_TESTS)
+    enable_testing()
+
+    file(GLOB UNIT_TEST_SOURCES "tests/unit/cpp/*_test.cpp")
+
+    # Link only the translation units under test. Pulling in the full source
+    # glob would drag every controller (and Drogon's static route registration)
+    # into a binary that never serves a request.
+    add_executable(stackpilot_unit_tests
+        ${UNIT_TEST_SOURCES}
+        tests/unit/cpp/main.cpp
+        src/utils/JwtHelper.cpp
+        src/db/Database.cpp
+        src/services/ComposeKubernetesPlanner.cpp
+        src/utils/RuntimeRateLimiter.cpp
+    )
+
+    target_include_directories(stackpilot_unit_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${PQXX_INCLUDE_DIRS}
+        ${JSONCPP_INCLUDE_DIRS}
+    )
+
+    target_link_libraries(stackpilot_unit_tests PRIVATE
+        Drogon::Drogon
+        spdlog::spdlog
+        OpenSSL::Crypto
+        CURL::libcurl
+        ${PQXX_LIBRARIES}
+        ${JSONCPP_LIBRARIES}
+    )
+
+    target_link_directories(stackpilot_unit_tests PRIVATE
+        ${PQXX_LIBRARY_DIRS}
+        ${JSONCPP_LIBRARY_DIRS}
+    )
+
+    add_test(NAME unit COMMAND stackpilot_unit_tests)
+endif()

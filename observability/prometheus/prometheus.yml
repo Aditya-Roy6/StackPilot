@@ -5,6 +5,20 @@ global:
 scrape_configs:
   - job_name: stackpilot-backend
     metrics_path: /metrics
+    # ⚠️ If STACKPILOT_METRICS_BEARER_TOKEN is set, the backend requires
+    # `Authorization: Bearer <token>` on /metrics and this job will start
+    # returning 401 — metrics stop silently and the Grafana dashboard goes blank
+    # with no error anywhere except the Prometheus targets page.
+    #
+    # Prometheus does not expand environment variables in this file, so the token
+    # has to come from a file. When you set the token, also:
+    #   1. write it to ./observability/prometheus/metrics_token (gitignored)
+    #   2. mount it into the prometheus service at /etc/prometheus/metrics_token
+    #   3. uncomment the block below
+    #
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/metrics_token
     static_configs:
       - targets:
           - backend:8090

@@ -307,6 +307,7 @@ See [mcp-server/README.md](mcp-server/README.md) and [docs/mcp-ide-agents.md](do
 |-- ai-service/          FastAPI AI service
 |-- mcp-server/          MCP server for IDE agents
 |-- sql/migrations/      PostgreSQL schema migrations
+|-- tests/               Unit (C++) and integration suites
 |-- observability/       Prometheus, Grafana, Loki, and Promtail config
 |-- docs/                Documentation
 |-- scripts/             Setup and helper scripts
@@ -357,6 +358,31 @@ Clean stopped containers and unused images:
 
 ```bash
 docker system prune
+```
+
+## Tests
+
+Three suites. All of them run in CI on every push and pull request
+(`.github/workflows/ci.yml`); `tests/README.md` explains what each one guards
+against and why.
+
+C++ unit tests — pure functions, no database or event loop:
+
+```bash
+docker build --target unit-tests -t stackpilot-unit-tests . && docker run --rm stackpilot-unit-tests
+```
+
+Frontend unit tests — theme system, `cn()`, and a static scan for React Query
+cache-key collisions:
+
+```bash
+cd frontend && npm test
+```
+
+Integration suite — runs against a live stack, stdlib only, no `pip install`:
+
+```bash
+python tests/integration/test_platform.py
 ```
 
 ## Troubleshooting

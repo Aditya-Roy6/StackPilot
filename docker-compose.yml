@@ -47,6 +47,19 @@ services:
       retries: 5
       start_period: 5s
 
+  # The backend runs as uid 10001, but ./uploads is a host bind mount whose
+  # subdirectories were historically created by a root container. Fix ownership
+  # once, as root, before the backend starts — otherwise build workspaces fail
+  # with "Unable to prepare generated application build workspace".
+  uploads-init:
+    image: alpine:3
+    container_name: stackpilot-uploads-init
+    user: "0:0"
+    command: sh -c "mkdir -p /work/builds /work/source-artifacts && chown -R 10001:10001 /work && chmod -R u+rwX,g+rwX /work"
+    volumes:
+      - ./uploads:/work
+    restart: "no"
+
   backend:
     build:
       context: .
@@ -146,6 +159,7 @@ services:
       - KUBECONFIG=/root/.kube/config
       - STACKPILOT_AI_ENABLED=${STACKPILOT_AI_ENABLED:-true}
       - STACKPILOT_AI_SERVICE_URL=${STACKPILOT_AI_SERVICE_URL:-http://ai-service:8010}
+      - STACKPILOT_AI_SERVICE_TOKEN=${STACKPILOT_AI_SERVICE_TOKEN:-}
       - STACKPILOT_AI_PROVIDER=${STACKPILOT_AI_PROVIDER:-nvidia_nim}
       - STACKPILOT_AI_MODEL=${STACKPILOT_AI_MODEL:-}
       - STACKPILOT_AI_CONFIDENCE_THRESHOLD=${STACKPILOT_AI_CONFIDENCE_THRESHOLD:-0.72}
@@ -173,12 +187,20 @@ services:
       - "127.0.0.1:8090:8090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # The backend now runs as uid 10001 (see Dockerfile). The mounted docker
+    # socket is root:root mode 660 on Docker Desktop, with no `docker` group to
+    # join, so supplementary group 0 is required for the ~141 docker shell-outs.
+    # This grants socket access only — the process is still not uid 0.
+    group_add:
+      - "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./uploads:/app/uploads
       - ${STACKPILOT_LOCAL_PROJECTS_DIR:-./local-projects}:/app/local-projects:ro
       - ${USERPROFILE}/.kube/config:/root/.kube/config:ro
     depends_on:
+      uploads-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -200,6 +222,7 @@ services:
     restart: unless-stopped
     logging: *stackpilot-logging
     environment:
+      - STACKPILOT_AI_SERVICE_TOKEN=${STACKPILOT_AI_SERVICE_TOKEN:-}
       - STACKPILOT_AI_PROVIDER=${STACKPILOT_AI_PROVIDER:-nvidia_nim}
       - STACKPILOT_AI_MODEL=${STACKPILOT_AI_MODEL:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
@@ -211,7 +234,7 @@ services:
       - NVIDIA_NIM_ALLOWED_MODELS=${NVIDIA_NIM_ALLOWED_MODELS:-}
       - NVIDIA_NIM_DISCOVER_MODELS=${NVIDIA_NIM_DISCOVER_MODELS:-true}
       - NVIDIA_NIM_PROBE_MODELS=${NVIDIA_NIM_PROBE_MODELS:-true}
-      - NVIDIA_NIM_MODEL_PROBE_LIMIT=${NVIDIA_NIM_MODEL_PROBE_LIMIT:-100}
+      - NVIDIA_NIM_MODEL_PROBE_LIMIT=${NVIDIA_NIM_MODEL_PROBE_LIMIT:-25}
       - NVIDIA_NIM_EMBEDDING_MODEL=${NVIDIA_NIM_EMBEDDING_MODEL:-nvidia/llama-3.2-nv-embedqa-1b-v2}
       - OPENAI_COMPATIBLE_BASE_URL=${OPENAI_COMPATIBLE_BASE_URL:-}
       - OPENAI_COMPATIBLE_API_KEY=${OPENAI_COMPATIBLE_API_KEY:-}
