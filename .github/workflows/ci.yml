@@ -104,6 +104,10 @@ jobs:
           ok=0
           wait_for backend    http://127.0.0.1:8090/api/v1/health || ok=1
           wait_for ai-service http://127.0.0.1:8010/health        || ok=1
+          # The frontend is slowest to come up and the suite probes it, so it
+          # has to be waited on too — otherwise the liveness check races the
+          # Next.js boot and fails with a connection refused.
+          wait_for frontend   http://127.0.0.1:3000/              || ok=1
           if [ "$ok" -ne 0 ]; then
             docker compose ps
             docker compose logs --tail=200
