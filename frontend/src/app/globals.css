@@ -674,3 +674,46 @@
   --sidebar-border: #44475a;
   --sidebar-ring: #bd93f9;
 }
+
+/* ── Status verb shine ──────────────────────────────────────────
+   The sweep on the "Thinking…" indicator. Uses background-clip so the
+   highlight travels across the glyphs themselves rather than sitting in a
+   box behind them.
+
+   Colours come from the theme tokens, so this reads correctly in all eight
+   themes rather than assuming a dark background. */
+.status-verb-shine {
+  background: linear-gradient(
+    100deg,
+    var(--muted-foreground) 20%,
+    var(--foreground) 42%,
+    var(--foreground) 50%,
+    var(--muted-foreground) 72%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: status-verb-shine 2.1s linear infinite;
+}
+
+@keyframes status-verb-shine {
+  from {
+    background-position: 180% 0;
+  }
+  to {
+    background-position: -80% 0;
+  }
+}
+
+/* A sweeping highlight is exactly the kind of motion that triggers vestibular
+   symptoms. Hold the gradient still and keep the text readable. */
+@media (prefers-reduced-motion: reduce) {
+  .status-verb-shine {
+    animation: none;
+    background: none;
+    -webkit-background-clip: border-box;
+    background-clip: border-box;
+    color: var(--muted-foreground);
+  }
+}

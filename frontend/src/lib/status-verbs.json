@@ -1,0 +1,139 @@
+{
+  "$comment": [
+    "Status verbs shown while the agent works, picked by what the user asked.",
+    "",
+    "All entries are gerunds on purpose. 'Agent is working...' is a status",
+    "sentence; 'Untangling...' is a status verb, and reads as the system doing",
+    "something right now rather than being stuck.",
+    "",
+    "Tone is not uniform, and that is deliberate. The diagnose and secrets",
+    "buckets are flat and literal because they appear when something is broken",
+    "or when credentials are involved -- whimsy there reads as flippant. The",
+    "playful entries live in buckets where nothing is on fire."
+  ],
+  "categories": {
+    "generic": {
+      "match": [],
+      "verbs": [
+        "Thinking", "Working", "Considering", "Processing", "Reasoning",
+        "Puzzling", "Mulling", "Pondering", "Chewing", "Noodling",
+        "Percolating", "Ruminating", "Cogitating", "Deliberating", "Weighing",
+        "Turning it over", "Lining things up", "Joining the dots",
+        "Following the thread", "Getting there", "Warming up", "Spinning up",
+        "Making sense of it", "Sorting it out", "Piecing it together",
+        "Getting oriented", "Taking stock", "Reading the room",
+        "Doing the rounds", "Working the problem", "Chasing it down",
+        "Sizing it up", "Casting about", "Rummaging", "Beavering away",
+        "Cranking", "Whirring", "Ticking over", "Marshalling", "Assembling"
+      ]
+    },
+    "deploy": {
+      "match": [
+        "deploy", "ship", "release", "rollout", "roll out", "launch",
+        "promote", "publish", "go live", "restart", "scale", "rollback"
+      ],
+      "verbs": [
+        "Planning the rollout", "Checking the runway", "Staging", "Marshalling",
+        "Lining up the pieces", "Preparing", "Sequencing", "Reserving capacity",
+        "Reading the manifest", "Checking prerequisites", "Sanity-checking",
+        "Confirming the target", "Warming the runtime", "Provisioning",
+        "Reconciling", "Squaring the plan", "Double-checking", "Rehearsing",
+        "Counting replicas", "Picking a port", "Wiring routes",
+        "Checking the door is unlocked", "Making room", "Clearing the deck",
+        "Taking a breath before the big one"
+      ]
+    },
+    "diagnose": {
+      "match": [
+        "error", "fail", "failed", "failing", "broken", "crash", "crashed",
+        "bug", "why", "debug", "diagnose", "wrong", "issue", "problem",
+        "not working", "stuck", "timeout", "exception", "stack trace",
+        "down", "outage", "incident", "restart loop", "oom"
+      ],
+      "verbs": [
+        "Reading the logs", "Tracing", "Narrowing it down", "Checking the stack",
+        "Following the error", "Isolating", "Reproducing", "Correlating",
+        "Checking timestamps", "Comparing states", "Working backwards",
+        "Ruling things out", "Checking the obvious first", "Reading carefully",
+        "Cross-referencing", "Looking upstream", "Checking the exit code",
+        "Examining", "Retracing the steps", "Inspecting", "Reviewing",
+        "Checking recent changes", "Testing the theory", "Confirming",
+        "Getting to the bottom of it"
+      ]
+    },
+    "build": {
+      "match": [
+        "build", "dockerfile", "compile", "image", "bundle", "package",
+        "docker", "container", "artifact", "npm", "cmake", "make"
+      ],
+      "verbs": [
+        "Reading the tree", "Laying foundations", "Stacking layers",
+        "Choosing a base", "Trimming the image", "Ordering the steps",
+        "Caching wisely", "Pinning versions", "Resolving dependencies",
+        "Measuring twice", "Drafting", "Sketching", "Shaping", "Whittling",
+        "Fitting the pieces", "Tightening bolts", "Squaring corners",
+        "Sanding edges", "Packing", "Compressing", "Bolting things together",
+        "Reading the lockfile", "Counting layers", "Minding the cache",
+        "Building it properly"
+      ]
+    },
+    "inspect": {
+      "match": [
+        "show", "list", "status", "what", "which", "check", "look",
+        "inspect", "describe", "get", "find", "search", "where", "who",
+        "logs", "metrics", "history"
+      ],
+      "verbs": [
+        "Looking", "Fetching", "Gathering", "Scanning", "Surveying",
+        "Checking", "Reading", "Collecting", "Rounding up", "Taking a look",
+        "Peeking", "Sifting", "Combing through", "Leafing through",
+        "Consulting the records", "Counting", "Tallying", "Cataloguing",
+        "Having a rummage", "Casting an eye over"
+      ]
+    },
+    "secrets": {
+      "match": [
+        "secret", "password", "credential", "key", "token", "env var",
+        "environment variable", "api key", "certificate", "auth"
+      ],
+      "verbs": [
+        "Checking permissions", "Verifying access", "Confirming scope",
+        "Reading the policy", "Checking who is asking", "Validating",
+        "Checking the audit trail", "Confirming the environment",
+        "Reviewing access", "Being careful", "Checking twice",
+        "Verifying", "Confirming", "Checking the boundary", "Making sure"
+      ]
+    },
+    "explain": {
+      "match": [
+        "explain", "how does", "how do", "what is", "why does", "teach",
+        "help me understand", "difference between", "should i", "recommend",
+        "advise", "compare", "best way"
+      ],
+      "verbs": [
+        "Finding the words", "Choosing an angle", "Composing", "Framing",
+        "Structuring", "Simplifying", "Untangling", "Clarifying",
+        "Picking an example", "Getting the order right", "Distilling",
+        "Boiling it down", "Cutting the waffle", "Finding the thread",
+        "Drafting", "Rephrasing", "Thinking how to put it",
+        "Looking for the clean explanation", "Trimming", "Getting to the point",
+        "Working out what matters", "Choosing what to leave out",
+        "Making it make sense", "Putting it plainly", "Weighing the trade-offs"
+      ]
+    },
+    "create": {
+      "match": [
+        "create", "make", "new", "add", "generate", "scaffold", "write",
+        "set up", "setup", "init", "bootstrap", "template"
+      ],
+      "verbs": [
+        "Drafting", "Sketching", "Roughing it out", "Laying it out",
+        "Naming things", "Choosing defaults", "Filling in the blanks",
+        "Wiring it up", "Setting the shape", "Blocking it in",
+        "Picking sensible defaults", "Scaffolding", "Framing", "Outlining",
+        "Getting the skeleton right", "Setting things up", "Arranging",
+        "Composing", "Putting it together", "Making a start"
+      ]
+    }
+  }
+}

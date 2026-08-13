@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { StatusVerb } from "@/components/ui/status-verb";
 
 // Must exceed the ai-service (90s) and backend (120s) timeouts, otherwise the
 // browser aborts while the backend completes the generation and bills for it.
@@ -1145,6 +1146,16 @@ export default function AiAgentPage() {
 
   const isRunning = runAgentMutation.isPending || commandMutation.isPending || autonomousDeployMutation.isPending;
 
+  // The verb is picked from what was actually asked, so the indicator keys off
+  // the most recent user turn rather than the composer (which is cleared on
+  // submit).
+  const lastUserPrompt = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "user") return messages[i].content;
+    }
+    return "";
+  }, [messages]);
+
   const submit = () => {
     const trimmed = input.trim();
     if (!trimmed || isRunning) return;
@@ -1326,7 +1337,7 @@ export default function AiAgentPage() {
             {isRunning && (
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                Agent is working...
+                <StatusVerb prompt={lastUserPrompt} />
               </div>
             )}
           </div>
