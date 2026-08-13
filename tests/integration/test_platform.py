@@ -32,6 +32,9 @@ from typing import Any, Optional
 BACKEND = "http://127.0.0.1:8090"
 AI_SERVICE = "http://127.0.0.1:8010"
 FRONTEND = "http://127.0.0.1:3000"
+# Must match CORS_ALLOWED_ORIGIN exactly -- the guard compares strings, so
+# 127.0.0.1 is not interchangeable with localhost here.
+BROWSER_ORIGIN = "http://localhost:3000"
 PG_CONTAINER = "stackpilot-postgres"
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -78,13 +81,60 @@ def check(name: str, passed: bool, detail: str = "") -> None:
     print(f"  {'PASS' if passed else 'FAIL'}  {name}" + (f"  ({detail})" if detail and not passed else ""))
 
 
+# Set when the suite registers its own user, so cleanup knows to remove it.
+FIXTURE_USER_EMAIL = ""
+
+
+def ensure_user() -> str:
+    """Return a user id, registering a throwaway account if the database is empty.
+
+    A fresh CI database has no users, which used to abort the whole suite
+    fourteen tests in. Registering through the public route rather than
+    inserting a row keeps the fixture honest: it exercises the same password
+    hashing the real signup path uses, so a user created here is a user the
+    rest of the platform will accept.
+    """
+    global FIXTURE_USER_EMAIL
+
+    existing = psql("SELECT id FROM users LIMIT 1;")
+    if existing:
+        return existing
+
+    email = f"integration-fixture-{secrets.token_hex(6)}@stackpilot.invalid"
+    # Mutating routes require a trusted Origin plus the CSRF header unless the
+    # caller presents a bearer token. Registration cannot have a token yet, so
+    # the fixture has to look like the browser does.
+    status, body = request(
+        "POST",
+        f"{BACKEND}/api/v1/auth/register",
+        {
+            # The field is `username`, not `name`, and the password minimum is
+            # 12 characters -- both taken from AuthController::registerUser
+            # rather than assumed.
+            "username": f"integration-fixture-{secrets.token_hex(4)}",
+            "email": email,
+            "password": "Fixture-" + secrets.token_hex(12) + "!aA1",
+        },
+        headers={
+            "Origin": BROWSER_ORIGIN,
+            "X-stackpilot-CSRF": "1",
+        },
+    )
+    if status not in (200, 201):
+        raise RuntimeError(f"could not register a fixture user: {status} {body[:200]}")
+
+    FIXTURE_USER_EMAIL = email
+    user_id = psql(f"SELECT id FROM users WHERE email = '{email}';")
+    if not user_id:
+        raise RuntimeError("registration reported success but no user row exists")
+    return user_id
+
+
 def mint_mcp_token(scopes: list[str], label: str) -> str:
     """Create a short-lived MCP token directly in the DB and return the raw value."""
     raw = "STACKPILOT_mcp_" + secrets.token_hex(16)
     digest = hashlib.sha256(raw.encode()).hexdigest()
-    user_id = psql("SELECT id FROM users LIMIT 1;")
-    if not user_id:
-        raise RuntimeError("no users in database — cannot run authenticated tests")
+    user_id = ensure_user()
     psql(
         "INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, permissions, expires_at) "
         f"VALUES ('{user_id}', '{label}', '{digest}', 'test', "
@@ -95,6 +145,18 @@ def mint_mcp_token(scopes: list[str], label: str) -> str:
 
 def cleanup(label: str) -> None:
     psql(f"DELETE FROM mcp_tokens WHERE name = '{label}';")
+
+
+def cleanup_fixture_user() -> None:
+    """Remove the account ensure_user() created, if it created one.
+
+    Only ever deletes an account this run registered. A database that already
+    had users is left exactly as it was found -- the suite is meant to be safe
+    to run against a stack with real data.
+    """
+    if not FIXTURE_USER_EMAIL:
+        return
+    psql(f"DELETE FROM users WHERE email = '{FIXTURE_USER_EMAIL}';")
 
 
 # --------------------------------------------------------------------------
@@ -290,16 +352,21 @@ def main() -> int:
     print("StackPilot integration regression suite")
     print(f"backend={BACKEND}  ai-service={AI_SERVICE}")
 
-    test_liveness()
-    test_authentication_required()
-    test_static_files_not_served()
-    test_platform_containers_protected()
-    test_ai_service_requires_token()
-    test_ai_service_ssrf_guard(service_token)
-    test_mcp_token_scopes()
-    test_agent_policy_gate()
-    test_secrets_are_write_only()
-    test_migration_ledger()
+    try:
+        test_liveness()
+        test_authentication_required()
+        test_static_files_not_served()
+        test_platform_containers_protected()
+        test_ai_service_requires_token()
+        test_ai_service_ssrf_guard(service_token)
+        test_mcp_token_scopes()
+        test_agent_policy_gate()
+        test_secrets_are_write_only()
+        test_migration_ledger()
+    finally:
+        # Runs even when a test raises, so a crash mid-suite does not leave a
+        # fixture account behind in someone's real database.
+        cleanup_fixture_user()
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     failed = len(RESULTS) - passed
