@@ -79,6 +79,9 @@ if(STACKPILOT_BUILD_TESTS)
         src/services/ComposeKubernetesPlanner.cpp
         src/utils/RuntimeRateLimiter.cpp
         src/utils/Authz.cpp
+        src/services/DriftDetector.cpp
+        src/services/CostModel.cpp
+        src/services/PreviewEnvironments.cpp
         src/services/LocalDockerRuntime.cpp
         src/services/DeploymentJournal.cpp
         src/services/SshService.cpp

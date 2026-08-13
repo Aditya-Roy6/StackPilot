@@ -579,6 +579,7 @@ void JobQueueService::start() {
     for (int i = 0; i < workerCount_; ++i) {
         workers_.emplace_back([this, i]() { workerLoop(i); });
     }
+    maintenanceWorker_ = std::thread([this]() { maintenanceLoop(); });
     spdlog::info("Started {} deployment job worker(s)", workerCount_);
 }
 
@@ -596,6 +597,9 @@ void JobQueueService::stop() {
         }
     }
     workers_.clear();
+    if (maintenanceWorker_.joinable()) {
+        maintenanceWorker_.join();
+    }
 }
 
 Json::Value JobQueueService::enqueueDeploymentBuild(const std::string& deploymentId,

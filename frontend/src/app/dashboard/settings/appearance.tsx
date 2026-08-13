@@ -66,7 +66,10 @@ export function AppearanceSettings() {
                   )}
                 >
                   {isActive && (
-                    <span className="absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+                    // z-10 because the swatch preview is a later sibling and
+                    // would otherwise paint over this badge. The ring keeps it
+                    // legible against whichever colour sits under it.
+                    <span className="absolute right-2 top-2 z-10 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground ring-2 ring-background">
                       <Check className="h-3 w-3" />
                     </span>
                   )}

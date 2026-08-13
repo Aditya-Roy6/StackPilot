@@ -28,6 +28,8 @@ public:
     ADD_METHOD_TO(DeploymentController::getKubernetesEvents, "/api/v1/deployments/{deployment_id}/kubernetes/events", drogon::Get);
     ADD_METHOD_TO(DeploymentController::getKubernetesStatus, "/api/v1/deployments/{deployment_id}/kubernetes/status", drogon::Get);
     ADD_METHOD_TO(DeploymentController::removeKubernetesDeployment, "/api/v1/deployments/{deployment_id}/kubernetes", drogon::Delete);
+    ADD_METHOD_TO(DeploymentController::checkDrift, "/api/v1/deployments/{deployment_id}/drift", drogon::Get);
+    ADD_METHOD_TO(DeploymentController::getCostReport, "/api/v1/cost", drogon::Get, drogon::Options);
     METHOD_LIST_END
 
     void createDeployment(const drogon::HttpRequestPtr& req,
@@ -77,6 +79,17 @@ public:
     void getKubernetesStatus(const drogon::HttpRequestPtr& req,
                              std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                              const std::string& deploymentId);
+
+    /// Compares the recorded desired state against live runtime state and
+    /// records the result. Read-only with respect to the runtime.
+    void checkDrift(const drogon::HttpRequestPtr& req,
+                    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                    const std::string& deploymentId);
+
+    /// Cost attribution across everything the caller can see, grouped by
+    /// project. Accepts ?days=N (default 30).
+    void getCostReport(const drogon::HttpRequestPtr& req,
+                       std::function<void(const drogon::HttpResponsePtr&)>&& callback);
     void removeKubernetesDeployment(const drogon::HttpRequestPtr& req,
                                     std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                     const std::string& deploymentId);

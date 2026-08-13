@@ -4,6 +4,7 @@
 
 #include "GitHubWebhookController.h"
 #include "../utils/StringUtils.h"
+#include "../services/PreviewEnvironments.h"
 #include "../db/Database.h"
 #include "../services/JobQueueService.h"
 
@@ -488,6 +489,97 @@ void GitHubWebhookController::handleWebhook(
         if (event == "installation" || event == "installation_repositories") {
             Json::Value body = handleGitHubAppInstallationEvent(txn, payload, event);
             txn.commit();
+            callback(drogon::HttpResponse::newHttpJsonResponse(body));
+            return;
+        }
+
+        if (event == "pull_request") {
+            const std::string fullName = repoFullName(payload);
+            const PreviewRequest preview = PreviewEnvironments::parseWebhook(payload);
+            if (fullName.empty() || preview.prNumber <= 0) {
+                txn.commit();
+                callback(drogon::HttpResponse::newHttpJsonResponse(
+                    okPayload("Pull request event ignored: missing repository or PR number")));
+                return;
+            }
+
+            auto rows = txn.exec_params(
+                "SELECT p.id AS project_id, p.user_id, p.name AS project_name, p.repo_url, "
+                "p.preview_environments_enabled, p.preview_ttl_hours "
+                "FROM projects p WHERE p.preview_environments_enabled = TRUE"
+            );
+
+            Json::Value handled(Json::arrayValue);
+            const std::string normalizedFullName = toLower(fullName);
+            for (const auto& row : rows) {
+                if (githubFullNameFromUrl(row["repo_url"].is_null() ? "" : row["repo_url"].as<std::string>())
+                        != normalizedFullName) {
+                    continue;
+                }
+
+                const PreviewDecision decision = PreviewEnvironments::decide(preview, true);
+                const std::string projectId = row["project_id"].as<std::string>();
+
+                Json::Value entry(Json::objectValue);
+                entry["project_id"] = projectId;
+                entry["pr_number"] = preview.prNumber;
+                entry["action"] = decision.action;
+                entry["reason"] = decision.reason;
+
+                if (decision.shouldTeardown()) {
+                    // Mark rather than delete. The cleanup service owns actually
+                    // destroying runtimes, and a webhook handler that shells out
+                    // to Docker would block the event loop on GitHub's timeout.
+                    txn.exec_params(
+                        "UPDATE deployments SET status = 'pending_teardown', updated_at = NOW() "
+                        "WHERE project_id = $1 AND pr_number = $2 AND is_preview "
+                        "AND status NOT IN ('destroyed', 'failed', 'superseded')",
+                        projectId, preview.prNumber
+                    );
+                } else if (decision.shouldDeploy()) {
+                    // Supersede the previous preview for this PR before inserting
+                    // the new one; the partial unique index allows exactly one
+                    // live preview per (project, PR).
+                    txn.exec_params(
+                        "UPDATE deployments SET status = 'superseded', updated_at = NOW() "
+                        "WHERE project_id = $1 AND pr_number = $2 AND is_preview "
+                        "AND status NOT IN ('destroyed', 'failed', 'superseded')",
+                        projectId, preview.prNumber
+                    );
+
+                    const int ttlHours = PreviewEnvironments::clampTtlHours(
+                        row["preview_ttl_hours"].is_null() ? 72 : row["preview_ttl_hours"].as<int>());
+
+                    auto inserted = txn.exec_params(
+                        "INSERT INTO deployments "
+                        "(project_id, status, version, commit_hash, branch, commit_sha, trigger_source, "
+                        " github_delivery_id, is_preview, pr_number, pr_title, pr_author, preview_expires_at, logs) "
+                        "VALUES ($1, 'pending', $2, $3, $4, $3, 'github_pull_request', $5, TRUE, $6, $7, $8, "
+                        "        NOW() + ($9 || ' hours')::interval, $10) "
+                        "RETURNING id",
+                        projectId,
+                        PreviewEnvironments::versionFor(preview.prNumber),
+                        preview.commitSha,
+                        preview.branch,
+                        deliveryId,
+                        preview.prNumber,
+                        preview.title,
+                        preview.author,
+                        std::to_string(ttlHours),
+                        "Preview environment queued for pull request #" +
+                            std::to_string(preview.prNumber) + " (" + decision.reason + ").\n"
+                    );
+                    if (!inserted.empty()) {
+                        entry["deployment_id"] = inserted[0][0].as<std::string>();
+                    }
+                }
+
+                handled.append(entry);
+            }
+
+            txn.commit();
+            Json::Value body = okPayload("Pull request event processed");
+            body["previews"] = handled;
             callback(drogon::HttpResponse::newHttpJsonResponse(body));
             return;
         }

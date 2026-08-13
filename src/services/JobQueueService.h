@@ -42,6 +42,8 @@ private:
 
     void recoverInterruptedJobs();
     void workerLoop(int workerIndex);
+    /// Periodic housekeeping: cost sampling and preview expiry.
+    void maintenanceLoop();
     std::optional<std::string> popRedisJob(int timeoutSeconds) const;
     bool pushRedisJob(const std::string& jobId) const;
     std::optional<DeploymentJobRecord> claimJob(const std::string& preferredJobId);
@@ -53,6 +55,7 @@ private:
     std::atomic<bool> running_{false};
     std::mutex lifecycleMutex_;
     std::vector<std::thread> workers_;
+    std::thread maintenanceWorker_;
     std::string workerId_;
     std::string redisHost_;
     int redisPort_ = 6379;

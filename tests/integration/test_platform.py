@@ -410,6 +410,65 @@ def test_organization_access_control() -> None:
             psql(f"DELETE FROM users WHERE email = '{outsider_email}';")
 
 
+def test_drift_cost_and_previews() -> None:
+    """Schema and endpoints for drift, cost attribution and PR previews.
+
+    These three features are mostly invisible when working, which is exactly
+    why they need a live check: a cost report that silently reads zero and a
+    drift detector that silently finds nothing look identical to a healthy
+    platform.
+    """
+    print("\ndrift, cost and previews")
+    try:
+        for table in ("deployment_drift_checks", "deployment_cost_samples"):
+            exists = psql("SELECT to_regclass('public.%s') IS NOT NULL;" % table)
+            check(f"{table} exists", exists == "t", f"got {exists}")
+
+        for column in ("is_preview", "pr_number", "preview_expires_at"):
+            found = psql(
+                "SELECT count(*) FROM information_schema.columns "
+                f"WHERE table_name = 'deployments' AND column_name = '{column}';")
+            check(f"deployments.{column} exists", found == "1", f"got {found}")
+
+        # The partial unique index is what stops every push to a PR stacking
+        # another preview deployment.
+        idx = psql(
+            "SELECT count(*) FROM pg_indexes WHERE tablename = 'deployments' "
+            "AND indexname = 'idx_deployments_active_preview';")
+        check("one live preview per (project, PR) is enforced", idx == "1", f"got {idx}")
+
+        # Endpoints must be authenticated. An unauthenticated cost report
+        # would disclose project names and spend across the whole install.
+        status, _ = request("GET", f"{BACKEND}/api/v1/cost")
+        check("cost report rejects anonymous", status == 401, f"got {status}")
+
+        token = mint_mcp_token(["read"], "integration-cost-read")
+        try:
+            status, body = request(
+                "GET", f"{BACKEND}/api/v1/cost?days=7",
+                headers={"Authorization": f"Bearer {token}", "X-stackpilot-MCP": "1"})
+            check("cost report responds to an authenticated read", status == 200, f"got {status} {body[:120]}")
+            if status == 200:
+                payload = json.loads(body)
+                check("cost report is scoped and totalled",
+                      "projects" in payload and "total_formatted" in payload,
+                      f"keys={sorted(payload)[:6]}")
+                check("cost report honours the window",
+                      payload.get("window_days") == 7, f"got {payload.get('window_days')}")
+                # Money must render as money, not as a raw integer count of
+                # millicents, which is how an off-by-1000 ships unnoticed.
+                check("totals are formatted as currency",
+                      str(payload.get("total_formatted", "")).startswith("$"),
+                      f"got {payload.get('total_formatted')}")
+        finally:
+            cleanup("integration-cost-read")
+
+        status, _ = request("GET", f"{BACKEND}/api/v1/deployments/{secrets.token_hex(16)}/drift")
+        check("drift check rejects anonymous", status == 401, f"got {status}")
+    except Exception as exc:
+        check("drift, cost and previews reachable", False, str(exc))
+
+
 def test_migration_ledger() -> None:
     """Regression: all migrations re-ran every boot, replaying destructive backfills."""
     print("\nmigration ledger")
@@ -464,6 +523,7 @@ def main() -> int:
         test_agent_policy_gate()
         test_secrets_are_write_only()
         test_organization_access_control()
+        test_drift_cost_and_previews()
         test_migration_ledger()
     finally:
         # Runs even when a test raises, so a crash mid-suite does not leave a
