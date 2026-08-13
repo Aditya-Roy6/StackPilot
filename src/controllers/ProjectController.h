@@ -1,10 +1,6 @@
 // ============================================================
 // ProjectController.h — Project Management REST API
 // ============================================================
-// CONCEPT: CRUD Operations
-// CRUD = Create, Read, Update, Delete
-// These are the 4 fundamental operations for any data entity.
-//
 // Endpoints:
 //   POST   /api/v1/projects         → Create project
 //   GET    /api/v1/projects         → List user's projects

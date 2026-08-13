@@ -5,13 +5,18 @@ import os
 import re
 import asyncio
 import hashlib
+import hmac
 import math
 import time
 import uuid
+import ipaddress
+import socket
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 import httpx
-from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -22,6 +27,11 @@ MODEL_PROBE_TIMEOUT = float(os.getenv("NVIDIA_NIM_MODEL_PROBE_TIMEOUT_SECONDS", 
 MODEL_PROBE_LIMIT = int(os.getenv("NVIDIA_NIM_MODEL_PROBE_LIMIT", "30"))
 MODEL_PROBE_CACHE_TTL = float(os.getenv("NVIDIA_NIM_MODEL_PROBE_CACHE_SECONDS", "3600"))
 MODEL_PROBE_CACHE: Dict[str, Any] = {"expires_at": 0.0, "models": []}
+# Serialises refreshes: the cache was a bare dict with a check-then-write race,
+# so N concurrent cold /models requests each launched a full probe sweep
+# (N x MODEL_PROBE_LIMIT chat completions), which rate-limited the provider
+# and left every probe failing.
+MODEL_PROBE_LOCK = asyncio.Lock()
 
 
 class AgentRequest(BaseModel):
@@ -89,6 +99,69 @@ class AgentState(TypedDict, total=False):
 
 
 app = FastAPI(title="StackPilot AI Service", version="0.1.0")
+
+
+# ---------------------------------------------------------------------------
+# Service authentication
+# ---------------------------------------------------------------------------
+# This service had no authentication on any route. Anything able to reach it on
+# the docker network could drive the model, read provider settings, or abuse the
+# SSRF sink below. It is only exposed on 127.0.0.1 today, which is a deployment
+# detail rather than a control.
+SERVICE_TOKEN = os.getenv("STACKPILOT_AI_SERVICE_TOKEN", "").strip()
+
+# Unauthenticated probes so container healthchecks keep working.
+PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def require_service_token(request: Request, call_next):
+    if request.url.path in PUBLIC_PATHS or not SERVICE_TOKEN:
+        return await call_next(request)
+    presented = request.headers.get("x-stackpilot-service-token", "")
+    # Constant-time compare so the token can't be recovered by timing.
+    if not hmac.compare_digest(presented, SERVICE_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# SSRF guard for caller-supplied provider base URLs
+# ---------------------------------------------------------------------------
+# `provider_overrides.base_url` was passed straight to httpx, so a caller could
+# point this service at the cloud metadata endpoint or any internal host. The
+# backend validates this on PUT /ai/settings, but that guard is bypassed by
+# talking to this service directly, so it has to be enforced here too.
+ALLOW_PRIVATE_PROVIDER_HOSTS = os.getenv("STACKPILOT_AI_ALLOW_PRIVATE_PROVIDER_HOSTS", "").lower() in {"1", "true", "yes"}
+
+
+def validate_provider_base_url(raw: str) -> str:
+    """Return the URL unchanged, or raise HTTPException if it is not safe to call."""
+    if not raw:
+        return raw
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Provider base_url must be http or https")
+    host = parsed.hostname
+    if not host:
+        raise HTTPException(status_code=400, detail="Provider base_url is missing a host")
+    if ALLOW_PRIVATE_PROVIDER_HOSTS:
+        return raw
+
+    # Resolve first: a public-looking name can still point at a private address.
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Provider base_url host could not be resolved")
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        if (address.is_private or address.is_loopback or address.is_link_local
+                or address.is_reserved or address.is_multicast):
+            raise HTTPException(
+                status_code=400,
+                detail="Provider base_url resolves to a non-public address",
+            )
+    return raw
 
 
 SECRET_PATTERNS = [
@@ -167,6 +240,8 @@ def provider_config(
             or os.getenv("NVIDIA_NIM_MODEL")
             or "meta/llama-3.1-70b-instruct"
         )
+    if selected == "openai_compatible":
+        validate_provider_base_url(base_url)
     return selected, base_url, api_key, selected_model
 
 
@@ -185,6 +260,9 @@ def embedding_provider_config(req: EmbeddingRequest) -> tuple[str, str, str, str
             or os.getenv("OPENAI_COMPATIBLE_API_KEY", "")
         )
         model = req.model or os.getenv("OPENAI_COMPATIBLE_EMBEDDING_MODEL") or "text-embedding-3-small"
+        # Same SSRF guard as provider_config — the embeddings route accepts the
+        # identical caller-supplied base_url and must not be a bypass.
+        validate_provider_base_url(base_url)
     else:
         selected = "nvidia_nim"
         base_url = os.getenv("NVIDIA_NIM_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
@@ -306,18 +384,40 @@ def chat_payload(
     return payload
 
 
-def parse_model_json(content: str) -> Dict[str, Any]:
+# Keys that identify our own response envelope, as opposed to any JSON that
+# merely happens to appear inside a prose answer.
+ENVELOPE_KEYS = {"summary", "result_type", "structured_output", "confidence"}
+
+
+def parse_model_json(content: str, *, allow_fragment: bool = True) -> Dict[str, Any]:
+    """Parse the model's reply as our response envelope.
+
+    The brace-matching fallback used to run for every workflow, including chat.
+    A chat answer containing a fenced JSON block (e.g. "here is a package.json")
+    would match first-{ to last-}, parse cleanly, and be returned as the whole
+    response — leaving summary empty, so the user saw a blank message. The
+    fallback is now limited to workflows that actually asked for JSON, and the
+    result must look like our envelope.
+    """
     text = (content or "{}").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
         text = re.sub(r"\s*```$", "", text)
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
+        if not allow_fragment:
+            raise
         match = re.search(r"\{.*\}", text, flags=re.S)
-        if match:
-            return json.loads(match.group(0))
-        raise
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+
+    if not isinstance(parsed, dict) or not (ENVELOPE_KEYS & set(parsed.keys())):
+        # Valid JSON, but not our envelope — treat it as prose so the caller
+        # falls back to plain_text_response instead of returning an empty summary.
+        raise json.JSONDecodeError("model output is not an agent envelope", text, 0)
+    return parsed
 
 
 def plain_text_response(content: str, result_type: str) -> Dict[str, Any]:
@@ -640,7 +740,11 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
                 requires_user_confirmation=False,
                 trace_id=trace_id,
                 provider=provider,
-                model="instant-fast-path",
+                # Report the model that was actually configured. The old
+                # "instant-fast-path" placeholder was persisted to ai_runs.model and
+                # ai_sessions.last_model and rendered as the model badge, so the UI
+                # and telemetry both showed a model ID that does not exist.
+                model=model,
                 latency_ms=int((time.perf_counter() - start) * 1000),
                 token_usage={},
             )
@@ -679,7 +783,10 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
             )
         content = payload.get("choices", [{}])[0].get("message", {}).get("content", "{}")
         try:
-            parsed = parse_model_json(content)
+            parsed = parse_model_json(
+                content,
+                allow_fragment=req.workflow_type not in {"agent_chat", "chat_project"},
+            )
         except json.JSONDecodeError:
             parsed = plain_text_response(content, req.workflow_type or "unknown")
         parsed = normalize_ai_output(req.workflow_type or "unknown", req.project, parsed)
@@ -725,7 +832,10 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
                     )
                 content = payload.get("choices", [{}])[0].get("message", {}).get("content", "{}")
                 try:
-                    parsed = parse_model_json(content)
+                    parsed = parse_model_json(
+                        content,
+                        allow_fragment=req.workflow_type not in {"agent_chat", "chat_project"},
+                    )
                 except json.JSONDecodeError:
                     parsed = plain_text_response(content, req.workflow_type or "unknown")
                 parsed = normalize_ai_output(req.workflow_type or "unknown", req.project, parsed)
@@ -976,6 +1086,21 @@ async def filter_working_models(
     if MODEL_PROBE_CACHE["expires_at"] > now:
         return MODEL_PROBE_CACHE["models"]
 
+    async with MODEL_PROBE_LOCK:
+        # Re-check inside the lock: a request that queued behind a refresh should
+        # use its result rather than immediately probing again.
+        now = time.time()
+        if MODEL_PROBE_CACHE["expires_at"] > now:
+            return MODEL_PROBE_CACHE["models"]
+        return await _refresh_working_models(base_url, api_key, candidates, now)
+
+
+async def _refresh_working_models(
+    base_url: str,
+    api_key: str,
+    candidates: List[Dict[str, Any]],
+    now: float,
+) -> List[Dict[str, Any]]:
     unique: List[Dict[str, Any]] = []
     seen = set()
     for item in candidates:

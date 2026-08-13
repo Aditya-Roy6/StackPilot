@@ -3,23 +3,52 @@
 // ============================================================
 
 #include "LogWebSocketController.h"
+#include "../db/Database.h"
+#include "../utils/JwtHelper.h"
 #include <json/json.h>
+#include <pqxx/pqxx>
 #include <spdlog/spdlog.h>
 
 namespace stackpilot {
 
 namespace {
 
-constexpr const char* kGlobalDeploymentsChannel = "__deployments__";
+constexpr const char* kGlobalDeploymentsChannelPrefix = "__deployments__:";
 
-std::string getSubscriptionKey(const drogon::HttpRequestPtr& req) {
-    std::string stream = req->getParameter("stream");
-    if (stream == "deployments") {
-        return kGlobalDeploymentsChannel;
+// Per-user global channel. Previously a single shared "__deployments__" channel
+// fanned every tenant's deployment updates out to every connected socket.
+std::string globalChannelFor(const std::string& userId) {
+    return std::string(kGlobalDeploymentsChannelPrefix) + userId;
+}
+
+bool userOwnsDeployment(const std::string& deploymentId, const std::string& userId) {
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+        auto rows = txn.exec_params(
+            "SELECT 1 FROM deployments d "
+            "JOIN projects p ON d.project_id = p.id "
+            "WHERE d.id = $1 AND p.user_id = $2",
+            deploymentId,
+            userId
+        );
+        txn.commit();
+        return !rows.empty();
+    } catch (const std::exception& e) {
+        // A malformed (non-UUID) deploymentId lands here too — deny by default.
+        spdlog::warn("WebSocket deployment ownership check failed: {}", e.what());
+        return false;
+    }
+}
+
+// Returns the channel this request is allowed to subscribe to, or "" to reject.
+std::string resolveAuthorizedChannel(const drogon::HttpRequestPtr& req, const std::string& userId) {
+    if (req->getParameter("stream") == "deployments") {
+        return globalChannelFor(userId);
     }
 
-    std::string deploymentId = req->getParameter("deploymentId");
-    if (!deploymentId.empty()) {
+    const std::string deploymentId = req->getParameter("deploymentId");
+    if (!deploymentId.empty() && userOwnsDeployment(deploymentId, userId)) {
         return deploymentId;
     }
 
@@ -35,8 +64,24 @@ void LogWebSocketController::handleNewConnection(
     const drogon::HttpRequestPtr& req,
     const drogon::WebSocketConnectionPtr& conn
 ) {
-    std::string subscriptionKey = getSubscriptionKey(req);
+    // WebSocket upgrades bypass the CORS/CSRF filter, so this is the only
+    // place the connection can be authenticated.
+    const auto payload = JwtHelper::verifyRequestToken(req);
+    if (payload.isNull()) {
+        spdlog::warn("Rejected unauthenticated /ws/logs connection");
+        conn->forceClose();
+        return;
+    }
+
+    const std::string userId = payload["user_id"].asString();
+    if (userId.empty()) {
+        conn->forceClose();
+        return;
+    }
+
+    const std::string subscriptionKey = resolveAuthorizedChannel(req, userId);
     if (subscriptionKey.empty()) {
+        spdlog::warn("Rejected /ws/logs subscription for user {}", userId);
         conn->forceClose();
         return;
     }
@@ -93,7 +138,7 @@ void LogWebSocketController::broadcastStatus(const std::string& deploymentId, co
     sendToChannelUnlocked(deploymentId, out);
 }
 
-void LogWebSocketController::broadcastDeploymentUpdate(const Json::Value& deployment) {
+void LogWebSocketController::broadcastDeploymentUpdate(const Json::Value& deployment, const std::string& ownerUserId) {
     Json::Value msg;
     msg["type"] = "deployment_update";
     msg["deployment"] = deployment;
@@ -102,13 +147,18 @@ void LogWebSocketController::broadcastDeploymentUpdate(const Json::Value& deploy
     std::string out = writer.write(msg);
 
     std::lock_guard<std::mutex> lock(subscribersMutex_);
-    sendToChannelUnlocked(kGlobalDeploymentsChannel, out);
+    // Only the owner's global channel. Without an owner we deliberately skip the
+    // global fan-out rather than fall back to broadcasting to everyone.
+    if (!ownerUserId.empty()) {
+        sendToChannelUnlocked(globalChannelFor(ownerUserId), out);
+    }
+    // The per-deployment channel is safe: subscription is ownership-checked.
     if (deployment.isMember("id")) {
         sendToChannelUnlocked(deployment["id"].asString(), out);
     }
 }
 
-void LogWebSocketController::broadcastDeploymentDeleted(const std::string& deploymentId) {
+void LogWebSocketController::broadcastDeploymentDeleted(const std::string& deploymentId, const std::string& ownerUserId) {
     Json::Value msg;
     msg["type"] = "deployment_deleted";
     msg["deployment_id"] = deploymentId;
@@ -117,7 +167,9 @@ void LogWebSocketController::broadcastDeploymentDeleted(const std::string& deplo
     std::string out = writer.write(msg);
 
     std::lock_guard<std::mutex> lock(subscribersMutex_);
-    sendToChannelUnlocked(kGlobalDeploymentsChannel, out);
+    if (!ownerUserId.empty()) {
+        sendToChannelUnlocked(globalChannelFor(ownerUserId), out);
+    }
     sendToChannelUnlocked(deploymentId, out);
 }
 

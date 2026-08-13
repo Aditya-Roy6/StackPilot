@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "ProjectEnvironmentController.h"
+#include "../utils/StringUtils.h"
 #include "../db/Database.h"
 #include "../utils/AuditLogger.h"
 #include "../utils/JwtHelper.h"
@@ -20,6 +21,9 @@
 
 namespace stackpilot {
 namespace {
+
+using strings::trim;
+
 
 Json::Value environmentRowToJson(const pqxx::row& row) {
     Json::Value env(Json::objectValue);
@@ -49,18 +53,6 @@ bool projectBelongsToUser(pqxx::transaction_base& txn,
                           const std::string& userId) {
     auto rows = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND user_id = $2", projectId, userId);
     return !rows.empty();
-}
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
 }
 
 std::string toLower(std::string value) {

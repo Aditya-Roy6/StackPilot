@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1221,6 +1222,44 @@ void HealthController::listInfrastructureClaims(
     }
 }
 
+namespace {
+
+// The platform's own containers must never be claimable or controllable through
+// the self-service infrastructure API — a user stopping stackpilot-postgres takes
+// down StackPilot itself. Deployment containers (stackpilot-local-*) are NOT in
+// this set and remain fully controllable.
+bool isProtectedPlatformContainer(const std::string& candidate) {
+    if (candidate.empty()) {
+        return false;
+    }
+    static const std::set<std::string> kProtected = {
+        "stackpilot-backend", "stackpilot-frontend", "stackpilot-ai-service",
+        "stackpilot-postgres", "stackpilot-redis", "stackpilot-prometheus",
+        "stackpilot-grafana", "stackpilot-loki", "stackpilot-promtail",
+        "stackpilot-cadvisor"
+    };
+    if (kProtected.count(candidate) > 0) {
+        return true;
+    }
+    // Operators can extend the list without a rebuild.
+    const char* extra = std::getenv("STACKPILOT_PROTECTED_CONTAINERS");
+    if (extra == nullptr) {
+        return false;
+    }
+    std::stringstream ss(extra);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        const size_t b = item.find_first_not_of(" 	");
+        const size_t e = item.find_last_not_of(" 	");
+        if (b != std::string::npos && candidate == item.substr(b, e - b + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
 void HealthController::claimInfrastructureResource(
     const drogon::HttpRequestPtr& req,
     std::function<void(const drogon::HttpResponsePtr&)>&& callback
@@ -1280,6 +1319,17 @@ void HealthController::claimInfrastructureResource(
         payload["error"] = "provider_type, resource_type, resource_key, and name are required";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
         resp->setStatusCode(drogon::k400BadRequest);
+        callback(resp);
+        return;
+    }
+
+    if (providerType == "docker" && resourceType == "container" &&
+        (isProtectedPlatformContainer(name) || isProtectedPlatformContainer(resourceKey) ||
+         isProtectedPlatformContainer(externalId))) {
+        Json::Value payload;
+        payload["error"] = "This container is part of the StackPilot platform and cannot be claimed";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+        resp->setStatusCode(drogon::k403Forbidden);
         callback(resp);
         return;
     }
@@ -1696,6 +1746,14 @@ void HealthController::restartInfrastructureResource(
         std::string action;
         if (resolvedProvider == "docker" && resolvedType == "container") {
             const std::string target = !externalId.empty() ? externalId : name;
+            if (isProtectedPlatformContainer(name) || isProtectedPlatformContainer(target)) {
+                Json::Value payload;
+                payload["error"] = "This container is part of the StackPilot platform and cannot be controlled";
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+                resp->setStatusCode(drogon::k403Forbidden);
+                callback(resp);
+                return;
+            }
             command = "timeout 20s sh -lc \"docker restart " + shellQuote(target) + " 2>&1\"";
             action = "docker_restart";
         } else if (resolvedProvider == "kubernetes" && resolvedType == "deployment" && !namespaceName.empty()) {
@@ -1808,6 +1866,14 @@ void HealthController::dockerStateInfrastructureResource(
         const std::string name = resource["name"].asString();
         const std::string externalId = resource["external_id"].asString();
         const std::string runtimeTarget = !externalId.empty() ? externalId : name;
+        if (isProtectedPlatformContainer(name) || isProtectedPlatformContainer(runtimeTarget)) {
+            Json::Value payload;
+            payload["error"] = "This container is part of the StackPilot platform and cannot be controlled";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+            resp->setStatusCode(drogon::k403Forbidden);
+            callback(resp);
+            return;
+        }
         const std::string command = "timeout 20s sh -lc \"docker " + requestedAction + " " + shellQuote(runtimeTarget) + " 2>&1\"";
 
         Json::Value payload;
@@ -2278,6 +2344,75 @@ void HealthController::kubernetesResourceYaml(
     }
 }
 
+namespace {
+
+// Guards the self-service apply-yaml endpoint. The claim check only proves the
+// caller holds *a* claim on *some* Kubernetes object; without this, a claim on
+// one's own pod allowed applying a ClusterRoleBinding or a hostPath DaemonSet.
+// Only namespaced, non-privileged kinds are permitted.
+bool applyYamlIsAllowed(const std::string& yaml, std::string& rejection) {
+    static const std::set<std::string> kAllowedKinds = {
+        "ConfigMap", "CronJob", "Deployment", "HorizontalPodAutoscaler", "Ingress",
+        "Job", "PersistentVolumeClaim", "Pod", "PodDisruptionBudget", "Service",
+        "StatefulSet"
+    };
+
+    const std::string ws = std::string(" ") + static_cast<char>(9);
+    const std::string trimChars = ws + static_cast<char>(34) + static_cast<char>(39);
+
+    std::stringstream ss(yaml);
+    std::string line;
+    int documentCount = 1;
+    bool sawContent = false;
+    bool sawKind = false;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == static_cast<char>(13)) {
+            line.pop_back();
+        }
+        const size_t firstReal = line.find_first_not_of(ws);
+        if (firstReal == std::string::npos) {
+            continue;
+        }
+        if (line.substr(firstReal) == "---") {
+            // A leading separator is conventional; a later one means multi-doc.
+            if (sawContent) {
+                ++documentCount;
+            }
+            continue;
+        }
+        sawContent = true;
+
+        // Only a top-level (column 0) `kind:` identifies the object being applied.
+        if (line.rfind("kind:", 0) != 0) {
+            continue;
+        }
+        std::string value = line.substr(5);
+        const size_t b = value.find_first_not_of(trimChars);
+        const size_t e = value.find_last_not_of(trimChars);
+        if (b == std::string::npos) {
+            continue;
+        }
+        value = value.substr(b, e - b + 1);
+        sawKind = true;
+        if (kAllowedKinds.count(value) == 0) {
+            rejection = "Applying kind '" + value + "' is not permitted through this endpoint";
+            return false;
+        }
+    }
+
+    if (documentCount > 1) {
+        rejection = "Multi-document YAML is not permitted; apply one object at a time";
+        return false;
+    }
+    if (!sawKind) {
+        rejection = "YAML must declare a top-level 'kind'";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 void HealthController::applyKubernetesResourceYaml(
     const drogon::HttpRequestPtr& req,
     std::function<void(const drogon::HttpResponsePtr&)>&& callback
@@ -2362,6 +2497,16 @@ void HealthController::applyKubernetesResourceYaml(
             return;
         }
 
+        std::string yamlRejection;
+        if (!applyYamlIsAllowed(yaml, yamlRejection)) {
+            Json::Value payload;
+            payload["error"] = yamlRejection;
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+            resp->setStatusCode(drogon::k403Forbidden);
+            callback(resp);
+            return;
+        }
+
         const std::string resourceType = resource["resource_type"].asString();
         if (resourceType != "namespace" && resourceType != "node" && resourceType != "pod" &&
             resourceType != "deployment" && resourceType != "service") {
@@ -2384,6 +2529,14 @@ void HealthController::applyKubernetesResourceYaml(
             }
             out << yaml;
         }
+        // The manifest may contain Secret stringData; don't leave it world-readable.
+        std::error_code permErr;
+        std::filesystem::permissions(
+            yamlPath,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace,
+            permErr
+        );
 
         std::string yamlPathForKubectl = yamlPath.string();
         std::string remoteYamlPath;
@@ -2399,7 +2552,14 @@ void HealthController::applyKubernetesResourceYaml(
             yamlPathForKubectl = remoteYamlPath;
         }
 
+        // Pin the namespace: kubectl errors when the manifest names a different one.
+        const std::string claimedNamespace = resourceType == "namespace"
+            ? resource["name"].asString()
+            : resource["namespace"].asString();
+        const std::string namespaceFlag =
+            claimedNamespace.empty() ? "" : ("-n " + shellQuote(claimedNamespace) + " ");
         const std::string applyCommand = "timeout 35s sh -lc \"kubectl apply " +
+            namespaceFlag +
             std::string(dryRun ? "--dry-run=server -o yaml " : "") +
             "-f " + shellQuote(yamlPathForKubectl) + " 2>&1\"";
         const std::string applyOutput = runCommandForTarget(target, applyCommand, 45);

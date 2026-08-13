@@ -1,25 +1,16 @@
-// ============================================================
-// main.cpp — Application Entry Point
-// ============================================================
-// CONCEPT: This is where your application starts. Think of it
-// as the "ignition" of your server.
+// Entry point: logging, database, migrations, then the Drogon event loop.
 //
-// What happens here:
-// 1. Initialize logging (spdlog)
-// 2. Connect to PostgreSQL database
-// 3. Start the Drogon HTTP server
-//
-// Drogon is an ASYNC framework — it uses an event loop
-// (like Node.js) to handle thousands of connections without
-// creating a thread per request. This is why C++ web servers
-// can be so fast.
-// ============================================================
+// Drogon handlers run on a small pool of event-loop threads, so anything that
+// blocks (SSH, shelling out, upstream AI calls) must be dispatched to
+// BlockingTaskRunner instead of running inline.
 
 #include <drogon/drogon.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include "db/Database.h"
+#include "utils/StringUtils.h"
 #include "services/JobQueueService.h"
+#include "utils/BlockingTaskRunner.h"
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +27,9 @@
 #include <pqxx/pqxx>
 
 namespace {
+
+using stackpilot::strings::trim;
+
 
 std::string getEnvOrDefault(const char* name, const std::string& fallback) {
     const char* value = std::getenv(name);
@@ -59,17 +53,6 @@ bool getEnvBoolOrDefault(const char* name, bool fallback) {
     std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
-}
-
-std::string trim(std::string value) {
-    auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
-    value.erase(value.begin(), std::find_if(value.begin(), value.end(), [&](char c) {
-        return !isSpace(static_cast<unsigned char>(c));
-    }));
-    value.erase(std::find_if(value.rbegin(), value.rend(), [&](char c) {
-        return !isSpace(static_cast<unsigned char>(c));
-    }).base(), value.end());
-    return value;
 }
 
 std::vector<std::string> splitCsv(const std::string& value) {
@@ -450,10 +433,6 @@ int main() {
     }
 
     // ─── Step 3: Configure and run Drogon ───────────────────
-    // CONCEPT: Drogon auto-discovers controllers at compile time
-    // using the METHOD_LIST macros. You don't need to manually
-    // register routes — just define controllers and they work.
-
     stackpilot::JobQueueService::getInstance().start();
 
     auto& app = drogon::app();
@@ -549,6 +528,67 @@ int main() {
         }
     );
 
+
+    // Workers for handlers that make synchronous outbound calls (the AI service
+    // client blocks for up to 120s). Keeping that work off the event-loop threads
+    // is what stops a few slow AI requests from stalling the whole backend.
+    {
+        std::size_t blockingWorkers = 8;
+        if (const char* env = std::getenv("STACKPILOT_BLOCKING_WORKERS")) {
+            try {
+                const int parsed = std::stoi(env);
+                if (parsed > 0) {
+                    blockingWorkers = static_cast<std::size_t>(parsed);
+                }
+            } catch (const std::exception&) {
+                spdlog::warn("Invalid STACKPILOT_BLOCKING_WORKERS, using {}", blockingWorkers);
+            }
+        }
+        stackpilot::BlockingTaskRunner::getInstance().start(blockingWorkers);
+    }
+
+    // AI history retention. `ai_preferences.history_retention_days` was stored,
+    // validated and returned by the API but never enforced anywhere, so
+    // ai_runs / ai_artifacts / ai_messages / ai_memory_chunks grew without bound.
+    // Cascades on run_id and session_id clean up the child rows.
+    {
+        const auto sweepAiHistory = []() {
+            try {
+                auto conn = stackpilot::Database::getInstance().getConnection();
+                pqxx::work txn(*conn);
+                const auto runs = txn.exec(
+                    "DELETE FROM ai_runs r USING ai_preferences p "
+                    "WHERE r.user_id = p.user_id "
+                    "  AND r.created_at < NOW() - make_interval(days => p.history_retention_days)"
+                );
+                const auto sessions = txn.exec(
+                    "DELETE FROM ai_sessions s USING ai_preferences p "
+                    "WHERE s.user_id = p.user_id "
+                    "  AND s.updated_at < NOW() - make_interval(days => p.history_retention_days)"
+                );
+                const auto chunks = txn.exec(
+                    "DELETE FROM ai_memory_chunks m USING ai_preferences p "
+                    "WHERE m.user_id = p.user_id "
+                    "  AND m.created_at < NOW() - make_interval(days => p.history_retention_days)"
+                );
+                txn.commit();
+                const auto total = runs.affected_rows() + sessions.affected_rows() + chunks.affected_rows();
+                if (total > 0) {
+                    spdlog::info("AI retention sweep removed {} row(s)", total);
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("AI retention sweep skipped: {}", e.what());
+            }
+        };
+
+        // Runs on a worker thread so the DB work never occupies an event loop.
+        drogon::app().getLoop()->runAfter(60.0, [sweepAiHistory]() {
+            stackpilot::BlockingTaskRunner::run(sweepAiHistory);
+        });
+        drogon::app().getLoop()->runEvery(24 * 60 * 60.0, [sweepAiHistory]() {
+            stackpilot::BlockingTaskRunner::run(sweepAiHistory);
+        });
+    }
 
     spdlog::info("Server starting on http://0.0.0.0:8090");
     spdlog::info("Press Ctrl+C to stop");

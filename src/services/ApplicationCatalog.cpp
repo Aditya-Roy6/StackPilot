@@ -1,4 +1,5 @@
 #include "ApplicationCatalog.h"
+#include "../utils/StringUtils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -9,17 +10,8 @@ namespace stackpilot {
 
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
-}
+using strings::trim;
+
 
 std::string lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -405,6 +397,20 @@ std::vector<BuildEnvVar> ApplicationCatalog::envVarsForConfig(const std::string&
         }
     }
     return envVars;
+}
+
+std::vector<std::string> ApplicationCatalog::secretEnvKeys(const std::string& templateId) {
+    std::vector<std::string> keys;
+    const auto* tmpl = findTemplate(templateId);
+    if (!tmpl) {
+        return keys;
+    }
+    for (const auto& field : tmpl->fields) {
+        if (field.secret && !field.envKey.empty()) {
+            keys.push_back(field.envKey);
+        }
+    }
+    return keys;
 }
 
 std::filesystem::path ApplicationCatalog::materializeSource(const std::string& deploymentId,

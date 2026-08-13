@@ -138,6 +138,11 @@ private:
     struct SessionFiles {
         std::string knownHostsPath;
         std::string privateKeyPath;
+        // Mode-0600 file holding the SSH password for `sshpass -f`. Passing the
+        // password via SSHPASS=... in the command string put it in the argv of
+        // sh/timeout, where any process in the container could read it from
+        // `ps` or /proc/<pid>/cmdline.
+        std::string passwordPath;
         std::string sshPrefix;
         std::string sshpassPrefix;
     };

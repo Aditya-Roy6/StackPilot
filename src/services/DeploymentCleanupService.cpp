@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "DeploymentCleanupService.h"
+#include "../utils/StringUtils.h"
 
 #include "../controllers/LogWebSocketController.h"
 #include "../db/Database.h"
@@ -28,17 +29,8 @@
 namespace stackpilot {
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
-}
+using strings::trim;
+
 
 Json::Value parseJsonObject(const std::string& raw) {
     if (trim(raw).empty()) {
@@ -168,11 +160,18 @@ SshOperationResult removeLocalDockerImage(const std::string& imageName) {
         result.error = "Docker image reference is empty or invalid";
         return result;
     }
+    // The previous command was `docker image rm -f ... || true; echo DONE`, so the
+    // success marker printed even when removal failed and the caller reported the
+    // image as deleted. An image that is already gone still counts as success so
+    // cleanup stays idempotent.
     const std::string command =
         "timeout 60s sh -lc " +
-        shellQuote("if command -v docker >/dev/null 2>&1; then docker image rm -f " +
-                   shellQuote(imageName) + " || true; echo __STACKPILOT_LOCAL_IMAGE_CLEANUP_DONE__; "
-                   "else echo __STACKPILOT_DOCKER_MISSING__; exit 11; fi");
+        shellQuote("if ! command -v docker >/dev/null 2>&1; then echo __STACKPILOT_DOCKER_MISSING__; exit 11; fi; "
+                   "if ! docker image inspect " + shellQuote(imageName) + " >/dev/null 2>&1; then "
+                   "echo __STACKPILOT_LOCAL_IMAGE_CLEANUP_DONE__; exit 0; fi; "
+                   "if docker image rm -f " + shellQuote(imageName) + "; then "
+                   "echo __STACKPILOT_LOCAL_IMAGE_CLEANUP_DONE__; "
+                   "else echo __STACKPILOT_LOCAL_IMAGE_CLEANUP_FAILED__; exit 12; fi");
     std::string output;
     const int exitCode = runCommand(command, output);
     result.exitCode = exitCode;
@@ -409,6 +408,10 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             }
         }
 
+        // Set by the compose-on-Kubernetes branches so the generic Kubernetes
+        // teardown below doesn't try to remove the same objects twice.
+        bool kubernetesHandled = false;
+
         const bool composeKubernetesRuntime =
             runtimeSnapshotJson.get("compose_kubernetes", false).asBool() ||
             (runtimeSnapshotJson.get("multi_service", false).asBool() &&
@@ -417,6 +420,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
 
         if (composeKubernetesRuntime && runtimeProvider == "remote_kubernetes" && !composeProject.empty() && hasRemoteHost) {
             result.runtimeCleanupAttempted = true;
+            kubernetesHandled = true;
             SshService sshService;
             const KubernetesRuntimeInfo removal = sshService.removeComposeKubernetesRuntime(
                 rowToRemoteRuntimeConfig(row),
@@ -453,6 +457,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             }
         } else if (composeKubernetesRuntime && runtimeProvider == "kubernetes" && !composeProject.empty()) {
             result.runtimeCleanupAttempted = true;
+            kubernetesHandled = true;
             KubernetesService service;
             const KubernetesRuntimeInfo removal = service.removeComposeStack(nameSpace, composeProject, exposureMode);
             result.logs += removal.logs;
@@ -504,7 +509,13 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 result.error = removal.error.empty() ? "Failed to remove local Docker runtime before deleting deployment" : removal.error;
                 return result;
             }
-        } else if (runtimeProvider == "remote_kubernetes" && !deploymentName.empty() && !serviceName.empty() && hasRemoteHost) {
+        }
+
+        // Evaluated independently of the Docker branches above. A deployment can
+        // carry a live container AND stale Kubernetes metadata (or vice versa);
+        // the old single if/else-if chain tore down whichever matched first, then
+        // deleted the DB row — orphaning the rest with no record to find them by.
+        if (!kubernetesHandled && runtimeProvider == "remote_kubernetes" && !deploymentName.empty() && !serviceName.empty() && hasRemoteHost) {
             result.runtimeCleanupAttempted = true;
             SshService sshService;
             const KubernetesRuntimeInfo removal = sshService.removeKubernetesRuntime(rowToRemoteRuntimeConfig(row), nameSpace, deploymentName, serviceName, exposureMode);
@@ -514,7 +525,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 result.error = removal.error.empty() ? "Failed to remove remote Kubernetes runtime before deleting deployment" : removal.error;
                 return result;
             }
-        } else if (!deploymentName.empty() && !serviceName.empty()) {
+        } else if (!kubernetesHandled && !deploymentName.empty() && !serviceName.empty()) {
             result.runtimeCleanupAttempted = true;
             KubernetesService service;
             const KubernetesRuntimeInfo removal = service.remove(nameSpace, deploymentName, serviceName, exposureMode);
@@ -589,7 +600,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 result.error = "Deployment not found";
                 return result;
             }
-            LogWebSocketController::broadcastDeploymentDeleted(deploymentId);
+            LogWebSocketController::broadcastDeploymentDeleted(deploymentId, userId);
         }
 
         result.success = true;

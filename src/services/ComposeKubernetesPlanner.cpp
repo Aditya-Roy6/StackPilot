@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "ComposeKubernetesPlanner.h"
+#include "../utils/StringUtils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,17 +15,8 @@ namespace stackpilot {
 
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
-}
+using strings::trim;
+
 
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {

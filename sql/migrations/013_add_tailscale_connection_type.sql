@@ -6,11 +6,15 @@ UPDATE ssh_connections
 SET connection_type = 'ssh'
 WHERE COALESCE(connection_type, '') = '';
 
+-- One-time normalization of rows that predate connection_type. The
+-- `auth_type IS DISTINCT FROM 'tailscale'` guard keeps a re-run from wiping
+-- credentials a user has since saved against a Tailscale connection.
 UPDATE ssh_connections
 SET auth_type = 'tailscale',
     password_encrypted = NULL,
     private_key_encrypted = NULL
-WHERE connection_type = 'tailscale';
+WHERE connection_type = 'tailscale'
+  AND auth_type IS DISTINCT FROM 'tailscale';
 
 CREATE INDEX IF NOT EXISTS idx_ssh_connections_user_connection_type
     ON ssh_connections(user_id, connection_type);

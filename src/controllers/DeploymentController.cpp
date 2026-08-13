@@ -3,8 +3,11 @@
 // ============================================================
 
 #include "DeploymentController.h"
+#include "../utils/StringUtils.h"
+#include "../utils/RuntimeRateLimiter.h"
 #include "LogWebSocketController.h"
 #include "../db/Database.h"
+#include "../utils/AgentPolicy.h"
 #include "../services/ApplicationCatalog.h"
 #include "../services/BuildService.h"
 #include "../services/DeploymentCleanupService.h"
@@ -36,37 +39,10 @@ namespace stackpilot {
 
 namespace {
 
+using strings::trim;
+
+
 std::mutex deploymentLogMutex;
-std::mutex runtimeOperationRateLimitMutex;
-
-struct RuntimeRateLimitState {
-    int attempts = 0;
-    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point blockedUntil = std::chrono::steady_clock::time_point::min();
-};
-
-struct RuntimeRateLimitPolicy {
-    int maxAttempts;
-    int windowSeconds;
-    int blockSeconds;
-};
-
-std::unordered_map<std::string, RuntimeRateLimitState> runtimeRateLimitStates;
-const RuntimeRateLimitPolicy kRuntimeMutationRateLimit{12, 300, 300};
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
-}
 
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -141,17 +117,6 @@ Json::Value deploymentSourceSnapshot(const std::string& sourceType,
     snapshot["local_https_enabled"] = localHttpsEnabled;
     snapshot["version"] = version;
     snapshot["project_name"] = projectName;
-    return snapshot;
-}
-
-Json::Value envKeySnapshot(const std::vector<BuildEnvVar>& envVars) {
-    Json::Value snapshot(Json::arrayValue);
-    for (const auto& envVar : envVars) {
-        Json::Value item;
-        item["key"] = envVar.key;
-        item["has_value"] = !envVar.value.empty();
-        snapshot.append(item);
-    }
     return snapshot;
 }
 
@@ -348,87 +313,6 @@ std::string remoteLogTailFromInspectOutput(const std::string& output) {
     return trim(output.substr(pos + marker.size()));
 }
 
-std::string getClientAddress(const drogon::HttpRequestPtr& req) {
-    if (!req) {
-        return "unknown";
-    }
-
-    const std::string forwarded = trim(req->getHeader("X-Forwarded-For"));
-    if (!forwarded.empty()) {
-        const auto comma = forwarded.find(',');
-        return toLower(trim(forwarded.substr(0, comma)));
-    }
-
-    return toLower(req->peerAddr().toIp());
-}
-
-std::string makeRuntimeRateLimitKey(const std::string& scope,
-                                    const drogon::HttpRequestPtr& req,
-                                    const std::string& userId,
-                                    const std::string& deploymentId) {
-    return scope + ":" + getClientAddress(req) + ":" + userId + ":" + deploymentId;
-}
-
-int getRuntimeRetryAfterSeconds(const std::string& key) {
-    std::lock_guard<std::mutex> lock(runtimeOperationRateLimitMutex);
-    const auto it = runtimeRateLimitStates.find(key);
-    if (it == runtimeRateLimitStates.end()) {
-        return 0;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= it->second.blockedUntil) {
-        return 0;
-    }
-
-    return static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(it->second.blockedUntil - now).count());
-}
-
-bool isRuntimeRateLimited(const std::string& key, int& retryAfterSeconds) {
-    retryAfterSeconds = getRuntimeRetryAfterSeconds(key);
-    return retryAfterSeconds > 0;
-}
-
-void recordRuntimeRateLimitFailure(const std::string& key, const RuntimeRateLimitPolicy& policy) {
-    std::lock_guard<std::mutex> lock(runtimeOperationRateLimitMutex);
-    auto& state = runtimeRateLimitStates[key];
-    const auto now = std::chrono::steady_clock::now();
-
-    if (now >= state.blockedUntil && now - state.windowStart > std::chrono::seconds(policy.windowSeconds)) {
-        state.attempts = 0;
-        state.windowStart = now;
-    }
-
-    if (state.blockedUntil > now) {
-        return;
-    }
-
-    if (state.attempts == 0) {
-        state.windowStart = now;
-    }
-
-    ++state.attempts;
-    if (state.attempts >= policy.maxAttempts) {
-        state.blockedUntil = now + std::chrono::seconds(policy.blockSeconds);
-        state.attempts = 0;
-        state.windowStart = now;
-    }
-}
-
-void clearRuntimeRateLimitState(const std::string& key) {
-    std::lock_guard<std::mutex> lock(runtimeOperationRateLimitMutex);
-    runtimeRateLimitStates.erase(key);
-}
-
-drogon::HttpResponsePtr makeRuntimeRateLimitedResponse(int retryAfterSeconds) {
-    Json::Value err;
-    err["error"] = "Too many runtime operations. Please wait and try again.";
-    auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-    resp->setStatusCode(drogon::k429TooManyRequests);
-    resp->addHeader("Retry-After", std::to_string(std::max(1, retryAfterSeconds)));
-    return resp;
-}
-
 void appendDeploymentLog(const std::string& deploymentId, const std::string& line) {
     std::lock_guard<std::mutex> lock(deploymentLogMutex);
 
@@ -486,7 +370,7 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
     auto conn = db.getConnection();
     pqxx::work txn(*conn);
     auto rows = txn.exec_params(
-        "SELECT d.id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
+        "SELECT d.id, p.user_id AS owner_user_id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
         "d.environment_id, e.name AS environment_name, d.branch, d.commit_sha, d.trigger_source, d.github_delivery_id, "
         "d.ci_required, d.ci_status, d.logs, d.image_name, "
         "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
@@ -507,6 +391,8 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
     const auto& row = rows[0];
     Json::Value dep;
     dep["id"] = row["id"].as<std::string>();
+    // Internal routing field, stripped before the payload is sent.
+    dep["__owner_user_id"] = row["owner_user_id"].as<std::string>();
     dep["project_id"] = row["project_id"].as<std::string>();
     dep["project_name"] = row["project_name"].as<std::string>();
     dep["repo_url"] = row["repo_url"].is_null() ? "" : row["repo_url"].as<std::string>();
@@ -530,7 +416,9 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
 void broadcastDeploymentSummary(const std::string& deploymentId) {
     Json::Value summary = loadDeploymentSummary(deploymentId);
     if (!summary.isNull()) {
-        LogWebSocketController::broadcastDeploymentUpdate(summary);
+        const std::string ownerUserId = summary.get("__owner_user_id", "").asString();
+        summary.removeMember("__owner_user_id");
+        LogWebSocketController::broadcastDeploymentUpdate(summary, ownerUserId);
     }
 }
 
@@ -1495,6 +1383,20 @@ void DeploymentController::createDeployment(
         callback(resp); return;
     }
 
+    // Agent-initiated mutations are subject to the user's stored agent policy.
+    {
+        std::string agentRefusal;
+        if (!AgentPolicy::allowsMutation(req, userId, agentRefusal)) {
+            Json::Value err;
+            err["error"] = agentRefusal;
+            err["requires_approval"] = true;
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k403Forbidden);
+            callback(resp);
+            return;
+        }
+    }
+
     try {
         auto& db = Database::getInstance();
         auto conn = db.getConnection();
@@ -1819,6 +1721,20 @@ void DeploymentController::triggerBuild(
         callback(resp); return;
     }
 
+    // Agent-initiated mutations are subject to the user's stored agent policy.
+    {
+        std::string agentRefusal;
+        if (!AgentPolicy::allowsMutation(req, userId, agentRefusal)) {
+            Json::Value err;
+            err["error"] = agentRefusal;
+            err["requires_approval"] = true;
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k403Forbidden);
+            callback(resp);
+            return;
+        }
+    }
+
     try {
         auto& db = Database::getInstance();
         auto conn = db.getConnection();
@@ -1832,7 +1748,12 @@ void DeploymentController::triggerBuild(
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            // FOR UPDATE OF d serializes concurrent triggers. Without it two
+            // simultaneous POSTs both read 'built', both enqueue, and two workers
+            // build the same deployment — colliding on identical derived image and
+            // container names, where `docker rm -f` kills the other run's container.
+            "WHERE d.id = $1 AND p.user_id = $2 "
+            "FOR UPDATE OF d",
             deploymentId,
             userId
         );
@@ -1925,525 +1846,6 @@ void DeploymentController::triggerBuild(
         callback(resp);
         return;
     }
-
-    try {
-        auto& db = Database::getInstance();
-        auto conn = db.getConnection();
-        pqxx::work txn(*conn);
-
-        auto deploymentRows = txn.exec_params(
-            "SELECT d.id, d.version, d.status, p.name AS project_name, p.repo_url, p.github_pat, p.source_type, p.ssh_connection_id, p.source_path, "
-            "p.application_template_id, p.application_config::text AS application_config, "
-            "p.execution_mode, p.remote_runtime_type, p.remote_k8s_exposure, p.remote_connection_id, p.runtime_scheme, p.local_https_enabled, "
-            "u.github_access_token, COALESCE(s.connection_type, 'ssh') AS connection_type, s.host, s.port, s.username, s.auth_type, "
-            "s.password_encrypted, s.private_key_encrypted, s.known_hosts_entry, "
-            "COALESCE(rs.connection_type, 'ssh') AS remote_connection_type, rs.host AS remote_host, rs.port AS remote_port, rs.username AS remote_username, "
-            "rs.auth_type AS remote_auth_type, rs.password_encrypted AS remote_password_encrypted, rs.private_key_encrypted AS remote_private_key_encrypted, "
-            "rs.known_hosts_entry AS remote_known_hosts_entry "
-            "FROM deployments d "
-            "JOIN projects p ON d.project_id = p.id "
-            "JOIN users u ON p.user_id = u.id "
-            "LEFT JOIN ssh_connections s ON p.ssh_connection_id = s.id "
-            "LEFT JOIN ssh_connections rs ON p.remote_connection_id = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
-            deploymentId, userId
-        );
-
-        if (deploymentRows.empty()) {
-            Json::Value err; err["error"] = "Deployment not found";
-            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-            resp->setStatusCode(drogon::k404NotFound);
-            callback(resp); return;
-        }
-
-        const std::string version = deploymentRows[0]["version"].as<std::string>();
-        const std::string currentStatus = deploymentRows[0]["status"].as<std::string>();
-        const std::string projectName = deploymentRows[0]["project_name"].as<std::string>();
-        const std::string sourceType =
-            deploymentRows[0]["source_type"].is_null() ? "github" : deploymentRows[0]["source_type"].as<std::string>();
-        const std::string executionMode =
-            deploymentRows[0]["execution_mode"].is_null() ? "local" : deploymentRows[0]["execution_mode"].as<std::string>();
-        const std::string remoteRuntimeType =
-            deploymentRows[0]["remote_runtime_type"].is_null() ? "docker" : deploymentRows[0]["remote_runtime_type"].as<std::string>();
-        const std::string remoteK8sExposure =
-            deploymentRows[0]["remote_k8s_exposure"].is_null() ? "nodeport" : deploymentRows[0]["remote_k8s_exposure"].as<std::string>();
-        const std::string runtimeScheme = normalizeRuntimeScheme(
-            deploymentRows[0]["runtime_scheme"].is_null() ? "http" : deploymentRows[0]["runtime_scheme"].as<std::string>()
-        );
-        const bool localHttpsEnabled = false;
-        const std::string repoUrl = deploymentRows[0]["repo_url"].as<std::string>();
-        const std::string sourcePath =
-            deploymentRows[0]["source_path"].is_null() ? "" : deploymentRows[0]["source_path"].as<std::string>();
-        const std::string applicationTemplateId =
-            deploymentRows[0]["application_template_id"].is_null() ? "" : deploymentRows[0]["application_template_id"].as<std::string>();
-        const Json::Value applicationConfig = parseJsonObject(
-            deploymentRows[0]["application_config"].is_null() ? "" : deploymentRows[0]["application_config"].as<std::string>()
-        );
-        const std::string projectToken = TokenCrypto::decrypt(deploymentRows[0]["github_pat"].as<std::string>());
-        const std::string linkedGitHubToken =
-            deploymentRows[0]["github_access_token"].is_null()
-                ? ""
-                : TokenCrypto::decrypt(deploymentRows[0]["github_access_token"].as<std::string>());
-        const std::string githubPat = !projectToken.empty() ? projectToken : linkedGitHubToken;
-        std::vector<BuildEnvVar> envVars;
-        SshConnectionConfig sshConfig;
-        SshConnectionConfig remoteExecutionConfig;
-        if (sourceType == "ssh") {
-            if (deploymentRows[0]["host"].is_null() || deploymentRows[0]["username"].is_null() ||
-                deploymentRows[0]["auth_type"].is_null()) {
-                Json::Value err; err["error"] = "Project SSH connection is missing or no longer available";
-                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-                resp->setStatusCode(drogon::k400BadRequest);
-                callback(resp); return;
-            }
-            sshConfig.connectionType = deploymentRows[0]["connection_type"].as<std::string>();
-            sshConfig.host = deploymentRows[0]["host"].as<std::string>();
-            sshConfig.port = deploymentRows[0]["port"].is_null() ? 22 : deploymentRows[0]["port"].as<int>();
-            sshConfig.username = deploymentRows[0]["username"].as<std::string>();
-            sshConfig.authType = deploymentRows[0]["auth_type"].as<std::string>();
-            sshConfig.password = deploymentRows[0]["password_encrypted"].is_null()
-                ? ""
-                : TokenCrypto::decrypt(deploymentRows[0]["password_encrypted"].as<std::string>());
-            sshConfig.privateKey = deploymentRows[0]["private_key_encrypted"].is_null()
-                ? ""
-                : TokenCrypto::decrypt(deploymentRows[0]["private_key_encrypted"].as<std::string>());
-            sshConfig.knownHostsEntry = deploymentRows[0]["known_hosts_entry"].as<std::string>();
-        }
-        if (executionMode == "remote_host") {
-            if (sourceType == "local") {
-                Json::Value err; err["error"] = "Remote host execution does not support local source projects";
-                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-                resp->setStatusCode(drogon::k400BadRequest);
-                callback(resp); return;
-            }
-            if (remoteRuntimeType != "docker" && remoteRuntimeType != "kubernetes") {
-                Json::Value err; err["error"] = "Remote host runtime must be Docker or Kubernetes";
-                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-                resp->setStatusCode(drogon::k400BadRequest);
-                callback(resp); return;
-            }
-            if (deploymentRows[0]["remote_host"].is_null() || deploymentRows[0]["remote_username"].is_null() ||
-                deploymentRows[0]["remote_auth_type"].is_null()) {
-                Json::Value err; err["error"] = "Remote execution connection is missing or no longer available";
-                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-                resp->setStatusCode(drogon::k400BadRequest);
-                callback(resp); return;
-            }
-            remoteExecutionConfig.connectionType = deploymentRows[0]["remote_connection_type"].as<std::string>();
-            remoteExecutionConfig.host = deploymentRows[0]["remote_host"].as<std::string>();
-            remoteExecutionConfig.port = deploymentRows[0]["remote_port"].is_null() ? 22 : deploymentRows[0]["remote_port"].as<int>();
-            remoteExecutionConfig.username = deploymentRows[0]["remote_username"].as<std::string>();
-            remoteExecutionConfig.authType = deploymentRows[0]["remote_auth_type"].as<std::string>();
-            remoteExecutionConfig.password = deploymentRows[0]["remote_password_encrypted"].is_null()
-                ? ""
-                : TokenCrypto::decrypt(deploymentRows[0]["remote_password_encrypted"].as<std::string>());
-            remoteExecutionConfig.privateKey = deploymentRows[0]["remote_private_key_encrypted"].is_null()
-                ? ""
-                : TokenCrypto::decrypt(deploymentRows[0]["remote_private_key_encrypted"].as<std::string>());
-            remoteExecutionConfig.knownHostsEntry = deploymentRows[0]["remote_known_hosts_entry"].as<std::string>();
-        }
-
-        auto envRows = txn.exec_params(
-            "SELECT key, value_encrypted FROM project_env_vars "
-            "WHERE project_id = (SELECT project_id FROM deployments WHERE id = $1) "
-            "ORDER BY key ASC",
-            deploymentId
-        );
-        for (const auto& envRow : envRows) {
-            envVars.push_back({
-                envRow["key"].as<std::string>(),
-                TokenCrypto::decrypt(envRow["value_encrypted"].as<std::string>())
-            });
-        }
-
-        if (currentStatus == "building") {
-            Json::Value err; err["error"] = "Build is already in progress for this deployment";
-            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-            resp->setStatusCode(drogon::k409Conflict);
-            callback(resp); return;
-        }
-
-        if (sourceType == "github" && repoUrl.empty()) {
-            Json::Value err; err["error"] = "Project repository URL is required before triggering a build";
-            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-            resp->setStatusCode(drogon::k400BadRequest);
-            callback(resp); return;
-        }
-
-        if (sourceType == "ssh" && sourcePath.empty()) {
-            Json::Value err; err["error"] = "Remote SSH path is required before triggering a build";
-            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-            resp->setStatusCode(drogon::k400BadRequest);
-            callback(resp); return;
-        }
-        if (sourceType == "local" && sourcePath.empty()) {
-            Json::Value err; err["error"] = "Local source path is required before triggering a build";
-            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-            resp->setStatusCode(drogon::k400BadRequest);
-            callback(resp); return;
-        }
-
-        txn.exec_params("DELETE FROM deployment_env_vars WHERE deployment_id = $1", deploymentId);
-        for (const auto& envVar : envVars) {
-            txn.exec_params(
-                "INSERT INTO deployment_env_vars (deployment_id, key, value_encrypted) "
-                "VALUES ($1, $2, $3) "
-                "ON CONFLICT (deployment_id, key) DO UPDATE SET value_encrypted = EXCLUDED.value_encrypted",
-                deploymentId,
-                envVar.key,
-                TokenCrypto::encrypt(envVar.value)
-            );
-        }
-
-        const Json::Value sourceSnapshot = deploymentSourceSnapshot(
-            sourceType, repoUrl, sourcePath, executionMode, remoteRuntimeType, remoteK8sExposure,
-            runtimeScheme, localHttpsEnabled, version, projectName
-        );
-        const Json::Value envSnapshot = envKeySnapshot(envVars);
-        txn.exec_params(
-            "UPDATE deployments "
-            "SET status = 'building', logs = '', source_snapshot = $2::jsonb, env_snapshot = $3::jsonb, "
-            "artifact_available = FALSE, updated_at = NOW() "
-            "WHERE id = $1",
-            deploymentId,
-            compactJson(sourceSnapshot),
-            compactJson(envSnapshot)
-        );
-        txn.commit();
-
-        Json::Value auditMeta;
-        auditMeta["project_name"] = projectName;
-        auditMeta["source_type"] = sourceType;
-        auditMeta["execution_mode"] = executionMode;
-        auditMeta["remote_runtime_type"] = remoteRuntimeType;
-        auditMeta["env_var_count"] = static_cast<int>(envVars.size());
-        AuditLogger::recordFromRequest(req, userId, "deployment.build_triggered", "deployment", deploymentId, auditMeta);
-
-        // Broadcast status update
-        LogWebSocketController::broadcastStatus(deploymentId, "building");
-        broadcastDeploymentSummary(deploymentId);
-
-        // Run build in a background thread to avoid blocking the HTTP thread
-        std::thread buildThread([deploymentId, repoUrl, version, githubPat, sourceType, sourcePath, applicationTemplateId, applicationConfig, sshConfig, executionMode, remoteExecutionConfig, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled, projectName, envVars]() {
-            try {
-                BuildService buildService;
-                const auto logSink = [deploymentId](const std::string& line) {
-                    appendDeploymentLog(deploymentId, line);
-                    LogWebSocketController::broadcastLog(deploymentId, line);
-                };
-                BuildResult buildResult;
-                KubernetesRuntimeInfo remoteK8sRuntime;
-                bool hasRemoteK8sRuntime = false;
-                if (executionMode == "remote_host") {
-                    if (sourceType == "github") {
-                        buildResult = buildService.buildRepositoryAndRunOnRemoteDocker(
-                            deploymentId,
-                            remoteExecutionConfig,
-                            repoUrl,
-                            sourcePath,
-                            version,
-                            githubPat,
-                            "",
-                            "",
-                            projectName,
-                            3000,
-                            envVars,
-                            logSink
-                        );
-                    } else if (sourceType == "application") {
-                        auto generatedSource = ApplicationCatalog::materializeSource(
-                            deploymentId,
-                            projectName,
-                            applicationTemplateId,
-                            applicationConfig,
-                            std::filesystem::temp_directory_path()
-                        );
-                        logSink("Generated application template source: " + applicationTemplateId);
-                        buildResult = buildService.buildGeneratedSourceAndRunOnRemoteDocker(
-                            deploymentId,
-                            remoteExecutionConfig,
-                            generatedSource.string(),
-                            sourcePath.empty() ? "/tmp" : sourcePath,
-                            version,
-                            projectName,
-                            3000,
-                            envVars,
-                            logSink
-                        );
-                    } else {
-                        buildResult = buildService.buildAndRunOnRemoteDocker(
-                            deploymentId,
-                            remoteExecutionConfig,
-                            sourcePath,
-                            projectName,
-                            version,
-                            3000,
-                            envVars,
-                            logSink
-                        );
-                    }
-                    if (buildResult.success && remoteRuntimeType == "kubernetes") {
-                        SshService sshService;
-                        if (buildResult.composeProject) {
-                            KubernetesDeployOptions options;
-                            options.deploymentId = deploymentId;
-                            options.projectName = projectName;
-                            options.nameSpace = "stackpilot-apps";
-                            options.runtimeScheme = runtimeScheme;
-                            options.exposureMode = options.runtimeScheme == "https" ? "ingress" : remoteK8sExposure;
-                            options.replicas = 1;
-                            options.containerPort = 3000;
-                            options.resourcePreset = "small";
-                            options.healthPath = "/";
-                            for (const auto& envVar : envVars) {
-                                options.envVars.emplace_back(envVar.key, envVar.value);
-                            }
-
-                            logSink("Deploying Docker Compose stack to remote Kubernetes...");
-                            remoteK8sRuntime = sshService.deployComposeKubernetesRuntime(
-                                remoteExecutionConfig,
-                                options,
-                                buildResult.composeWorkdir,
-                                buildResult.composeFile,
-                                buildResult.composeProjectName,
-                                buildResult.composeServices
-                            );
-                        } else if (!buildResult.remoteContainerName.empty()) {
-                            const auto cleanup = sshService.removeDockerContainer(
-                                remoteExecutionConfig,
-                                buildResult.remoteContainerName,
-                                buildResult.imageName,
-                                false
-                            );
-                            if (!cleanup.output.empty()) {
-                                buildResult.logs += "\n" + cleanup.output;
-                                logSink("Temporary remote Docker container removed before Kubernetes deployment");
-                            }
-                        }
-
-                        if (!buildResult.composeProject) {
-                            KubernetesDeployOptions options;
-                            options.deploymentId = deploymentId;
-                            options.projectName = projectName;
-                            options.imageName = buildResult.imageName;
-                            options.nameSpace = "stackpilot-apps";
-                            options.runtimeScheme = runtimeScheme;
-                            options.exposureMode = options.runtimeScheme == "https" ? "ingress" : remoteK8sExposure;
-                            options.replicas = 1;
-                            options.containerPort = 3000;
-                            options.resourcePreset = "small";
-                            options.healthPath = "/";
-                            for (const auto& envVar : envVars) {
-                                options.envVars.emplace_back(envVar.key, envVar.value);
-                            }
-
-                            logSink("Deploying image to remote Kubernetes...");
-                            remoteK8sRuntime = sshService.deployKubernetesRuntime(remoteExecutionConfig, options);
-                        }
-                        hasRemoteK8sRuntime = true;
-                        buildResult.logs += "\n" + remoteK8sRuntime.logs;
-                        buildResult.runtimeProvider = "remote_kubernetes";
-                        buildResult.runtimeUrl = remoteK8sRuntime.runtimeUrl;
-                        buildResult.remoteContainerName.clear();
-                        if (!remoteK8sRuntime.success) {
-                            buildResult.success = false;
-                            buildResult.error = remoteK8sRuntime.error.empty()
-                                ? "Remote Kubernetes deployment failed"
-                                : remoteK8sRuntime.error;
-                        }
-                    }
-                } else if (sourceType == "ssh") {
-                    buildResult = buildService.buildFromSshSource(
-                        deploymentId,
-                        sshConfig,
-                        sourcePath,
-                        version,
-                        envVars,
-                        logSink
-                    );
-                } else if (sourceType == "local") {
-                    buildResult = buildService.buildFromLocalSource(
-                        deploymentId,
-                        sourcePath,
-                        version,
-                        envVars,
-                        logSink
-                    );
-                } else if (sourceType == "application") {
-                    auto generatedSource = ApplicationCatalog::materializeSource(
-                        deploymentId,
-                        projectName,
-                        applicationTemplateId,
-                        applicationConfig,
-                        std::filesystem::temp_directory_path()
-                    );
-                    logSink("Generated application template source: " + applicationTemplateId);
-                    buildResult = buildService.buildFromGeneratedSource(
-                        deploymentId,
-                        generatedSource.string(),
-                        version,
-                        envVars,
-                        logSink
-                    );
-                } else {
-                    buildResult = buildService.buildFromRepository(
-                        deploymentId,
-                        repoUrl,
-                        version,
-                        githubPat,
-                        "",
-                        "",
-                        envVars,
-                        logSink
-                    );
-                }
-
-                auto& db = Database::getInstance();
-                auto connUpdate = db.getConnection();
-                pqxx::work updateTxn(*connUpdate);
-                if (buildResult.success) {
-                    if (buildResult.runtimeProvider == "remote_kubernetes" && hasRemoteK8sRuntime) {
-                        updateTxn.exec_params(
-                            "UPDATE deployments "
-                            "SET status = $1, logs = $2, image_name = $3, runtime_url = $4, runtime_exposure = $5, "
-                            "runtime_provider = 'remote_kubernetes', remote_container_name = '', "
-                            "k8s_namespace = $6, k8s_deployment_name = $7, k8s_service_name = $8, k8s_ingress_name = $9, "
-                            "desired_replicas = $10, runtime_snapshot = $11::jsonb, runtime_paused = FALSE, artifact_available = TRUE, updated_at = NOW() "
-                            "WHERE id = $12",
-                            remoteK8sRuntime.status.empty() ? "running" : remoteK8sRuntime.status,
-                            buildResult.logs,
-                            buildResult.imageName,
-                            remoteK8sRuntime.runtimeUrl,
-                            remoteK8sRuntime.exposureMode,
-                            remoteK8sRuntime.nameSpace,
-                            remoteK8sRuntime.deploymentName,
-                            remoteK8sRuntime.serviceName,
-                            remoteK8sRuntime.ingressName,
-                            remoteK8sRuntime.desiredReplicas,
-                            compactJson(buildResult.composeProject
-                                ? composeKubernetesRuntimeSnapshot(buildResult, remoteK8sRuntime, "remote_kubernetes", runtimeScheme, 3000, "small", "/")
-                                : runtimeSnapshot(
-                                    "remote_kubernetes",
-                                    buildResult.imageName,
-                                    remoteK8sRuntime.runtimeUrl,
-                                    remoteK8sRuntime.exposureMode,
-                                    remoteK8sRuntime.desiredReplicas,
-                                    3000,
-                                    "small",
-                                    "/",
-                                    remoteK8sRuntime.runtimeScheme.empty() ? runtimeScheme : remoteK8sRuntime.runtimeScheme
-                                )),
-                            deploymentId
-                        );
-                        LogWebSocketController::broadcastStatus(deploymentId, remoteK8sRuntime.status.empty() ? "running" : remoteK8sRuntime.status);
-                    } else if (buildResult.runtimeProvider == "remote_compose") {
-                        updateTxn.exec_params(
-                            "UPDATE deployments "
-                            "SET status = 'running', logs = $1, image_name = $2, runtime_url = $3, runtime_exposure = 'remote_compose', "
-                            "runtime_provider = 'remote_compose', remote_container_name = $4, runtime_snapshot = $5::jsonb, runtime_paused = FALSE, "
-                            "artifact_available = TRUE, updated_at = NOW() "
-                            "WHERE id = $6",
-                            buildResult.logs,
-                            buildResult.imageName,
-                            buildResult.runtimeUrl,
-                            buildResult.composeProjectName.empty() ? buildResult.remoteContainerName : buildResult.composeProjectName,
-                            compactJson(composeRuntimeSnapshot(buildResult, "remote_compose", "http")),
-                            deploymentId
-                        );
-                        LogWebSocketController::broadcastStatus(deploymentId, "running");
-                    } else if (buildResult.runtimeProvider == "remote_docker") {
-                        updateTxn.exec_params(
-                            "UPDATE deployments "
-                            "SET status = 'running', logs = $1, image_name = $2, runtime_url = $3, runtime_exposure = 'remote_docker', "
-                            "runtime_provider = 'remote_docker', remote_container_name = $4, runtime_snapshot = $5::jsonb, runtime_paused = FALSE, "
-                            "artifact_available = TRUE, updated_at = NOW() "
-                            "WHERE id = $6",
-                            buildResult.logs,
-                            buildResult.imageName,
-                            buildResult.runtimeUrl,
-                            buildResult.remoteContainerName,
-                            compactJson(runtimeSnapshot("remote_docker", buildResult.imageName, buildResult.runtimeUrl, "remote_docker", 1, 3000, "small", "/", "http")),
-                            deploymentId
-                        );
-                        LogWebSocketController::broadcastStatus(deploymentId, "running");
-                    } else if (buildResult.runtimeProvider == "local_compose") {
-                        updateTxn.exec_params(
-                            "UPDATE deployments "
-                            "SET status = 'running', logs = $1, image_name = $2, runtime_url = $3, runtime_exposure = 'local_compose', "
-                            "runtime_provider = 'local_compose', remote_container_name = $4, desired_replicas = 1, runtime_paused = FALSE, "
-                            "runtime_snapshot = $5::jsonb, artifact_available = TRUE, updated_at = NOW() "
-                            "WHERE id = $6",
-                            buildResult.logs,
-                            buildResult.imageName,
-                            buildResult.runtimeUrl,
-                            buildResult.composeProjectName.empty() ? buildResult.remoteContainerName : buildResult.composeProjectName,
-                            compactJson(composeRuntimeSnapshot(buildResult, "local_compose", "http")),
-                            deploymentId
-                        );
-                        LogWebSocketController::broadcastStatus(deploymentId, "running");
-                    } else {
-                        updateTxn.exec_params(
-                            "UPDATE deployments "
-                            "SET status = 'built', logs = $1, image_name = $2, runtime_snapshot = $3::jsonb, runtime_paused = FALSE, "
-                            "artifact_available = TRUE, updated_at = NOW() "
-                            "WHERE id = $4",
-                            buildResult.logs,
-                            buildResult.imageName,
-                            compactJson(runtimeSnapshot("local_docker", buildResult.imageName, "", "docker", 0, 3000, "small", "/", "http")),
-                            deploymentId
-                        );
-                        LogWebSocketController::broadcastStatus(deploymentId, "built");
-                    }
-                } else {
-                    std::string failureLogs = buildResult.logs.empty() ? buildResult.error : buildResult.logs;
-                    if (!buildResult.error.empty() && failureLogs.find(buildResult.error) == std::string::npos) {
-                        failureLogs += "\nFailure reason: " + buildResult.error + "\n";
-                    }
-                    updateTxn.exec_params(
-                        "UPDATE deployments "
-                        "SET status = 'failed', logs = $1, artifact_available = FALSE, updated_at = NOW() "
-                        "WHERE id = $2",
-                        failureLogs, deploymentId
-                    );
-                    LogWebSocketController::broadcastStatus(deploymentId, "failed");
-                }
-                updateTxn.commit();
-                broadcastDeploymentSummary(deploymentId);
-            } catch (const std::exception& e) {
-                spdlog::error("Background build error for {}: {}", deploymentId, e.what());
-                try {
-                    auto& db = Database::getInstance();
-                    auto connUpdate = db.getConnection();
-                    pqxx::work updateTxn(*connUpdate);
-                    updateTxn.exec_params(
-                        "UPDATE deployments SET status = 'failed', logs = $1, updated_at = NOW() WHERE id = $2",
-                        std::string("Background build error: ") + e.what(),
-                        deploymentId
-                    );
-                    updateTxn.commit();
-                    LogWebSocketController::broadcastStatus(deploymentId, "failed");
-                    broadcastDeploymentSummary(deploymentId);
-                } catch (const std::exception& dbError) {
-                    spdlog::error("Failed to persist build failure for {}: {}", deploymentId, dbError.what());
-                }
-            }
-        });
-        buildThread.detach(); // Detach to let it run independently
-
-        Json::Value payload;
-        payload["message"] = "Build triggered successfully in background";
-        payload["deployment_id"] = deploymentId;
-        payload["status"] = "building";
-        
-        callback(drogon::HttpResponse::newHttpJsonResponse(payload));
-
-    } catch (const std::exception& e) {
-        spdlog::error("Trigger build error: {}", e.what());
-        Json::Value err; err["error"] = "Internal server error";
-        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-        resp->setStatusCode(drogon::k500InternalServerError);
-        callback(resp);
-    }
 }
 
 void DeploymentController::getDeploymentLogs(
@@ -2534,6 +1936,34 @@ void DeploymentController::deleteDeployment(
             }
         }
 
+        // The project-level delete already refuses while a build is in flight; the
+        // per-deployment delete did not. Deleting mid-build removed the row (cascading
+        // away the job) while the worker kept running docker/kubectl, leaving
+        // containers and k8s objects alive with no DB row to ever clean them up.
+        {
+            auto conn = Database::getInstance().getConnection();
+            pqxx::work txn(*conn);
+            auto activeJobs = txn.exec_params(
+                "SELECT COUNT(*) FROM deployments d "
+                "JOIN deployment_jobs j ON j.deployment_id = d.id "
+                "JOIN projects p ON d.project_id = p.id "
+                "WHERE d.id = $1 AND p.user_id = $2 "
+                "  AND j.status IN ('running', 'queued', 'retrying')",
+                deploymentId,
+                userId
+            );
+            const int activeCount = activeJobs.empty() ? 0 : activeJobs[0][0].as<int>();
+            txn.commit();
+            if (activeCount > 0) {
+                Json::Value err;
+                err["error"] = "This deployment has a build in progress. Wait for it to finish before deleting so runtime cleanup can be authoritative.";
+                err["active_jobs"] = activeCount;
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+                resp->setStatusCode(drogon::k409Conflict);
+                callback(resp); return;
+            }
+        }
+
         DeploymentCleanupOptions options;
         options.deleteDatabaseRow = true;
         options.deleteImage = deleteRemoteImage;
@@ -2580,10 +2010,10 @@ void DeploymentController::deployToLocalDocker(
         callback(resp); return;
     }
 
-    const std::string rateLimitKey = makeRuntimeRateLimitKey("local-docker-deploy", req, userId, deploymentId);
+    const std::string rateLimitKey = RuntimeRateLimiter::makeKey("local-docker-deploy", req, userId, deploymentId);
     int retryAfterSeconds = 0;
-    if (isRuntimeRateLimited(rateLimitKey, retryAfterSeconds)) {
-        callback(makeRuntimeRateLimitedResponse(retryAfterSeconds));
+    if (RuntimeRateLimiter::isLimited(rateLimitKey, retryAfterSeconds)) {
+        callback(RuntimeRateLimiter::makeLimitedResponse(retryAfterSeconds));
         return;
     }
 
@@ -2606,7 +2036,7 @@ void DeploymentController::deployToLocalDocker(
         );
 
         if (rows.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Deployment not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k404NotFound);
@@ -2623,7 +2053,7 @@ void DeploymentController::deployToLocalDocker(
             row["image_name"].is_null() ? "" : row["image_name"].as<std::string>()
         );
         if (imageName.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Build the image before deploying to local Docker";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
@@ -2636,7 +2066,7 @@ void DeploymentController::deployToLocalDocker(
             const std::string composeFile = jsonString(existingRuntimeSnapshot, "compose_file");
             const std::string composeWorkdir = jsonString(existingRuntimeSnapshot, "compose_workdir");
             if (composeProject.empty() || composeFile.empty() || composeWorkdir.empty()) {
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err; err["error"] = "Compose runtime metadata is incomplete";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k400BadRequest);
@@ -2687,7 +2117,7 @@ void DeploymentController::deployToLocalDocker(
             const int exitCode = runLocalCommand("timeout 180s sh -lc " + shellQuote(composeCommand), output);
             appendDeploymentLogBlock(deploymentId, output);
             if (exitCode != 0) {
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 auto updateConn = db.getConnection();
                 pqxx::work updateTxn(*updateConn);
                 updateTxn.exec_params(
@@ -2727,7 +2157,7 @@ void DeploymentController::deployToLocalDocker(
             updateTxn.commit();
             LogWebSocketController::broadcastStatus(deploymentId, "running");
             broadcastDeploymentSummary(deploymentId);
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
 
             Json::Value payload;
             payload["message"] = "Compose stack deployed";
@@ -2770,7 +2200,7 @@ void DeploymentController::deployToLocalDocker(
         const std::string status = valueFromKeyValueOutput(output, "status");
         const bool running = valueFromKeyValueOutput(output, "running") == "true";
         if (exitCode != 0 || output.find("__STACKPILOT_LOCAL_DOCKER_RUNNING__") == std::string::npos || runtimeUrl.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             auto connUpdate = db.getConnection();
             pqxx::work updateTxn(*connUpdate);
             updateTxn.exec_params(
@@ -2804,6 +2234,10 @@ void DeploymentController::deployToLocalDocker(
         updateTxn.exec_params(
             "UPDATE deployments "
             "SET status = $1, runtime_url = $2, runtime_exposure = 'local_docker', runtime_provider = 'local_docker', "
+            // Switching provider must clear the other provider's identity, or the
+            // old Kubernetes Deployment/Service keeps running, referenced by nothing,
+            // and pause/cleanup later route to a runtime that isn't there.
+            "k8s_namespace = '', k8s_deployment_name = '', k8s_service_name = '', k8s_ingress_name = '', "
             "remote_container_name = $3, desired_replicas = 1, runtime_snapshot = $4::jsonb, runtime_paused = FALSE, updated_at = NOW() "
             "WHERE id = $5",
             persistedStatus,
@@ -2814,7 +2248,7 @@ void DeploymentController::deployToLocalDocker(
         );
         updateTxn.commit();
 
-        clearRuntimeRateLimitState(rateLimitKey);
+        RuntimeRateLimiter::clear(rateLimitKey);
         LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
         broadcastDeploymentSummary(deploymentId);
 
@@ -2836,7 +2270,7 @@ void DeploymentController::deployToLocalDocker(
         AuditLogger::recordFromRequest(req, userId, "runtime.local_docker.deployed", "deployment", deploymentId, auditMeta);
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         spdlog::error("Deploy to local Docker error: {}", e.what());
         Json::Value err; err["error"] = "Internal server error";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -2858,10 +2292,10 @@ void DeploymentController::deployToKubernetes(
         callback(resp); return;
     }
 
-    const std::string rateLimitKey = makeRuntimeRateLimitKey("deploy", req, userId, deploymentId);
+    const std::string rateLimitKey = RuntimeRateLimiter::makeKey("deploy", req, userId, deploymentId);
     int retryAfterSeconds = 0;
-    if (isRuntimeRateLimited(rateLimitKey, retryAfterSeconds)) {
-        callback(makeRuntimeRateLimitedResponse(retryAfterSeconds));
+    if (RuntimeRateLimiter::isLimited(rateLimitKey, retryAfterSeconds)) {
+        callback(RuntimeRateLimiter::makeLimitedResponse(retryAfterSeconds));
         return;
     }
 
@@ -2897,7 +2331,7 @@ void DeploymentController::deployToKubernetes(
         );
 
         if (rows.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Deployment not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k404NotFound);
@@ -2916,7 +2350,7 @@ void DeploymentController::deployToKubernetes(
         const auto deploymentEnvVars = loadDeploymentEnvVarPairs(txn, deploymentId);
         const std::string imageName = row["image_name"].is_null() ? "" : row["image_name"].as<std::string>();
         if (imageName.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Build the image before deploying to Kubernetes";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
@@ -2966,6 +2400,8 @@ void DeploymentController::deployToKubernetes(
                 "UPDATE deployments "
                 "SET status = $1, k8s_namespace = $2, k8s_deployment_name = $3, "
                 "k8s_service_name = $4, k8s_ingress_name = $5, desired_replicas = $6, runtime_url = $7, "
+                // Clear the Docker identity for the same reason as above.
+                "remote_container_name = '', "
                 "runtime_exposure = $8, runtime_provider = 'kubernetes', runtime_snapshot = $9::jsonb, runtime_paused = FALSE, updated_at = NOW() "
                 "WHERE id = $10",
                 runtime.status.empty() ? "running" : runtime.status,
@@ -2990,11 +2426,11 @@ void DeploymentController::deployToKubernetes(
                 deploymentId
             );
             updateTxn.commit();
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, runtime.status.empty() ? "running" : runtime.status);
             broadcastDeploymentSummary(deploymentId);
         } else {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             updateTxn.exec_params(
                 "UPDATE deployments SET status = 'failed', updated_at = NOW() WHERE id = $1",
                 deploymentId
@@ -3035,7 +2471,7 @@ void DeploymentController::deployToKubernetes(
         AuditLogger::recordFromRequest(req, userId, "runtime.kubernetes.deployed", "deployment", deploymentId, auditMeta);
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         spdlog::error("Deploy to Kubernetes error: {}", e.what());
         Json::Value err; err["error"] = "Internal server error";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -3057,10 +2493,10 @@ void DeploymentController::scaleKubernetesDeployment(
         callback(resp); return;
     }
 
-    const std::string rateLimitKey = makeRuntimeRateLimitKey("scale", req, userId, deploymentId);
+    const std::string rateLimitKey = RuntimeRateLimiter::makeKey("scale", req, userId, deploymentId);
     int retryAfterSeconds = 0;
-    if (isRuntimeRateLimited(rateLimitKey, retryAfterSeconds)) {
-        callback(makeRuntimeRateLimitedResponse(retryAfterSeconds));
+    if (RuntimeRateLimiter::isLimited(rateLimitKey, retryAfterSeconds)) {
+        callback(RuntimeRateLimiter::makeLimitedResponse(retryAfterSeconds));
         return;
     }
 
@@ -3087,7 +2523,7 @@ void DeploymentController::scaleKubernetesDeployment(
         );
 
         if (rows.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Deployment not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k404NotFound);
@@ -3111,7 +2547,7 @@ void DeploymentController::scaleKubernetesDeployment(
         ));
 
         if (deploymentName.empty() || serviceName.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "This build has not been deployed to Kubernetes yet";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
@@ -3123,7 +2559,7 @@ void DeploymentController::scaleKubernetesDeployment(
         if (isRemoteKubernetes) {
             if (row["remote_host"].is_null()) {
                 txn.commit();
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err; err["error"] = "Remote Kubernetes connection metadata is missing";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k400BadRequest);
@@ -3157,11 +2593,11 @@ void DeploymentController::scaleKubernetesDeployment(
                 deploymentId
             );
             updateTxn.commit();
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, runtime.status.empty() ? "running" : runtime.status);
             broadcastDeploymentSummary(deploymentId);
         } else {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
             broadcastDeploymentSummary(deploymentId);
@@ -3193,7 +2629,7 @@ void DeploymentController::scaleKubernetesDeployment(
         AuditLogger::recordFromRequest(req, userId, "runtime.kubernetes.scaled", "deployment", deploymentId, auditMeta);
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         spdlog::error("Scale Kubernetes error: {}", e.what());
         Json::Value err; err["error"] = "Internal server error";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -3234,10 +2670,10 @@ void DeploymentController::setRuntimePausedState(
         return;
     }
 
-    const std::string rateLimitKey = makeRuntimeRateLimitKey(paused ? "pause" : "resume", req, userId, deploymentId);
+    const std::string rateLimitKey = RuntimeRateLimiter::makeKey(paused ? "pause" : "resume", req, userId, deploymentId);
     int retryAfterSeconds = 0;
-    if (isRuntimeRateLimited(rateLimitKey, retryAfterSeconds)) {
-        callback(makeRuntimeRateLimitedResponse(retryAfterSeconds));
+    if (RuntimeRateLimiter::isLimited(rateLimitKey, retryAfterSeconds)) {
+        callback(RuntimeRateLimiter::makeLimitedResponse(retryAfterSeconds));
         return;
     }
 
@@ -3261,7 +2697,7 @@ void DeploymentController::setRuntimePausedState(
         );
 
         if (rows.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err;
             err["error"] = "Deployment not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -3320,7 +2756,7 @@ void DeploymentController::setRuntimePausedState(
         SshConnectionConfig remoteConfig;
         if ((isRemoteDocker || isRemoteKubernetes) && row["remote_host"].is_null()) {
             txn.commit();
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err;
             err["error"] = "Remote runtime connection metadata is missing";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -3338,7 +2774,7 @@ void DeploymentController::setRuntimePausedState(
 
         if (isRemoteDocker) {
             if (remoteContainerName.empty()) {
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err;
                 err["error"] = "Remote Docker container is not attached to this deployment";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -3360,7 +2796,7 @@ void DeploymentController::setRuntimePausedState(
             }
 
             if (!op.success) {
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 payload["error"] = op.error.empty() ? std::string(paused ? "Failed to pause runtime" : "Failed to resume runtime") : op.error;
                 payload["runtime"]["logs"] = op.output;
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
@@ -3384,7 +2820,7 @@ void DeploymentController::setRuntimePausedState(
             );
             updateTxn.commit();
 
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
             broadcastDeploymentSummary(deploymentId);
 
@@ -3443,7 +2879,7 @@ void DeploymentController::setRuntimePausedState(
 
             appendDeploymentLogBlock(deploymentId, runtime.logs);
             if (!runtime.success) {
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 payload["error"] = runtime.error.empty() ? std::string(paused ? "Failed to pause runtime" : "Failed to resume runtime") : runtime.error;
                 payload["runtime"]["logs"] = runtime.logs;
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
@@ -3468,7 +2904,7 @@ void DeploymentController::setRuntimePausedState(
             );
             updateTxn.commit();
 
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
             broadcastDeploymentSummary(deploymentId);
 
@@ -3505,7 +2941,7 @@ void DeploymentController::setRuntimePausedState(
         }
 
         if (isLocalDocker) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err;
             err["error"] = "Pause and resume are currently supported for remote Docker and Kubernetes runtimes.";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -3514,14 +2950,14 @@ void DeploymentController::setRuntimePausedState(
             return;
         }
 
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         Json::Value err;
         err["error"] = "This deployment does not have a controllable live runtime yet.";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
         resp->setStatusCode(drogon::k400BadRequest);
         callback(resp);
     } catch (const std::exception& e) {
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         spdlog::error("{} runtime error: {}", paused ? "Pause" : "Resume", e.what());
         Json::Value err;
         err["error"] = "Internal server error";
@@ -4340,10 +3776,10 @@ void DeploymentController::rollbackKubernetesDeployment(
         callback(resp); return;
     }
 
-    const std::string rateLimitKey = makeRuntimeRateLimitKey("rollback", req, userId, deploymentId);
+    const std::string rateLimitKey = RuntimeRateLimiter::makeKey("rollback", req, userId, deploymentId);
     int retryAfterSeconds = 0;
-    if (isRuntimeRateLimited(rateLimitKey, retryAfterSeconds)) {
-        callback(makeRuntimeRateLimitedResponse(retryAfterSeconds));
+    if (RuntimeRateLimiter::isLimited(rateLimitKey, retryAfterSeconds)) {
+        callback(RuntimeRateLimiter::makeLimitedResponse(retryAfterSeconds));
         return;
     }
 
@@ -4374,7 +3810,7 @@ void DeploymentController::rollbackKubernetesDeployment(
         );
 
         if (rows.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Deployment not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k404NotFound);
@@ -4400,14 +3836,14 @@ void DeploymentController::rollbackKubernetesDeployment(
         );
         const bool artifactAvailable = row["artifact_available"].is_null() ? true : row["artifact_available"].as<bool>();
         if (deploymentName.empty() || serviceName.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "This build has not been deployed to Kubernetes yet";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
             callback(resp); return;
         }
         if (imageName.empty() || !artifactAvailable) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Rollback artifact is not available for this deployment";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
@@ -4419,7 +3855,7 @@ void DeploymentController::rollbackKubernetesDeployment(
         if (isRemoteKubernetes) {
             if (row["remote_host"].is_null()) {
                 txn.commit();
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err; err["error"] = "Remote Kubernetes connection metadata is missing";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k400BadRequest);
@@ -4496,11 +3932,11 @@ void DeploymentController::rollbackKubernetesDeployment(
                 deploymentId
             );
             updateTxn.commit();
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, runtime.status.empty() ? "running" : runtime.status);
             broadcastDeploymentSummary(deploymentId);
         } else {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
             broadcastDeploymentSummary(deploymentId);
@@ -4534,7 +3970,7 @@ void DeploymentController::rollbackKubernetesDeployment(
         AuditLogger::recordFromRequest(req, userId, "runtime.kubernetes.rollback", "deployment", deploymentId, auditMeta);
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         spdlog::error("Rollback Kubernetes deployment error: {}", e.what());
         Json::Value err; err["error"] = "Internal server error";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -4556,10 +3992,10 @@ void DeploymentController::removeKubernetesDeployment(
         callback(resp); return;
     }
 
-    const std::string rateLimitKey = makeRuntimeRateLimitKey("remove", req, userId, deploymentId);
+    const std::string rateLimitKey = RuntimeRateLimiter::makeKey("remove", req, userId, deploymentId);
     int retryAfterSeconds = 0;
-    if (isRuntimeRateLimited(rateLimitKey, retryAfterSeconds)) {
-        callback(makeRuntimeRateLimitedResponse(retryAfterSeconds));
+    if (RuntimeRateLimiter::isLimited(rateLimitKey, retryAfterSeconds)) {
+        callback(RuntimeRateLimiter::makeLimitedResponse(retryAfterSeconds));
         return;
     }
 
@@ -4589,7 +4025,7 @@ void DeploymentController::removeKubernetesDeployment(
         );
 
         if (rows.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "Deployment not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k404NotFound);
@@ -4624,7 +4060,7 @@ void DeploymentController::removeKubernetesDeployment(
         if (runtimeProvider == "remote_docker" || exposureMode == "remote_docker") {
             if (remoteContainerName.empty() || row["remote_host"].is_null()) {
                 txn.commit();
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err; err["error"] = "Remote Docker runtime metadata is missing";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k400BadRequest);
@@ -4642,13 +4078,16 @@ void DeploymentController::removeKubernetesDeployment(
             pqxx::work updateTxn(*connUpdate);
             if (removal.success) {
                 updateTxn.exec_params(
-                    "UPDATE deployments SET status = 'built', runtime_url = '', desired_replicas = 1, "
-                    "runtime_exposure = '', runtime_provider = '', remote_container_name = '', updated_at = NOW() "
+                    "UPDATE deployments "
+                    "SET status = 'built', runtime_url = '', desired_replicas = 1, "
+                    "runtime_exposure = '', runtime_provider = '', remote_container_name = '', "
+                    "k8s_namespace = '', k8s_deployment_name = '', k8s_service_name = '', k8s_ingress_name = '', "
+                    "runtime_snapshot = NULL, runtime_paused = FALSE, updated_at = NOW() "
                     "WHERE id = $1",
                     deploymentId
                 );
                 updateTxn.commit();
-                clearRuntimeRateLimitState(rateLimitKey);
+                RuntimeRateLimiter::clear(rateLimitKey);
                 LogWebSocketController::broadcastStatus(deploymentId, "built");
                 broadcastDeploymentSummary(deploymentId);
 
@@ -4673,7 +4112,7 @@ void DeploymentController::removeKubernetesDeployment(
 
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             broadcastDeploymentSummary(deploymentId);
 
             Json::Value err;
@@ -4688,7 +4127,7 @@ void DeploymentController::removeKubernetesDeployment(
         if (runtimeProvider == "local_docker" || exposureMode == "local_docker") {
             if (remoteContainerName.empty()) {
                 txn.commit();
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err; err["error"] = "Local Docker runtime metadata is missing";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k400BadRequest);
@@ -4703,13 +4142,16 @@ void DeploymentController::removeKubernetesDeployment(
             pqxx::work updateTxn(*connUpdate);
             if (removal.success) {
                 updateTxn.exec_params(
-                    "UPDATE deployments SET status = 'built', runtime_url = '', desired_replicas = 1, "
-                    "runtime_exposure = '', runtime_provider = '', remote_container_name = '', runtime_paused = FALSE, updated_at = NOW() "
+                    "UPDATE deployments "
+                    "SET status = 'built', runtime_url = '', desired_replicas = 1, "
+                    "runtime_exposure = '', runtime_provider = '', remote_container_name = '', "
+                    "k8s_namespace = '', k8s_deployment_name = '', k8s_service_name = '', k8s_ingress_name = '', "
+                    "runtime_snapshot = NULL, runtime_paused = FALSE, updated_at = NOW() "
                     "WHERE id = $1",
                     deploymentId
                 );
                 updateTxn.commit();
-                clearRuntimeRateLimitState(rateLimitKey);
+                RuntimeRateLimiter::clear(rateLimitKey);
                 LogWebSocketController::broadcastStatus(deploymentId, "built");
                 broadcastDeploymentSummary(deploymentId);
 
@@ -4728,7 +4170,7 @@ void DeploymentController::removeKubernetesDeployment(
 
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             broadcastDeploymentSummary(deploymentId);
 
             Json::Value err;
@@ -4743,7 +4185,7 @@ void DeploymentController::removeKubernetesDeployment(
         if (runtimeProvider == "remote_kubernetes") {
             if (deploymentName.empty() || serviceName.empty() || row["remote_host"].is_null()) {
                 txn.commit();
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 Json::Value err; err["error"] = "Remote Kubernetes runtime metadata is missing";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k400BadRequest);
@@ -4762,16 +4204,17 @@ void DeploymentController::removeKubernetesDeployment(
             updateTxn.exec_params(
                 "UPDATE deployments "
                 "SET status = 'built', runtime_url = '', desired_replicas = 1, "
+                "runtime_exposure = '', runtime_provider = '', remote_container_name = '', "
                 "k8s_namespace = '', k8s_deployment_name = '', k8s_service_name = '', k8s_ingress_name = '', "
-                "runtime_exposure = '', runtime_provider = '', updated_at = NOW() "
+                "runtime_snapshot = NULL, runtime_paused = FALSE, updated_at = NOW() "
                 "WHERE id = $1",
                 deploymentId
             );
             updateTxn.commit();
             if (removal.success) {
-                clearRuntimeRateLimitState(rateLimitKey);
+                RuntimeRateLimiter::clear(rateLimitKey);
             } else {
-                recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             }
             LogWebSocketController::broadcastStatus(deploymentId, "built");
             broadcastDeploymentSummary(deploymentId);
@@ -4799,7 +4242,7 @@ void DeploymentController::removeKubernetesDeployment(
         txn.commit();
 
         if (deploymentName.empty() || serviceName.empty()) {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             Json::Value err; err["error"] = "This build is not currently deployed to Kubernetes";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
@@ -4815,16 +4258,17 @@ void DeploymentController::removeKubernetesDeployment(
         updateTxn.exec_params(
             "UPDATE deployments "
             "SET status = 'built', runtime_url = '', desired_replicas = 1, "
+            "runtime_exposure = '', runtime_provider = '', remote_container_name = '', "
             "k8s_namespace = '', k8s_deployment_name = '', k8s_service_name = '', k8s_ingress_name = '', "
-            "runtime_exposure = '', updated_at = NOW() "
+            "runtime_snapshot = NULL, runtime_paused = FALSE, updated_at = NOW() "
             "WHERE id = $1",
             deploymentId
         );
         updateTxn.commit();
         if (removal.success) {
-            clearRuntimeRateLimitState(rateLimitKey);
+            RuntimeRateLimiter::clear(rateLimitKey);
         } else {
-            recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         }
         LogWebSocketController::broadcastStatus(deploymentId, "built");
         broadcastDeploymentSummary(deploymentId);
@@ -4848,7 +4292,7 @@ void DeploymentController::removeKubernetesDeployment(
         AuditLogger::recordFromRequest(req, userId, "runtime.removed", "deployment", deploymentId, auditMeta);
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
-        recordRuntimeRateLimitFailure(rateLimitKey, kRuntimeMutationRateLimit);
+        RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         spdlog::error("Remove Kubernetes deployment error: {}", e.what());
         Json::Value err; err["error"] = "Internal server error";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);

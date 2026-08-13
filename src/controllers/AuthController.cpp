@@ -3,6 +3,8 @@
 // ============================================================
 
 #include "AuthController.h"
+#include "../utils/StringUtils.h"
+#include "../utils/RuntimeRateLimiter.h"
 
 #include "../db/Database.h"
 #include "../services/EmailService.h"
@@ -35,25 +37,14 @@ namespace stackpilot {
 
 namespace {
 
+using strings::trim;
+
+
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
     return value;
-}
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
 }
 
 std::string sanitizeUsername(const std::string& raw) {
@@ -113,20 +104,6 @@ struct AuthRateLimitState {
 
 std::mutex authRateLimitMutex;
 std::unordered_map<std::string, AuthRateLimitState> authRateLimitStates;
-
-std::string getClientAddress(const drogon::HttpRequestPtr& req) {
-    if (!req) {
-        return "unknown";
-    }
-
-    const std::string forwarded = trim(req->getHeader("X-Forwarded-For"));
-    if (!forwarded.empty()) {
-        const auto comma = forwarded.find(',');
-        return toLower(trim(forwarded.substr(0, comma)));
-    }
-
-    return toLower(req->peerAddr().toIp());
-}
 
 std::string trimForStorage(const std::string& value, size_t maxLength) {
     if (value.size() <= maxLength) {
@@ -191,7 +168,7 @@ void recordSuccessfulLogin(const std::string& userId,
 std::string makeRateLimitKey(const std::string& scope,
                              const drogon::HttpRequestPtr& req,
                              const std::string& identity = "") {
-    std::string key = scope + ":" + getClientAddress(req);
+    std::string key = scope + ":" + RuntimeRateLimiter::clientAddress(req);
     if (!identity.empty()) {
         key += ":" + toLower(trim(identity));
     }
@@ -854,7 +831,7 @@ void AuthController::loginUser(
         auto resp = drogon::HttpResponse::newHttpJsonResponse(authPayloadFromRow(row));
         attachAuthCookie(resp, token);
         clearRateLimitState(rateLimitKey);
-        recordSuccessfulLogin(row["id"].as<std::string>(), "email", getClientAddress(req), getUserAgent(req));
+        recordSuccessfulLogin(row["id"].as<std::string>(), "email", RuntimeRateLimiter::clientAddress(req), getUserAgent(req));
         AuditLogger::recordFromRequest(req, row["id"].as<std::string>(), "auth.login", "user", row["id"].as<std::string>(), Json::Value(Json::objectValue));
         callback(resp);
         spdlog::info("User logged in: {}", email);
@@ -889,7 +866,7 @@ void AuthController::googleAuth(
         return;
     }
 
-    const std::string ipAddress = getClientAddress(req);
+    const std::string ipAddress = RuntimeRateLimiter::clientAddress(req);
     const std::string userAgent = getUserAgent(req);
     GoogleAuthService service;
     service.verifyCredential(
@@ -1084,7 +1061,7 @@ void AuthController::githubCallback(
 
     const std::string mode = statePayload.isMember("mode") ? statePayload["mode"].asString() : "signin";
     const std::string requestedUserId = statePayload.isMember("user_id") ? statePayload["user_id"].asString() : "";
-    const std::string ipAddress = getClientAddress(req);
+    const std::string ipAddress = RuntimeRateLimiter::clientAddress(req);
     const std::string userAgent = getUserAgent(req);
 
     GitHubAuthService service;
@@ -1388,7 +1365,7 @@ void AuthController::requestPasswordResetOtp(
             userId,
             otpHash,
             email,
-            trimForStorage(getClientAddress(req), 128),
+            trimForStorage(RuntimeRateLimiter::clientAddress(req), 128),
             kPasswordResetOtpMaxAttempts,
             expiryMinutes
         );

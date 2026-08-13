@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "SshService.h"
+#include "../utils/StringUtils.h"
 
 #include "ComposeKubernetesPlanner.h"
 
@@ -21,19 +22,8 @@ namespace stackpilot {
 
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
+using strings::trim;
 
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
-}
 
 bool hasShellUnsafeCharacters(const std::string& value) {
     static const std::string dangerous = "\"';&|<>`$";
@@ -626,7 +616,14 @@ SshService::SessionFiles SshService::prepareSessionFiles(const SshConnectionConf
     files.sshPrefix = sshPrefix.str();
 
     if (authType == "password" && !isTailscaleConnection(config)) {
-        files.sshpassPrefix = "SSHPASS=" + shellQuote(config.password) + " sshpass -e ";
+        // Read the password from a private file instead of the command line.
+        // `sshpass -f` keeps it out of argv entirely.
+        files.passwordPath = (sessionDir / "sshpass").string();
+        std::ofstream passwordOut(files.passwordPath, std::ios::trunc);
+        passwordOut << config.password;
+        passwordOut.close();
+        chmod(files.passwordPath.c_str(), S_IRUSR | S_IWUSR);
+        files.sshpassPrefix = "sshpass -f " + shellQuote(files.passwordPath) + " ";
     }
 
     return files;
@@ -637,6 +634,9 @@ void SshService::cleanupSessionFiles(const SessionFiles& files) const {
     std::error_code ec;
     if (!files.privateKeyPath.empty()) {
         fs::remove(files.privateKeyPath, ec);
+    }
+    if (!files.passwordPath.empty()) {
+        fs::remove(files.passwordPath, ec);
     }
     if (!files.knownHostsPath.empty()) {
         const fs::path parent = fs::path(files.knownHostsPath).parent_path();

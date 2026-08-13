@@ -3,9 +3,11 @@
 // ============================================================
 
 #include "ProjectController.h"
+#include "../utils/StringUtils.h"
 #include "LogWebSocketController.h"
 #include "../db/Database.h"
 #include "../services/ApplicationCatalog.h"
+#include "../utils/AgentPolicy.h"
 #include "../services/BuildService.h"
 #include "../services/DeploymentCleanupService.h"
 #include "../services/JobQueueService.h"
@@ -26,6 +28,7 @@
 #include <unordered_set>
 #include <vector>
 #include <algorithm>
+#include <set>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -35,6 +38,9 @@
 namespace stackpilot {
 
 namespace {
+
+using strings::trim;
+
 
 std::mutex projectDeploymentLogMutex;
 
@@ -63,20 +69,6 @@ bool isValidEnvKey(const std::string& key) {
     }
 
     return true;
-}
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
 }
 
 std::string toLower(std::string value) {
@@ -849,7 +841,7 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
     auto conn = db.getConnection();
     pqxx::work txn(*conn);
     auto rows = txn.exec_params(
-        "SELECT d.id, d.project_id, p.name AS project_name, d.status, d.version, d.commit_hash, d.image_name, "
+        "SELECT d.id, p.user_id AS owner_user_id, d.project_id, p.name AS project_name, d.status, d.version, d.commit_hash, d.image_name, "
         "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
         "d.desired_replicas, d.runtime_url, d.runtime_exposure, d.created_at "
         "FROM deployments d "
@@ -866,6 +858,8 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
     const auto& row = rows[0];
     Json::Value dep;
     dep["id"] = row["id"].as<std::string>();
+    // Internal routing field, stripped before the payload is sent.
+    dep["__owner_user_id"] = row["owner_user_id"].as<std::string>();
     dep["project_id"] = row["project_id"].as<std::string>();
     dep["project_name"] = row["project_name"].as<std::string>();
     dep["status"] = row["status"].as<std::string>();
@@ -886,7 +880,9 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
 void broadcastDeploymentSummary(const std::string& deploymentId) {
     Json::Value summary = loadDeploymentSummary(deploymentId);
     if (!summary.isNull()) {
-        LogWebSocketController::broadcastDeploymentUpdate(summary);
+        const std::string ownerUserId = summary.get("__owner_user_id", "").asString();
+        summary.removeMember("__owner_user_id");
+        LogWebSocketController::broadcastDeploymentUpdate(summary, ownerUserId);
     }
 }
 
@@ -1341,6 +1337,20 @@ void ProjectController::createProject(
         callback(resp); return;
     }
 
+    // Agent-initiated mutations are subject to the user's stored agent policy.
+    {
+        std::string agentRefusal;
+        if (!AgentPolicy::allowsMutation(req, userId, agentRefusal)) {
+            Json::Value err;
+            err["error"] = agentRefusal;
+            err["requires_approval"] = true;
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k403Forbidden);
+            callback(resp);
+            return;
+        }
+    }
+
     try {
         auto body = req->getJsonObject();
         if (!body) {
@@ -1637,7 +1647,43 @@ void ProjectController::createProject(
             userId, name, description, repoUrl, encryptedGithubPat, sourceType, sshConnectionId, sourcePath, executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled, applicationTemplateId, compactJson(applicationConfig)
         );
         const std::string projectId = result[0]["id"].as<std::string>();
-        replaceProjectEnvVars(txn, projectId, envVars);
+
+        // Template-generated credentials (DB passwords, root passwords, admin
+        // passwords) were written into project_env_vars, where they are shown in
+        // the UI, unversioned and unaudited. Route the catalog's secret-marked
+        // fields into project_secrets instead; ordinary config stays an env var.
+        // Deploy-time injection applies secrets over env vars, so the container
+        // still receives exactly the same environment.
+        std::vector<BuildEnvVar> plainEnvVars;
+        std::vector<BuildEnvVar> secretEnvVars;
+        if (sourceType == "application" && !applicationTemplateId.empty()) {
+            const auto secretKeys = ApplicationCatalog::secretEnvKeys(applicationTemplateId);
+            const std::set<std::string> secretKeySet(secretKeys.begin(), secretKeys.end());
+            for (const auto& envVar : envVars) {
+                if (secretKeySet.count(envVar.key) > 0) {
+                    secretEnvVars.push_back(envVar);
+                } else {
+                    plainEnvVars.push_back(envVar);
+                }
+            }
+        } else {
+            plainEnvVars = envVars;
+        }
+
+        replaceProjectEnvVars(txn, projectId, plainEnvVars);
+        for (const auto& secret : secretEnvVars) {
+            txn.exec_params(
+                "INSERT INTO project_secrets (project_id, environment_id, key, value_encrypted, description, created_by) "
+                "VALUES ($1, NULL, $2, $3, $4, $5) "
+                "ON CONFLICT (project_id, environment_id, key) DO UPDATE "
+                "SET value_encrypted = EXCLUDED.value_encrypted, version = project_secrets.version + 1, updated_at = NOW()",
+                projectId,
+                secret.key,
+                TokenCrypto::encrypt(secret.value),
+                std::string("Generated by the ") + applicationTemplateId + " template",
+                userId
+            );
+        }
         Json::Value createdEnvironments = insertProjectEnvironments(txn, projectId, environmentConfigs);
         txn.commit();
 
@@ -1648,13 +1694,15 @@ void ProjectController::createProject(
         auditMeta["remote_runtime_type"] = remoteRuntimeType;
         auditMeta["runtime_scheme"] = runtimeScheme;
         auditMeta["local_https_enabled"] = localHttpsEnabled;
-        auditMeta["env_var_count"] = static_cast<int>(envVars.size());
+        auditMeta["env_var_count"] = static_cast<int>(plainEnvVars.size());
+        auditMeta["secret_count"] = static_cast<int>(secretEnvVars.size());
         auditMeta["environment_count"] = static_cast<int>(createdEnvironments.size());
         AuditLogger::recordFromRequest(req, userId, "project.created", "project", projectId, auditMeta);
 
         Json::Value pj = projectRowToJson(result[0]);
-        pj["env_var_count"] = static_cast<int>(envVars.size());
-        pj["env_vars"] = envVarsToJson(envVars);
+        pj["env_var_count"] = static_cast<int>(plainEnvVars.size());
+        pj["env_vars"] = envVarsToJson(plainEnvVars);
+        pj["secret_count"] = static_cast<int>(secretEnvVars.size());
         pj["environments"] = createdEnvironments;
         Json::Value webhookWarnings(Json::arrayValue);
         if (sourceType == "github") {
@@ -1824,6 +1872,7 @@ void ProjectController::updateProject(
 
         std::string resolvedSourceType;
         std::string existingSourceType;
+        std::string existingApplicationTemplateId;
         std::string existingRepoUrl;
         std::string existingSourcePath;
         std::string existingSshConnectionId;
@@ -1867,7 +1916,8 @@ void ProjectController::updateProject(
 
         auto currentRows = txn.exec_params(
             "SELECT p.source_type, p.ssh_connection_id, p.source_path, p.repo_url, "
-            "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, u.github_access_token "
+            "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, "
+            "p.application_template_id, u.github_access_token "
             "FROM projects p "
             "JOIN users u ON p.user_id = u.id "
             "WHERE p.id = $1 AND p.user_id = $2",
@@ -1896,6 +1946,9 @@ void ProjectController::updateProject(
         linkedGitHubToken = currentRows[0]["github_access_token"].is_null()
             ? ""
             : TokenCrypto::decrypt(currentRows[0]["github_access_token"].as<std::string>());
+        existingApplicationTemplateId = currentRows[0]["application_template_id"].is_null()
+            ? ""
+            : currentRows[0]["application_template_id"].as<std::string>();
         existingEnvVars = loadProjectEnvVars(txn, id);
 
         if (resolvedSourceType == "ssh") {
@@ -2070,7 +2123,34 @@ void ProjectController::updateProject(
 
         const std::vector<BuildEnvVar> finalEnvVars =
             (*body).isMember("env_vars") ? incomingEnvVars : existingEnvVars;
-        const bool envChanged = envVarsSignature(finalEnvVars) != envVarsSignature(existingEnvVars);
+
+        // Same partition createProject performs. Without it, a credential the
+        // user re-adds in the project editor lands in the plaintext
+        // project_env_vars table while the encrypted project_secrets row still
+        // exists — the secrets manager would then be showing a value that is
+        // also sitting in the clear one table over.
+        std::vector<BuildEnvVar> plainEnvVars;
+        std::vector<BuildEnvVar> promotedSecrets;
+        if (existingSourceType == "application" && !existingApplicationTemplateId.empty()) {
+            const auto secretKeys = ApplicationCatalog::secretEnvKeys(existingApplicationTemplateId);
+            const std::set<std::string> secretKeySet(secretKeys.begin(), secretKeys.end());
+            for (const auto& envVar : finalEnvVars) {
+                // An empty value is the editor showing a blank field, not the
+                // user asking to overwrite the stored secret with nothing.
+                if (secretKeySet.count(envVar.key) > 0 && !trim(envVar.value).empty()) {
+                    promotedSecrets.push_back(envVar);
+                } else if (secretKeySet.count(envVar.key) == 0) {
+                    plainEnvVars.push_back(envVar);
+                }
+            }
+        } else {
+            plainEnvVars = finalEnvVars;
+        }
+
+        // A submitted secret is always a change: it never round-trips through
+        // the editor, so its presence means the user typed it just now.
+        const bool envChanged = envVarsSignature(plainEnvVars) != envVarsSignature(existingEnvVars) ||
+                                !promotedSecrets.empty();
 
         auto latestDeploymentRows = txn.exec_params(
             "SELECT id, version, commit_hash FROM deployments WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1",
@@ -2138,7 +2218,20 @@ void ProjectController::updateProject(
             executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled
         );
 
-        replaceProjectEnvVars(txn, id, finalEnvVars);
+        replaceProjectEnvVars(txn, id, plainEnvVars);
+        for (const auto& secret : promotedSecrets) {
+            txn.exec_params(
+                "INSERT INTO project_secrets (project_id, environment_id, key, value_encrypted, description, created_by) "
+                "VALUES ($1, NULL, $2, $3, $4, $5) "
+                "ON CONFLICT (project_id, environment_id, key) DO UPDATE "
+                "SET value_encrypted = EXCLUDED.value_encrypted, version = project_secrets.version + 1, updated_at = NOW()",
+                id,
+                secret.key,
+                TokenCrypto::encrypt(secret.value),
+                std::string("Moved out of project environment variables during a project update"),
+                userId
+            );
+        }
 
         std::string autoBuildDeploymentId;
         if (envChanged && hasLatestDeployment) {
@@ -2163,11 +2256,20 @@ void ProjectController::updateProject(
 
         Json::Value resp_body;
         Json::Value projectJson = projectRowToJson(result[0]);
-        projectJson["env_var_count"] = static_cast<int>(finalEnvVars.size());
-        projectJson["env_vars"] = envVarsToJson(finalEnvVars);
-        resp_body["message"] = envChanged && hasLatestDeployment
-            ? "Project updated. Environmental variables changed, auto building project..."
-            : "Project updated";
+        projectJson["env_var_count"] = static_cast<int>(plainEnvVars.size());
+        projectJson["env_vars"] = envVarsToJson(plainEnvVars);
+        projectJson["secrets_updated"] = static_cast<int>(promotedSecrets.size());
+        // Say so explicitly when a value was moved: it disappears from the env
+        // var list, and silently vanishing credentials look like data loss.
+        const std::string secretNote = promotedSecrets.empty()
+            ? ""
+            : (promotedSecrets.size() == 1
+                   ? " 1 credential was moved to the secrets manager."
+                   : " " + std::to_string(promotedSecrets.size()) +
+                         " credentials were moved to the secrets manager.");
+        resp_body["message"] = (envChanged && hasLatestDeployment
+            ? std::string("Project updated. Environmental variables changed, auto building project...")
+            : std::string("Project updated")) + secretNote;
         resp_body["project"] = projectJson;
         resp_body["auto_build_triggered"] = envChanged && hasLatestDeployment;
         if (!autoBuildDeploymentId.empty()) {

@@ -9,7 +9,7 @@
     "app": {
         "threads_num": 4,
         "enable_session": false,
-        "document_root": "./",
+        "document_root": "./static",
         "upload_path": "uploads",
         "max_connections": 100000,
         "max_connections_per_ip": 0,
@@ -17,7 +17,7 @@
             "log_path": "./logs",
             "logfile_base_name": "stackpilot-platform",
             "log_size_limit": 100000000,
-            "log_level": "DEBUG"
+            "log_level": "INFO"
         }
     }
 }

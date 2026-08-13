@@ -28,8 +28,10 @@ public:
     // Static helper to broadcast logs to all listeners of a deployment
     static void broadcastLog(const std::string& deploymentId, const std::string& line);
     static void broadcastStatus(const std::string& deploymentId, const std::string& status);
-    static void broadcastDeploymentUpdate(const Json::Value& deployment);
-    static void broadcastDeploymentDeleted(const std::string& deploymentId);
+    // ownerUserId scopes the fan-out to the deployment owner's private channel.
+    // Without it the global channel leaked every tenant's deployments.
+    static void broadcastDeploymentUpdate(const Json::Value& deployment, const std::string& ownerUserId);
+    static void broadcastDeploymentDeleted(const std::string& deploymentId, const std::string& ownerUserId);
 
 private:
     static void sendToChannelUnlocked(const std::string& channelKey, const std::string& payload);

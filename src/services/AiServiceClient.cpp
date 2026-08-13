@@ -44,6 +44,15 @@ AiServiceResult performRequest(const std::string& url,
     std::string responseBody;
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    // Shared secret proving the caller is the backend. ai-service enforces this
+    // on every route except /health; without it anything on the docker network
+    // could drive the model and reach its provider base_url SSRF sink.
+    if (const char* serviceToken = std::getenv("STACKPILOT_AI_SERVICE_TOKEN")) {
+        if (*serviceToken) {
+            const std::string tokenHeader = std::string("X-StackPilot-Service-Token: ") + serviceToken;
+            headers = curl_slist_append(headers, tokenHeader.c_str());
+        }
+    }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSeconds);
@@ -76,7 +85,18 @@ AiServiceResult performRequest(const std::string& url,
     result.body = parsed;
     result.ok = result.statusCode >= 200 && result.statusCode < 300;
     if (!result.ok) {
-        result.error = parsed.isMember("detail") ? parsed["detail"].asString() : "ai_service_http_error";
+        // FastAPI validation errors return `detail` as an ARRAY. Calling
+        // asString() on a non-string throws Json::LogicError, which escaped this
+        // function and turned every 422 into an opaque 500.
+        if (!parsed.isMember("detail")) {
+            result.error = "ai_service_http_error";
+        } else if (parsed["detail"].isString()) {
+            result.error = parsed["detail"].asString();
+        } else {
+            Json::StreamWriterBuilder writer;
+            writer["indentation"] = "";
+            result.error = Json::writeString(writer, parsed["detail"]);
+        }
     }
     return result;
 }

@@ -166,8 +166,11 @@ void McpController::createToken(
     try {
         auto body = req->getJsonObject();
         std::string name = "MCP Token";
+        // An IDE agent needs to deploy, not just read. "admin" (delete) stays
+        // opt-in so a leaked token cannot tear down deployments.
         Json::Value permissions(Json::arrayValue);
         permissions.append("read");
+        permissions.append("deploy");
 
         if (body) {
             if (body->isMember("name") && (*body)["name"].isString()) {
@@ -176,7 +179,17 @@ void McpController::createToken(
                 if (name.size() > 128) name = name.substr(0, 128);
             }
             if (body->isMember("permissions") && (*body)["permissions"].isArray()) {
-                permissions = (*body)["permissions"];
+                Json::Value requested(Json::arrayValue);
+                for (const auto& entry : (*body)["permissions"]) {
+                    if (!entry.isString()) continue;
+                    const std::string scope = entry.asString();
+                    if (scope == "read" || scope == "deploy" || scope == "admin") {
+                        requested.append(scope);
+                    }
+                }
+                if (!requested.empty()) {
+                    permissions = requested;
+                }
             }
         }
 
@@ -209,9 +222,11 @@ void McpController::createToken(
         std::string permissionsJson = Json::writeString(writer, permissions);
 
         auto result = txn.exec_params(
-            "INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, permissions) "
-            "VALUES ($1, $2, $3, $4, $5::jsonb) "
-            "RETURNING id, name, token_prefix, permissions, created_at",
+            // expires_at was never set, so every MCP token was immortal and could
+            // not be aged out. Default to 365 days; revocation still works.
+            "INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, permissions, expires_at) "
+            "VALUES ($1, $2, $3, $4, $5::jsonb, NOW() + INTERVAL '365 days') "
+            "RETURNING id, name, token_prefix, permissions, created_at, expires_at",
             userId, name, tokenHash, tokenPrefix, permissionsJson
         );
         txn.commit();

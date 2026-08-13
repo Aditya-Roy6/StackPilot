@@ -1,15 +1,7 @@
 // ============================================================
 // AuthController.h — Authentication REST API
 // ============================================================
-// CONCEPT: Controllers in MVC
-// A controller HANDLES incoming HTTP requests.
-// It's the "C" in MVC (Model-View-Controller).
-//
-// Flow: Client → HTTP Request → Controller → Service → Database
-//                                    ↓
-//                              HTTP Response ← Controller
-//
-// This controller handles:
+// Endpoints:
 //   POST /api/v1/auth/register  → Create new user
 //   POST /api/v1/auth/login     → Login and get JWT token
 //   GET  /api/v1/auth/me        → Get current user (requires JWT)
@@ -24,9 +16,6 @@ namespace stackpilot {
 class AuthController : public drogon::HttpController<AuthController> {
 public:
     // ─── Route Registration ─────────────────────────────────
-    // CONCEPT: These macros tell Drogon "when someone hits
-    // POST /api/v1/auth/register, call the registerUser method"
-    // This is called "routing" — mapping URLs to handler functions
     METHOD_LIST_BEGIN
     ADD_METHOD_TO(AuthController::registerUser, "/api/v1/auth/register", drogon::Post);
     ADD_METHOD_TO(AuthController::loginUser, "/api/v1/auth/login", drogon::Post);
@@ -57,14 +46,6 @@ public:
     METHOD_LIST_END
 
     // ─── Handler Methods ────────────────────────────────────
-    // CONCEPT: Each method receives:
-    //   - req: The incoming HTTP request (contains headers, body, etc.)
-    //   - callback: A function YOU call to send the response back
-    //
-    // The callback pattern is how async frameworks work:
-    // Instead of "return response", you call callback(response)
-    // This allows the server to handle other requests while
-    // waiting for database queries to complete.
 
     void registerUser(const drogon::HttpRequestPtr& req,
                       std::function<void(const drogon::HttpResponsePtr&)>&& callback);

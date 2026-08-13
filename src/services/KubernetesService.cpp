@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "KubernetesService.h"
+#include "../utils/StringUtils.h"
 
 #include "ComposeKubernetesPlanner.h"
 
@@ -20,9 +21,24 @@ namespace stackpilot {
 
 namespace {
 
+using strings::trim;
+
+
 std::string getEnvOrDefault(const char* name, const std::string& fallback) {
     const char* value = std::getenv(name);
     return (value && *value) ? value : fallback;
+}
+
+// Namespace prefix policy. Empty/unset means "use the secure default"; the
+// sentinels "*" and "none" are the explicit opt-out for operators who run their
+// own namespace scheme. Returning "" here disables the check downstream.
+std::string namespacePrefixFromEnv() {
+    const char* raw = std::getenv("K8S_NAMESPACE_PREFIX");
+    const std::string value = (raw && *raw) ? raw : "stackpilot-";
+    if (value == "*" || value == "none") {
+        return "";
+    }
+    return value;
 }
 
 bool isTruthy(const std::string& value) {
@@ -48,20 +64,6 @@ std::string normalizeRuntimeScheme(const std::string& value) {
         return static_cast<char>(std::tolower(c));
     });
     return normalized == "https" ? "https" : "http";
-}
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
 }
 
 int getEnvIntOrDefault(const char* name, int fallback) {
@@ -194,7 +196,12 @@ KubernetesService::KubernetesService()
       ingressClassName_(getEnvOrDefault("K8S_INGRESS_CLASS", "")),
       ingressTlsSecretName_(getEnvOrDefault("K8S_INGRESS_TLS_SECRET", "")),
       ingressAnnotationsJson_(getEnvOrDefault("K8S_INGRESS_ANNOTATIONS_JSON", "")),
-      namespacePrefix_(getEnvOrDefault("K8S_NAMESPACE_PREFIX", "")),
+      // Secure by default. `namespace` is accepted from the request body and was
+      // only validated as a DNS label, so with an empty prefix a user could target
+      // kube-system or another tenant's namespace — having it created, a Secret
+      // with their env vars written into it, and resources later deleted from it.
+      // Set K8S_NAMESPACE_PREFIX=* (or =none) to opt out.
+      namespacePrefix_(namespacePrefixFromEnv()),
       imagePullSecretName_(getEnvOrDefault("K8S_IMAGE_PULL_SECRET", "")),
       serviceAccountName_(getEnvOrDefault("K8S_SERVICE_ACCOUNT_NAME", "")),
       cpuRequest_(getEnvOrDefault("K8S_CPU_REQUEST", "100m")),

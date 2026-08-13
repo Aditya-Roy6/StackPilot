@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "SshTerminalWebSocketController.h"
+#include "../utils/StringUtils.h"
 #include "../db/Database.h"
 #include "../utils/JwtHelper.h"
 #include "../utils/TokenCrypto.h"
@@ -30,6 +31,9 @@ namespace stackpilot {
 
 namespace {
 
+using strings::trim;
+
+
 struct SshTerminalConfig {
     std::string connectionType = "ssh";
     std::string host;
@@ -40,18 +44,6 @@ struct SshTerminalConfig {
     std::string privateKey;
     std::string knownHostsEntry;
 };
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
-}
 
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),

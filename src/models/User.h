@@ -1,8 +1,8 @@
 // ============================================================
 // User.h — User Data Model
 // ============================================================
-// CONCEPT: A "model" represents a database row as a C++ object.
-// This is the "M" in MVC (Model-View-Controller) architecture.
+// Maps a row of the users table. Keep toJson() free of password_hash and
+// any other column that must not leave the process.
 // ============================================================
 
 #pragma once

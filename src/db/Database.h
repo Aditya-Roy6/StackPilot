@@ -1,17 +1,9 @@
-// ============================================================
-// Database.h — PostgreSQL Connection Manager (Singleton)
-// ============================================================
-// CONCEPT: Singleton Pattern
-// A singleton ensures only ONE instance of a class exists.
-// We want exactly ONE database connection pool for the entire
-// application. Multiple connections would waste resources.
+// Process-wide PostgreSQL connection pool.
 //
-// Usage: auto& db = Database::getInstance();
-//
-// CONCEPT: Connection String
-// PostgreSQL uses a connection string to know WHERE to connect:
-// "host=localhost port=5432 dbname=mydb user=admin password=secret"
-// ============================================================
+// Single instance by design: the pool size is the platform's contract with
+// Postgres' max_connections, and a second pool would silently double it.
+// getConnection() blocks when the pool is saturated rather than opening an
+// unbounded number of sockets.
 
 #pragma once
 
@@ -19,11 +11,21 @@
 #include <memory>
 #include <pqxx/pqxx>
 #include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <vector>
 
 namespace stackpilot {
 
 class Database {
 public:
+    // A pooled connection. The custom deleter returns it to the pool instead of
+    // closing it, so call sites keep using `auto conn = db.getConnection();`
+    // unchanged. Previously every call opened a brand-new PostgreSQL connection,
+    // and a request holding one across a slow network call could exhaust
+    // max_connections and take down every service at once.
+    using ConnectionHandle = std::unique_ptr<pqxx::connection, std::function<void(pqxx::connection*)>>;
+
     // ─── Singleton access ───────────────────────────────────
     // static means this belongs to the CLASS, not an instance
     // Returns a reference (&) to the single instance
@@ -42,9 +44,9 @@ public:
     );
 
     // ─── Get a connection for queries ───────────────────────
-    // Returns a unique_ptr — the caller owns the connection
-    // and it's automatically cleaned up when done
-    std::unique_ptr<pqxx::connection> getConnection();
+    // Borrows from the pool, blocking briefly if every connection is checked out.
+    // Released automatically when the handle goes out of scope.
+    ConnectionHandle getConnection();
 
     // ─── Check if connected ─────────────────────────────────
     bool isConnected() const { return m_initialized; }
@@ -62,6 +64,12 @@ private:
     std::string m_connString;
     bool m_initialized = false;
     std::mutex m_mutex;  // Thread safety for initialization
+
+    // ─── Connection pool ────────────────────────────────────
+    std::vector<std::unique_ptr<pqxx::connection>> m_idle;
+    std::condition_variable m_available;
+    std::size_t m_maxConnections = 16;
+    std::size_t m_outstanding = 0;  // currently checked out
 };
 
 } // namespace stackpilot

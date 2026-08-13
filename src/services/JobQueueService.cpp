@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "JobQueueService.h"
+#include "../utils/StringUtils.h"
 
 #include "../controllers/LogWebSocketController.h"
 #include "../db/Database.h"
@@ -36,6 +37,9 @@
 namespace stackpilot {
 namespace {
 
+using strings::trim;
+
+
 std::mutex deploymentLogMutex;
 
 std::string getEnvOrDefault(const char* name, const std::string& fallback) {
@@ -51,18 +55,6 @@ int getEnvIntOrDefault(const char* name, int fallback) {
     } catch (...) {
         return fallback;
     }
-}
-
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
 }
 
 std::string toLower(std::string value) {
@@ -569,7 +561,7 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
     auto conn = Database::getInstance().getConnection();
     pqxx::work txn(*conn);
     auto rows = txn.exec_params(
-        "SELECT d.id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
+        "SELECT d.id, p.user_id AS owner_user_id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
         "d.environment_id, e.name AS environment_name, d.branch, d.commit_sha, d.trigger_source, d.github_delivery_id, "
         "d.ci_required, d.ci_status, d.logs, d.image_name, "
         "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
@@ -589,6 +581,8 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
     const auto& row = rows[0];
     Json::Value dep;
     dep["id"] = row["id"].as<std::string>();
+    // Internal routing field, stripped before the payload is sent.
+    dep["__owner_user_id"] = row["owner_user_id"].as<std::string>();
     dep["project_id"] = row["project_id"].as<std::string>();
     dep["project_name"] = row["project_name"].as<std::string>();
     dep["repo_url"] = row["repo_url"].is_null() ? "" : row["repo_url"].as<std::string>();
@@ -621,7 +615,9 @@ Json::Value loadDeploymentSummary(const std::string& deploymentId) {
 void broadcastDeploymentSummary(const std::string& deploymentId) {
     Json::Value summary = loadDeploymentSummary(deploymentId);
     if (!summary.isNull()) {
-        LogWebSocketController::broadcastDeploymentUpdate(summary);
+        const std::string ownerUserId = summary.get("__owner_user_id", "").asString();
+        summary.removeMember("__owner_user_id");
+        LogWebSocketController::broadcastDeploymentUpdate(summary, ownerUserId);
     }
 }
 
@@ -672,6 +668,14 @@ void JobQueueService::start() {
     std::lock_guard<std::mutex> lock(lifecycleMutex_);
     if (running_) {
         return;
+    }
+
+    // Pass the Redis password through the environment rather than `-a <password>`,
+    // which exposed it in the argv of every redis-cli invocation (readable via
+    // `ps` / /proc). Set once here, before the worker threads start, since
+    // setenv() is not thread-safe.
+    if (!redisPassword_.empty()) {
+        setenv("REDISCLI_AUTH", redisPassword_.c_str(), 1);
     }
 
     recoverInterruptedJobs();
@@ -743,10 +747,17 @@ void JobQueueService::recoverInterruptedJobs() {
     try {
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
-        txn.exec(
+        // Only reclaim this instance's own jobs, plus jobs whose lock has gone
+        // stale. Reclaiming every running job meant a second backend instance
+        // (or a rolling restart) re-queued another instance's in-flight builds,
+        // producing two workers building the same deployment concurrently.
+        txn.exec_params(
             "UPDATE deployment_jobs "
             "SET status = 'queued', locked_by = '', locked_at = NULL, next_run_at = NOW(), updated_at = NOW() "
-            "WHERE status = 'running'"
+            "WHERE status = 'running' "
+            "  AND (locked_by = $1 OR locked_by = '' OR locked_by IS NULL "
+            "       OR locked_at IS NULL OR locked_at < NOW() - INTERVAL '15 minutes')",
+            workerId_
         );
         txn.exec(
             "UPDATE deployments "
@@ -766,7 +777,8 @@ bool JobQueueService::pushRedisJob(const std::string& jobId) const {
     std::string command = "redis-cli -h " + shellQuote(redisHost_) +
         " -p " + std::to_string(redisPort_);
     if (!redisPassword_.empty()) {
-        command += " -a " + shellQuote(redisPassword_) + " --no-auth-warning";
+        // Credential comes from REDISCLI_AUTH (exported in start()).
+        command += " --no-auth-warning";
     }
     command += " RPUSH " + shellQuote(queueName_) + " " + shellQuote(jobId) + " >/dev/null 2>&1";
     return std::system(command.c_str()) == 0;
@@ -776,7 +788,8 @@ std::optional<std::string> JobQueueService::popRedisJob(int timeoutSeconds) cons
     std::string command = "timeout " + std::to_string(timeoutSeconds + 2) +
         " redis-cli -h " + shellQuote(redisHost_) + " -p " + std::to_string(redisPort_);
     if (!redisPassword_.empty()) {
-        command += " -a " + shellQuote(redisPassword_) + " --no-auth-warning";
+        // Credential comes from REDISCLI_AUTH (exported in start()).
+        command += " --no-auth-warning";
     }
     command += " --raw BLPOP " + shellQuote(queueName_) + " " + std::to_string(timeoutSeconds) + " 2>/dev/null";
 
@@ -1183,6 +1196,51 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     TokenCrypto::decrypt(envRow["value_encrypted"].as<std::string>());
             }
         }
+        // Secrets are applied last so they win over a plain env var of the same
+        // key: project-wide secrets first, then environment-scoped ones, matching
+        // the general-to-specific precedence used above.
+        {
+            auto secretRows = txn.exec_params(
+                "SELECT id, key, value_encrypted FROM project_secrets "
+                "WHERE project_id = (SELECT project_id FROM deployments WHERE id = $1) "
+                "  AND environment_id IS NULL "
+                "ORDER BY key ASC",
+                job.deploymentId
+            );
+            std::vector<std::string> injectedIds;
+            for (const auto& secretRow : secretRows) {
+                mergedEnvVars[secretRow["key"].as<std::string>()] =
+                    TokenCrypto::decrypt(secretRow["value_encrypted"].as<std::string>());
+                injectedIds.push_back(secretRow["id"].as<std::string>());
+            }
+
+            if (!environmentId.empty()) {
+                auto scopedRows = txn.exec_params(
+                    "SELECT id, key, value_encrypted FROM project_secrets "
+                    "WHERE environment_id = $1 ORDER BY key ASC",
+                    environmentId
+                );
+                for (const auto& secretRow : scopedRows) {
+                    mergedEnvVars[secretRow["key"].as<std::string>()] =
+                        TokenCrypto::decrypt(secretRow["value_encrypted"].as<std::string>());
+                    injectedIds.push_back(secretRow["id"].as<std::string>());
+                }
+            }
+
+            // Record usage so the UI can show which secrets are actually consumed
+            // (and, just as usefully, which are stale and safe to remove).
+            for (const auto& secretId : injectedIds) {
+                txn.exec_params(
+                    "UPDATE project_secrets "
+                    "SET last_accessed_at = NOW(), last_accessed_by = 'deploy' WHERE id = $1",
+                    secretId
+                );
+            }
+            if (!injectedIds.empty()) {
+                spdlog::info("Injected {} secret(s) into deployment {}", injectedIds.size(), job.deploymentId);
+            }
+        }
+
         std::vector<BuildEnvVar> envVars;
         envVars.reserve(mergedEnvVars.size());
         for (const auto& item : mergedEnvVars) {
@@ -1585,7 +1643,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 updateTxn.exec_params(
                     "UPDATE deployments "
                     "SET status = $1, logs = $2, image_name = $3, runtime_url = $4, runtime_exposure = $5, "
-                    "runtime_provider = 'kubernetes', "
+                    "runtime_provider = 'kubernetes', remote_container_name = '', "
                     "k8s_namespace = $6, k8s_deployment_name = $7, k8s_service_name = $8, k8s_ingress_name = $9, "
                     "desired_replicas = $10, runtime_snapshot = $11::jsonb, runtime_paused = FALSE, "
                     "artifact_available = TRUE, updated_at = NOW() "
@@ -1635,8 +1693,11 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 updateTxn.exec_params(
                     "UPDATE deployments "
                     "SET status = 'running', logs = $1, image_name = $2, runtime_url = $3, runtime_exposure = 'remote_docker', "
+                    // runtime_paused was the only success branch not resetting this,
+                    // so rebuilding a paused remote-Docker deployment left it stuck
+                    // reporting "paused" while actually running.
                     "runtime_provider = 'remote_docker', remote_container_name = $4, runtime_snapshot = $5::jsonb, "
-                    "artifact_available = TRUE, updated_at = NOW() "
+                    "artifact_available = TRUE, runtime_paused = FALSE, updated_at = NOW() "
                     "WHERE id = $6",
                     buildResult.logs,
                     buildResult.imageName,
@@ -1666,6 +1727,9 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 updateTxn.exec_params(
                     "UPDATE deployments "
                     "SET status = 'running', logs = $1, image_name = $2, runtime_url = $3, runtime_exposure = 'local_docker', "
+                    // Clear k8s identity so a provider switch cannot orphan the old
+                    // Kubernetes objects with no DB row still referencing them.
+                    "k8s_namespace = '', k8s_deployment_name = '', k8s_service_name = '', k8s_ingress_name = '', "
                     "runtime_provider = 'local_docker', remote_container_name = $4, desired_replicas = 1, runtime_paused = FALSE, "
                     "runtime_snapshot = $5::jsonb, artifact_available = TRUE, updated_at = NOW() "
                     "WHERE id = $6",

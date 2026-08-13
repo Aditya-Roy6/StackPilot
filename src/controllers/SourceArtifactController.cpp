@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "SourceArtifactController.h"
+#include "../utils/StringUtils.h"
 #include "../db/Database.h"
 #include "../utils/AuditLogger.h"
 #include "../utils/JwtHelper.h"
@@ -25,17 +26,8 @@
 namespace stackpilot {
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-    return value.substr(start, end - start);
-}
+using strings::trim;
+
 
 std::filesystem::path artifactRoot() {
     const char* env = std::getenv("SOURCE_ARTIFACT_DIR");

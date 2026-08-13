@@ -1,4 +1,5 @@
 #include "EmailService.h"
+#include "../utils/StringUtils.h"
 
 #include <curl/curl.h>
 #include <spdlog/spdlog.h>
@@ -15,19 +16,8 @@
 namespace stackpilot {
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
+using strings::trim;
 
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
-}
 
 std::string getEnvOrDefault(const char* name, const std::string& fallback = "") {
     const char* value = std::getenv(name);

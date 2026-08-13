@@ -111,6 +111,44 @@ function apiHeaders(auth = true) {
   return headers;
 }
 
+// ─── Retry / reliability configuration ──────────────────────
+// Transient failures (backend still starting, a rolling restart, a brief
+// network blip) should not surface to the IDE as a hard error. We retry with
+// exponential backoff, but only where it is safe: idempotent reads retry on any
+// transient failure, while mutations retry only when the request provably never
+// reached the backend (connection refused / DNS), so we never duplicate a
+// project or deployment.
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+const NONIDEMPOTENT_RETRYABLE_STATUS = new Set([429, 503]);
+const CONNECTION_NOT_SENT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"]);
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "EPIPE",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+]);
+const MAX_RETRIES = Math.min(numberEnv("STACKPILOT_MCP_MAX_RETRIES", 3), 8);
+const RETRY_BASE_MS = numberEnv("STACKPILOT_MCP_RETRY_BASE_MS", 500);
+
+function errorCode(error) {
+  return error?.cause?.code || error?.code || "";
+}
+
+function backoffDelay(attempt, retryAfterHeader) {
+  const retryAfter = Number(retryAfterHeader);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, 30_000);
+  }
+  const base = RETRY_BASE_MS * 2 ** (attempt - 1);
+  const jitter = Math.random() * RETRY_BASE_MS;
+  return Math.min(base + jitter, 15_000);
+}
+
 async function api(method, apiPath, body, options = {}) {
   const auth = options.auth !== false;
   if (auth && !TOKEN) {
@@ -119,44 +157,76 @@ async function api(method, apiPath, body, options = {}) {
     );
   }
 
-  const controller = new AbortController();
   const timeoutMs = options.timeoutMs || HTTP_TIMEOUT_MS;
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const url = `${API_BASE}${apiPath}`;
+  // GET/HEAD are always safe to retry; callers can opt a mutation in with retry:true.
+  const idempotent = method === "GET" || method === "HEAD" || options.retry === true;
+  const maxAttempts = (options.retries != null ? Math.max(0, options.retries) : MAX_RETRIES) + 1;
 
-  try {
-    const init = {
-      method,
-      headers: apiHeaders(auth),
-      signal: controller.signal,
-    };
-    if (body !== undefined && body !== null) {
-      init.body = JSON.stringify(body);
-    }
-
-    const res = await fetch(url, init);
-    const raw = await res.text();
-    let json;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      json = raw ? JSON.parse(raw) : {};
-    } catch {
-      json = { raw };
-    }
+      const init = {
+        method,
+        headers: apiHeaders(auth),
+        signal: controller.signal,
+      };
+      if (body !== undefined && body !== null) {
+        init.body = JSON.stringify(body);
+      }
 
-    if (!res.ok) {
-      const detail = json.error || json.message || json.raw || `HTTP ${res.status}`;
-      throw new Error(`${method} ${apiPath} failed: ${detail}`);
-    }
+      const res = await fetch(url, init);
+      const raw = await res.text();
+      let json;
+      try {
+        json = raw ? JSON.parse(raw) : {};
+      } catch {
+        json = { raw };
+      }
 
-    return json;
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error(`${method} ${apiPath} timed out after ${timeoutMs}ms`);
+      if (!res.ok) {
+        const detail = json.error || json.message || json.raw || `HTTP ${res.status}`;
+        const statusRetriable = idempotent
+          ? RETRYABLE_STATUS.has(res.status)
+          : NONIDEMPOTENT_RETRYABLE_STATUS.has(res.status);
+        if (statusRetriable && attempt < maxAttempts) {
+          lastError = new Error(`${method} ${apiPath} failed: ${detail}`);
+          await sleep(backoffDelay(attempt, res.headers.get("retry-after")));
+          continue;
+        }
+        throw new Error(`${method} ${apiPath} failed: ${detail}`);
+      }
+
+      return json;
+    } catch (error) {
+      const isTimeout = error?.name === "AbortError";
+      const code = errorCode(error);
+      const transient =
+        isTimeout || TRANSIENT_NETWORK_CODES.has(code) || (error?.name === "TypeError" && Boolean(code));
+      const notSent = CONNECTION_NOT_SENT_CODES.has(code);
+      const canRetry = attempt < maxAttempts && (idempotent ? transient : notSent);
+      if (canRetry) {
+        lastError = error;
+        await sleep(backoffDelay(attempt, null));
+        continue;
+      }
+      if (isTimeout) {
+        throw new Error(`${method} ${apiPath} timed out after ${timeoutMs}ms`);
+      }
+      if (transient) {
+        throw new Error(
+          `${method} ${apiPath} could not reach the StackPilot backend at ${API_BASE} (${code || "network error"}). ` +
+            "Confirm the backend is running and STACKPILOT_API_URL is correct."
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
-    throw error;
-  } finally {
-    clearTimeout(timer);
   }
+  throw lastError || new Error(`${method} ${apiPath} failed after ${maxAttempts} attempt(s)`);
 }
 
 function safeName(value, fallback = "local-project") {
@@ -450,7 +520,7 @@ async function collectTarFiles(root) {
     for (const entry of entries) {
       const fullPath = path.join(current, entry.name);
       const relative = toPosixPath(path.relative(root, fullPath));
-      if (!relative || shouldIgnore(entry.name, relative)) {
+      if (!relative || shouldIgnore(relative, entry.name)) {
         continue;
       }
       if (entry.isSymbolicLink()) {
@@ -687,7 +757,13 @@ async function pollDeployment(deploymentId, waitSeconds) {
 
   while (Date.now() < deadline) {
     const status = String(last.status || "").toLowerCase();
-    if (["running", "built", "failed", "cancelled"].includes(status)) {
+    // Backend terminal statuses the poller previously missed — it burned the full
+    // wait_seconds and reported "still_running" for permanently finished builds.
+    // Note both spellings: the backend emits "canceled", this tool had "cancelled".
+    if ([
+      "running", "built", "failed", "cancelled", "canceled",
+      "blocked", "failed_ci", "superseded", "retired",
+    ].includes(status)) {
       break;
     }
     await sleep(2500);

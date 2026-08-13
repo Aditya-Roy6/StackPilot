@@ -1,4 +1,5 @@
 #include "AiController.h"
+#include "../utils/BlockingTaskRunner.h"
 
 #include "../db/Database.h"
 #include "../services/AiServiceClient.h"
@@ -308,10 +309,11 @@ Json::Value loadPreferences(pqxx::work& txn, const std::string& userId) {
     prefs["openai_compatible_api_key"] = envOrDefault("OPENAI_COMPATIBLE_API_KEY", "");
     prefs["confidence_threshold"] = clampConfidence(envDouble("STACKPILOT_AI_CONFIDENCE_THRESHOLD", 0.72));
     prefs["history_retention_days"] = 90;
+    prefs["agent_access_mode"] = "ask";  // fail closed until the user opts in
 
     const auto rows = txn.exec_params(
         "SELECT enabled, provider, model, openai_compatible_base_url, openai_compatible_api_key, "
-        "confidence_threshold, history_retention_days "
+        "confidence_threshold, history_retention_days, agent_access_mode "
         "FROM ai_preferences WHERE user_id = $1",
         userId);
     if (!rows.empty()) {
@@ -326,6 +328,9 @@ Json::Value loadPreferences(pqxx::work& txn, const std::string& userId) {
                                                        : TokenCrypto::decrypt(row["openai_compatible_api_key"].as<std::string>());
         prefs["confidence_threshold"] = clampConfidence(row["confidence_threshold"].as<double>());
         prefs["history_retention_days"] = row["history_retention_days"].as<int>();
+        if (!row["agent_access_mode"].is_null()) {
+            prefs["agent_access_mode"] = row["agent_access_mode"].as<std::string>();
+        }
     }
     return prefs;
 }
@@ -516,10 +521,17 @@ Json::Value retrieveSemanticMemories(pqxx::work& txn,
     }
     try {
         const auto rows = txn.exec_params(
+            // The inner query must ORDER BY the distance operator and LIMIT for
+            // pgvector to use idx_ai_memory_chunks_embedding_hnsw. Previously the
+            // ordering lived in the outer query, so every chat turn sequentially
+            // scanned the user's entire memory table. The similarity floor is
+            // applied outside, over the small candidate set.
             "SELECT content, metadata::text, session_id::text, memory_type, similarity FROM ("
             "  SELECT content, metadata, session_id, memory_type, (1 - (embedding <=> $2::vector)) AS similarity "
             "  FROM ai_memory_chunks "
-            "  WHERE user_id = $1 AND ($3 = '' OR session_id = $3::uuid OR session_id IS NULL)"
+            "  WHERE user_id = $1 AND ($3 = '' OR session_id = $3::uuid OR session_id IS NULL) "
+            "  ORDER BY embedding <=> $2::vector "
+            "  LIMIT 40"
             ") ranked "
             "WHERE similarity >= 0.22 "
             "ORDER BY similarity DESC LIMIT 8",
@@ -728,6 +740,14 @@ void AiController::updateSettings(const drogon::HttpRequestPtr& req,
     const int retentionDays = body.isMember("history_retention_days")
                                   ? std::max(1, std::min(3650, body["history_retention_days"].asInt()))
                                   : 90;
+    // Reject anything outside the known modes so the DB check constraint can't
+    // be the only thing standing between a typo and an unintended policy.
+    std::string agentAccessMode = body.isMember("agent_access_mode")
+                                      ? body["agent_access_mode"].asString()
+                                      : "ask";
+    if (agentAccessMode != "ask" && agentAccessMode != "auto_review" && agentAccessMode != "full_access") {
+        agentAccessMode = "ask";
+    }
 
     try {
         auto conn = Database::getInstance().getConnection();
@@ -735,8 +755,8 @@ void AiController::updateSettings(const drogon::HttpRequestPtr& req,
         txn.exec_params(
             "INSERT INTO ai_preferences "
             "(user_id, enabled, provider, model, openai_compatible_base_url, openai_compatible_api_key, "
-            "confidence_threshold, history_retention_days) "
-            "VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, $8) "
+            "confidence_threshold, history_retention_days, agent_access_mode) "
+            "VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, $8, $9) "
             "ON CONFLICT (user_id) DO UPDATE SET "
             "enabled = EXCLUDED.enabled, provider = EXCLUDED.provider, model = EXCLUDED.model, "
             "openai_compatible_base_url = EXCLUDED.openai_compatible_base_url, "
@@ -745,6 +765,7 @@ void AiController::updateSettings(const drogon::HttpRequestPtr& req,
             "WHEN NULLIF($6, '') IS NULL THEN ai_preferences.openai_compatible_api_key "
             "ELSE EXCLUDED.openai_compatible_api_key END, "
             "confidence_threshold = EXCLUDED.confidence_threshold, history_retention_days = EXCLUDED.history_retention_days, "
+            "agent_access_mode = EXCLUDED.agent_access_mode, "
             "updated_at = NOW()",
             userId,
             enabled,
@@ -754,6 +775,7 @@ void AiController::updateSettings(const drogon::HttpRequestPtr& req,
             encryptedCompatibleApiKey,
             threshold,
             retentionDays,
+            agentAccessMode,
             clearCompatibleKey);
         txn.commit();
 
@@ -775,6 +797,10 @@ void AiController::updateSettings(const drogon::HttpRequestPtr& req,
 
 void AiController::listModels(const drogon::HttpRequestPtr& req,
                               std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback)]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -812,10 +838,15 @@ void AiController::listModels(const drogon::HttpRequestPtr& req,
         payload["error"] = "AI model catalog request failed";
     }
     sendJson(callback, payload, status);
+    });
 }
 
 void AiController::chatAgent(const drogon::HttpRequestPtr& req,
                              std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback)]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -990,6 +1021,7 @@ void AiController::chatAgent(const drogon::HttpRequestPtr& req,
         spdlog::error("AI agent chat failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "AI agent chat failed");
     }
+    });
 }
 
 void AiController::listSessions(const drogon::HttpRequestPtr& req,
@@ -1202,6 +1234,10 @@ void AiController::listProjectRuns(const drogon::HttpRequestPtr& req,
 void AiController::analyzeProject(const drogon::HttpRequestPtr& req,
                                   std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                   const std::string& projectId) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback), projectId]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -1245,11 +1281,16 @@ void AiController::analyzeProject(const drogon::HttpRequestPtr& req,
         spdlog::error("AI project analysis failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "AI project analysis failed");
     }
+    });
 }
 
 void AiController::generateDockerfile(const drogon::HttpRequestPtr& req,
                                       std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                       const std::string& projectId) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback), projectId]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -1292,11 +1333,16 @@ void AiController::generateDockerfile(const drogon::HttpRequestPtr& req,
         spdlog::error("AI Dockerfile generation failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "AI Dockerfile generation failed");
     }
+    });
 }
 
 void AiController::chatProject(const drogon::HttpRequestPtr& req,
                                std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                const std::string& projectId) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback), projectId]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -1382,11 +1428,16 @@ void AiController::chatProject(const drogon::HttpRequestPtr& req,
         spdlog::error("AI project chat failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "AI project chat failed");
     }
+    });
 }
 
 void AiController::analyzeBuildFailure(const drogon::HttpRequestPtr& req,
                                        std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                        const std::string& deploymentId) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback), deploymentId]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -1430,11 +1481,16 @@ void AiController::analyzeBuildFailure(const drogon::HttpRequestPtr& req,
         spdlog::error("AI build failure analysis failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "AI build failure analysis failed");
     }
+    });
 }
 
 void AiController::analyzeRuntimeFailure(const drogon::HttpRequestPtr& req,
                                          std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                          const std::string& deploymentId) {
+    // Runs off the event loop: this handler performs a synchronous call to
+    // the AI service that can block for up to 120s, which would otherwise
+    // occupy one of the few Drogon event-loop threads for its duration.
+    BlockingTaskRunner::run([this, req, callback = std::move(callback), deploymentId]() mutable {
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
@@ -1478,6 +1534,7 @@ void AiController::analyzeRuntimeFailure(const drogon::HttpRequestPtr& req,
         spdlog::error("AI runtime failure analysis failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "AI runtime failure analysis failed");
     }
+    });
 }
 
 } // namespace stackpilot

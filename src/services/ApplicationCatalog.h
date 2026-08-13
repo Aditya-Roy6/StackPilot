@@ -38,6 +38,9 @@ public:
     static Json::Value sanitizedConfig(const std::string& templateId, const Json::Value& config);
     static std::vector<std::string> missingRequiredFields(const std::string& templateId, const Json::Value& config);
     static std::vector<BuildEnvVar> envVarsForConfig(const std::string& templateId, const Json::Value& config);
+    // Env keys the catalog marks as secret (passwords, root credentials). These
+    // are routed to project_secrets rather than the plainly-visible env vars.
+    static std::vector<std::string> secretEnvKeys(const std::string& templateId);
     static std::filesystem::path materializeSource(const std::string& deploymentId,
                                                    const std::string& projectName,
                                                    const std::string& templateId,

@@ -18,6 +18,9 @@ public:
     static std::string extractTokenFromRequest(const drogon::HttpRequestPtr& req);
     static Json::Value verifyRequestToken(const drogon::HttpRequestPtr& req);
     static Json::Value verifyMcpToken(const std::string& token);
+
+    // Scope gate for MCP tokens: read (GET), deploy (POST/PUT/PATCH), admin (DELETE).
+    static bool mcpTokenPermitsRequest(const Json::Value& payload, const drogon::HttpRequestPtr& req);
     static bool isExpired(const Json::Value& payload);
 
 private:

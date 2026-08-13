@@ -96,3 +96,6 @@ uploads/builds/
 uploads/source-artifacts/
 uploads/ssh/
 uploads/tmp/
+
+# TypeScript incremental build caches — machine-specific, regenerated on build
+*.tsbuildinfo

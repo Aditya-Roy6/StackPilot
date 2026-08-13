@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "JwtHelper.h"
+#include "StringUtils.h"
 #include "../db/Database.h"
 #include <spdlog/spdlog.h>
 #include <pqxx/pqxx>
@@ -22,19 +23,8 @@ namespace stackpilot {
 
 namespace {
 
-std::string trim(const std::string& value) {
-    size_t start = 0;
-    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start]))) {
-        ++start;
-    }
+using strings::trim;
 
-    size_t end = value.size();
-    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
-        --end;
-    }
-
-    return value.substr(start, end - start);
-}
 
 std::string extractCookieValue(const std::string& cookieHeader, const std::string& name) {
     std::stringstream stream(cookieHeader);
@@ -225,15 +215,65 @@ std::string JwtHelper::extractTokenFromRequest(const drogon::HttpRequestPtr& req
     return cookieValue;
 }
 
+bool JwtHelper::mcpTokenPermitsRequest(const Json::Value& payload, const drogon::HttpRequestPtr& req) {
+    // Scope model: "read" for GET/HEAD, "deploy" for POST/PUT/PATCH,
+    // "admin" for DELETE. "admin" implies everything; "*" is a full-access escape
+    // hatch. Previously `permissions` was stored but never read anywhere, so every
+    // MCP token was an unscoped, full-account credential.
+    const Json::Value& perms = payload["permissions"];
+    if (!perms.isArray() || perms.empty()) {
+        // No scopes recorded — treat as read-only rather than full access.
+        return req->method() == drogon::Get || req->method() == drogon::Head;
+    }
+
+    std::string required = "deploy";
+    switch (req->method()) {
+        case drogon::Get:
+        case drogon::Head:
+        case drogon::Options:
+            required = "read";
+            break;
+        case drogon::Delete:
+            required = "admin";
+            break;
+        default:
+            required = "deploy";
+            break;
+    }
+
+    bool hasAdmin = false;
+    for (const auto& entry : perms) {
+        if (!entry.isString()) continue;
+        const std::string scope = entry.asString();
+        if (scope == "*" || scope == "admin") hasAdmin = true;
+        if (scope == required) return true;
+    }
+    // admin implies read and deploy
+    if (hasAdmin) return true;
+
+    spdlog::warn("MCP token lacks '{}' scope for {}", required, req->path());
+    return false;
+}
+
 Json::Value JwtHelper::verifyRequestToken(const drogon::HttpRequestPtr& req) {
     const std::string token = extractTokenFromRequest(req);
     if (token.empty()) {
         return Json::Value(Json::nullValue);
     }
 
-    // MCP tokens are scoped to MCP endpoints. Normal API auth must reject them.
+    // MCP tokens are accepted on normal API routes — the MCP server drives
+    // /projects, /deployments and /ssh/connections, so rejecting them here made
+    // 11 of the 13 MCP tools return 401 while /mcp/verify still reported "valid".
+    // Authority is narrowed by scope rather than by endpoint.
     if (token.rfind("STACKPILOT_mcp_", 0) == 0) {
-        return Json::Value(Json::nullValue);
+        Json::Value payload = verifyMcpToken(token);
+        if (payload.isNull()) {
+            return Json::Value(Json::nullValue);
+        }
+        if (!mcpTokenPermitsRequest(payload, req)) {
+            return Json::Value(Json::nullValue);
+        }
+        return payload;
     }
 
     Json::Value payload = verifyToken(token);
@@ -294,7 +334,8 @@ Json::Value JwtHelper::verifyMcpToken(const std::string& token) {
         pqxx::work txn(*conn);
 
         auto result = txn.exec_params(
-            "SELECT user_id FROM mcp_tokens WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > NOW())",
+            "SELECT user_id, COALESCE(permissions, '[]'::jsonb)::text AS permissions "
+            "FROM mcp_tokens WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > NOW())",
             tokenHash
         );
 
@@ -311,6 +352,22 @@ Json::Value JwtHelper::verifyMcpToken(const std::string& token) {
         Json::Value payload;
         payload["user_id"] = result[0]["user_id"].as<std::string>();
         payload["mcp"] = true;
+        // Carry the scopes so mcpTokenPermitsRequest can enforce them.
+        {
+            Json::Value parsedPermissions(Json::arrayValue);
+            const std::string raw = result[0]["permissions"].is_null()
+                ? "[]"
+                : result[0]["permissions"].as<std::string>();
+            Json::CharReaderBuilder builder;
+            std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+            std::string parseErrors;
+            Json::Value candidate;
+            if (reader->parse(raw.c_str(), raw.c_str() + raw.size(), &candidate, &parseErrors) &&
+                candidate.isArray()) {
+                parsedPermissions = candidate;
+            }
+            payload["permissions"] = parsedPermissions;
+        }
         auto now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         payload["iat"] = Json::Value::Int64(now);
