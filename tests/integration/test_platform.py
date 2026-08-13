@@ -319,6 +319,7 @@ def test_organization_access_control() -> None:
     """
     print("\norganization access control")
     outsider_email = f"rbac-outsider-{secrets.token_hex(6)}@stackpilot.invalid"
+    project_name = f"rbac-fixture-{secrets.token_hex(6)}"
     try:
         owner_id = ensure_user()
 
@@ -332,9 +333,22 @@ def test_organization_access_control() -> None:
         orphans = psql("SELECT count(*) FROM projects WHERE organization_id IS NULL;")
         check("no project is orphaned from an organization", orphans == "0", f"{orphans} orphaned")
 
-        project_id = psql("SELECT id FROM projects LIMIT 1;")
+        # Create our own project rather than borrowing whatever happens to
+        # exist. On a fresh CI database nothing does, and the earlier version
+        # of this test quietly skipped its twelve real assertions there --
+        # a green tick that proved almost nothing.
+        owner_org = psql(
+            "SELECT o.id FROM organizations o "
+            "JOIN organization_members m ON m.organization_id = o.id "
+            f"WHERE m.user_id = '{owner_id}' AND o.is_personal LIMIT 1;")
+        # RETURNING prints the value and then psql's "INSERT 0 1" status line;
+        # only the first line is the id.
+        project_id = psql(
+            "INSERT INTO projects (organization_id, user_id, name, source_type, repo_url) "
+            f"VALUES ('{owner_org}', '{owner_id}', '{project_name}', 'github', "
+            "'https://example.invalid/rbac-fixture.git') RETURNING id;").splitlines()[0].strip()
+        check("fixture project created", bool(project_id), "no id returned")
         if not project_id:
-            check("access control (skipped: no projects exist)", True)
             return
 
         check("owner reaches their own project",
@@ -391,6 +405,7 @@ def test_organization_access_control() -> None:
     except Exception as exc:
         check("organization access control reachable", False, str(exc))
     finally:
+        psql(f"DELETE FROM projects WHERE name = '{project_name}';")
         if outsider_email:
             psql(f"DELETE FROM users WHERE email = '{outsider_email}';")
 
