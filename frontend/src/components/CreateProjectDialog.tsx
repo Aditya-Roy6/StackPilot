@@ -1218,7 +1218,7 @@ export function CreateProjectDialog() {
           </Button>
         }
       />
-      <DialogContent className="!flex h-[min(82vh,760px)] !w-[min(92vw,820px)] !max-w-[820px] flex-col overflow-hidden rounded-2xl p-0">
+      <DialogContent className="!flex h-[min(90vh,940px)] !w-[min(96vw,1120px)] !max-w-[1120px] flex-col overflow-hidden rounded-2xl p-0">
         <DialogHeader className="shrink-0 border-b border-border p-6">
           <div className="flex items-start justify-between gap-4 pr-8">
             <div className="space-y-2">

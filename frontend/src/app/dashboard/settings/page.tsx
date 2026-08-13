@@ -28,6 +28,7 @@ import {
   Loader2,
   Lock,
   Save,
+  Search,
   ScrollText,
   Server,
   Shield,
@@ -35,11 +36,14 @@ import {
   Trash2,
   Unplug,
   Wrench,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { GitHubAuthButton } from "@/components/auth/GitHubAuthButton";
 import { RemoteSshTerminal } from "@/components/RemoteSshTerminal";
 import { McpIntegrations } from "./mcp-integrations";
+import { AppearanceSettings } from "./appearance";
+import { SettingsSection, visibleSettingsSections } from "./settings-section";
 
 interface MeResponse {
   user: {
@@ -136,6 +140,7 @@ function formatLoginTime(value: string) {
 
 export default function SettingsPage() {
   const queryClient = useQueryClient();
+  const [settingsQuery, setSettingsQuery] = useState("");
   const [fullNameDraft, setFullNameDraft] = useState<string | null>(null);
   const [sshName, setSshName] = useState("");
   const [sshHost, setSshHost] = useState("");
@@ -404,15 +409,40 @@ export default function SettingsPage() {
   });
 
   const connections = sshConnectionsQuery.data?.connections ?? [];
+  const matchedSections = visibleSettingsSections(settingsQuery);
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight text-foreground">Settings</h1>
-        <p className="text-muted-foreground">Manage account, integrations, and remote build connections.</p>
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight text-foreground">Settings</h1>
+          <p className="text-muted-foreground">Manage account, integrations, and remote build connections.</p>
+        </div>
+        <div className="relative w-full lg:max-w-sm">
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={settingsQuery}
+            onChange={(event) => setSettingsQuery(event.target.value)}
+            placeholder="Search settings…"
+            aria-label="Search settings"
+            className="pl-9 pr-9"
+          />
+          {settingsQuery && (
+            <button
+              type="button"
+              onClick={() => setSettingsQuery("")}
+              aria-label="Clear search"
+              className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="grid gap-6">
+
+        <SettingsSection id="account" query={settingsQuery}>
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
@@ -501,7 +531,9 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+        </SettingsSection>
 
+        <SettingsSection id="github" query={settingsQuery}>
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
@@ -562,9 +594,13 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+        </SettingsSection>
 
+        <SettingsSection id="mcp" query={settingsQuery}>
         <McpIntegrations />
+        </SettingsSection>
 
+        <SettingsSection id="remote" query={settingsQuery}>
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
@@ -970,7 +1006,9 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+        </SettingsSection>
 
+        <SettingsSection id="platform" query={settingsQuery}>
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
@@ -994,6 +1032,24 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+        </SettingsSection>
+
+        <SettingsSection id="appearance" query={settingsQuery}>
+          <AppearanceSettings />
+        </SettingsSection>
+
+        {matchedSections.length === 0 && (
+          <div className="rounded-xl border border-dashed border-border py-14 text-center">
+            <Search className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
+            <p className="font-medium">No settings match “{settingsQuery}”</p>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Try a broader term such as “ssh”, “theme” or “token”.
+            </p>
+            <Button variant="outline" size="sm" className="mt-4" onClick={() => setSettingsQuery("")}>
+              Clear search
+            </Button>
+          </div>
+        )}
       </div>
 
       {terminalConnection && (

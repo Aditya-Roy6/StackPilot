@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { type PointerEvent, type WheelEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
+
+import { readCanvasTheme, useCanvasThemeVersion } from "@/lib/canvas-theme";
 import {
   Activity,
   Boxes,
@@ -12,7 +14,9 @@ import {
   Gauge,
   GitBranch,
   Loader2,
+  Focus,
   Maximize2,
+  Minimize2,
   Minus,
   Network,
   Plus,
@@ -411,6 +415,9 @@ function extractYamlFromAi(value: string) {
 export function ClusterVisualization() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const shellRef = useRef<HTMLDivElement | null>(null);
+  // Set on a fullscreen transition, consumed by the ResizeObserver once the
+  // shell has actually been remeasured at its new size.
+  const pendingFullscreenFitRef = useRef(false);
   const graphNodesRef = useRef<GraphNode[]>([]);
   const [canvasSize, setCanvasSize] = useState({ width: 1180, height: 640 });
   const [view, setView] = useState({ x: 80, y: 40, scale: 0.78 });
@@ -430,10 +437,16 @@ export function ClusterVisualization() {
   const connectionsQuery = useQuery({
     queryKey: ["ssh-connections"],
     queryFn: async () => {
-      const response = await api.get<{ connections: SshConnection[] }>("/ssh/connections");
-      return response.data.connections || [];
+      // Shape must match every other consumer of the ["ssh-connections"] key —
+      // React Query caches per key, so a divergent shape here crashes whichever
+      // component reads the cache entry it didn't write.
+      const response = await api.get<{ connections?: SshConnection[]; count?: number }>("/ssh/connections");
+      return response.data;
     },
   });
+  const sshConnections = Array.isArray(connectionsQuery.data?.connections)
+    ? connectionsQuery.data.connections
+    : [];
 
   const inventoryQuery = useQuery({
     queryKey: ["infrastructure-inventory-visualization", targetConnectionId],
@@ -441,7 +454,9 @@ export function ClusterVisualization() {
       const response = await api.get<InfrastructureInventory>(`/infrastructure/inventory${targetQueryValue}`);
       return normalizeVisualInventory(response.data);
     },
-    refetchInterval: 15000,
+    refetchInterval: 5000,
+    refetchIntervalInBackground: false,
+    placeholderData: (previous) => previous,
   });
 
   const inventory = inventoryQuery.data;
@@ -464,18 +479,14 @@ export function ClusterVisualization() {
   }, [inventory?.docker.stats]);
 
   const graph = useMemo(() => {
-    const nodes: GraphNode[] = [{
-      id: "cluster",
-      kind: "cluster",
-      label: "StackPilot Cluster",
-      sublabel: inventory?.kubernetes.available ? "Kubernetes reachable" : "Topology view",
-      status: inventory?.kubernetes.available ? "ready" : "observed",
-      x: 820,
-      y: 410,
-      width: 180,
-      height: 64,
-      color: KIND_COLORS.cluster,
-    }];
+    // Tidy left-to-right tree. Every node is placed relative to its parent and
+    // each subtree owns a vertical band, so edges stay short and never cross.
+    // Columns are fixed depths; only the vertical cursor advances as we lay out.
+    const COL = { cluster: 0, group: 330, leaf: 640 };
+    const ROW_GAP = 12;
+    const GROUP_GAP = 44;
+
+    const nodes: GraphNode[] = [];
     const edges: GraphEdge[] = [];
     const k8sNodes = inventory?.kubernetes.nodes || [];
     const pods = inventory?.kubernetes.pods || [];
@@ -483,62 +494,40 @@ export function ClusterVisualization() {
     const services = inventory?.kubernetes.services || [];
     const containers = inventory?.docker.containers || [];
 
-    k8sNodes.forEach((resource, index) => {
-      const angle = -Math.PI / 2 + (index / Math.max(k8sNodes.length, 1)) * Math.PI * 2;
-      const metric = nodeMetricsByName.get(resource.name);
-      const cpu = typeof metric?.cpu_percent === "number" ? `CPU ${formatNumber(metric.cpu_percent, "%")}` : resource.allocatable?.cpu || "CPU -";
-      const node: GraphNode = {
-        id: `node:${resource.name}`,
-        kind: "node",
-        label: resource.name,
-        sublabel: cpu,
-        status: resource.ready ? "ready" : "not_ready",
-        x: 820 + Math.cos(angle) * 250,
-        y: 410 + Math.sin(angle) * 220,
-        width: 170,
-        height: 56,
-        color: resource.ready ? KIND_COLORS.node : "#ef4444",
-        resource,
-      };
-      nodes.push(node);
-      edges.push({ from: "cluster", to: node.id, color: "rgba(148, 163, 184, 0.35)" });
-    });
+    let cursorY = 0;
 
-    deployments.slice(0, 32).forEach((resource, index) => {
-      const node: GraphNode = {
-        id: `deployment:${resource.namespace}/${resource.name}`,
-        kind: "deployment",
-        label: resource.name,
-        sublabel: `${resource.ready_replicas}/${resource.desired_replicas} ready`,
-        status: resource.ready_replicas >= resource.desired_replicas ? "ready" : "degraded",
-        x: 140 + (index % 3) * 188,
-        y: 90 + Math.floor(index / 3) * 72,
-        width: 170,
-        height: 48,
-        color: KIND_COLORS.deployment,
-        resource,
-      };
-      nodes.push(node);
-      edges.push({ from: "cluster", to: node.id, color: "rgba(167, 139, 250, 0.24)" });
-    });
+    // Lays out one branch: a group anchor in the middle column with its leaves
+    // stacked in the outer column, then centers the anchor on its own leaves.
+    const addBranch = (
+      anchor: { id: string; label: string; sublabel: string; status: string; color: string; kind: GraphKind; resource?: GraphResource },
+      leaves: Array<{ id: string; label: string; sublabel: string; status: string; color: string; kind: GraphKind; resource?: GraphResource }>,
+      edgeColor: string
+    ) => {
+      const leafH = 42;
+      const startY = cursorY;
 
-    services.slice(0, 28).forEach((resource, index) => {
-      const node: GraphNode = {
-        id: `service:${resource.namespace}/${resource.name}`,
-        kind: "service",
-        label: resource.name,
-        sublabel: resource.type,
-        status: "ready",
-        x: 140 + (index % 5) * 178,
-        y: 780 + Math.floor(index / 5) * 62,
-        width: 160,
-        height: 44,
-        color: KIND_COLORS.service,
-        resource,
-      };
-      nodes.push(node);
-      edges.push({ from: "cluster", to: node.id, color: "rgba(245, 158, 11, 0.24)" });
-    });
+      leaves.forEach((leaf, index) => {
+        nodes.push({
+          ...leaf,
+          x: COL.leaf,
+          y: startY + index * (leafH + ROW_GAP),
+          width: 210,
+          height: leafH,
+        });
+      });
+
+      const span = leaves.length > 0 ? (leaves.length - 1) * (leafH + ROW_GAP) : 0;
+      const anchorY = startY + span / 2;
+      nodes.push({ ...anchor, x: COL.group, y: anchorY, width: 190, height: 54 });
+
+      for (const leaf of leaves) {
+        edges.push({ from: anchor.id, to: leaf.id, color: edgeColor });
+      }
+      edges.push({ from: "cluster", to: anchor.id, color: "rgba(148,163,184,0.30)" });
+
+      cursorY = startY + Math.max(span, 54) + GROUP_GAP;
+      return anchorY;
+    };
 
     const podsByNode = new Map<string, KubernetesPod[]>();
     for (const pod of pods) {
@@ -546,49 +535,130 @@ export function ClusterVisualization() {
       list.push(pod);
       podsByNode.set(pod.node, list);
     }
-    k8sNodes.forEach((host, hostIndex) => {
-      const hostGraph = nodes.find((node) => node.id === `node:${host.name}`);
-      if (!hostGraph) return;
-      const hostPods = (podsByNode.get(host.name) || []).slice(0, 18);
-      hostPods.forEach((resource, podIndex) => {
-        const col = podIndex % 3;
-        const row = Math.floor(podIndex / 3);
-        const metric = podMetricsByKey.get(`${resource.namespace}/${resource.name}`);
-        const node: GraphNode = {
-          id: `pod:${resource.namespace}/${resource.name}`,
-          kind: "pod",
-          label: resource.name,
-          sublabel: metric?.cpu ? `${metric.cpu} CPU` : resource.phase,
-          status: resource.phase,
-          x: hostGraph.x - 190 + col * 150 + hostIndex * 18,
-          y: hostGraph.y + 84 + row * 50,
-          width: 136,
-          height: 38,
-          color: resource.phase === "Running" ? KIND_COLORS.pod : "#f97316",
-          resource,
+
+    // One branch per Kubernetes node, carrying its own pods.
+    k8sNodes.forEach((resource) => {
+      const metric = nodeMetricsByName.get(resource.name);
+      const cpu =
+        typeof metric?.cpu_percent === "number"
+          ? `CPU ${formatNumber(metric.cpu_percent, "%")}`
+          : resource.allocatable?.cpu || "CPU -";
+
+      const hostPods = (podsByNode.get(resource.name) || []).slice(0, 14).map((pod) => {
+        const podMetric = podMetricsByKey.get(`${pod.namespace}/${pod.name}`);
+        return {
+          id: `pod:${pod.namespace}/${pod.name}`,
+          kind: "pod" as GraphKind,
+          label: pod.name,
+          sublabel: podMetric?.cpu ? `${podMetric.cpu} CPU` : pod.phase,
+          status: pod.phase,
+          color: pod.phase === "Running" ? KIND_COLORS.pod : "#f97316",
+          resource: pod as GraphResource,
         };
-        nodes.push(node);
-        edges.push({ from: hostGraph.id, to: node.id, color: "rgba(56, 189, 248, 0.26)" });
       });
+
+      addBranch(
+        {
+          id: `node:${resource.name}`,
+          kind: "node",
+          label: resource.name,
+          sublabel: cpu,
+          status: resource.ready ? "ready" : "not_ready",
+          color: resource.ready ? KIND_COLORS.node : "#ef4444",
+          resource,
+        },
+        hostPods,
+        "rgba(56,189,248,0.30)"
+      );
     });
 
-    containers.slice(0, 24).forEach((resource, index) => {
-      const metric = dockerStatsByName.get(resource.name);
-      const node: GraphNode = {
-        id: `container:${resource.name || resource.id}`,
-        kind: "container",
-        label: resource.name,
-        sublabel: metric?.cpu ? `CPU ${metric.cpu}` : resource.status,
-        status: resource.status,
-        x: 1450,
-        y: 90 + index * 56,
-        width: 205,
-        height: 42,
-        color: resource.status.toLowerCase().includes("up") ? KIND_COLORS.container : "#64748b",
-        resource,
-      };
-      nodes.push(node);
-      edges.push({ from: "cluster", to: node.id, color: "rgba(251, 113, 133, 0.22)" });
+    if (deployments.length > 0) {
+      addBranch(
+        {
+          id: "group:deployments",
+          kind: "deployment",
+          label: "Deployments",
+          sublabel: `${deployments.length} workload${deployments.length === 1 ? "" : "s"}`,
+          status: "ready",
+          color: KIND_COLORS.deployment,
+        },
+        deployments.slice(0, 24).map((resource) => ({
+          id: `deployment:${resource.namespace}/${resource.name}`,
+          kind: "deployment" as GraphKind,
+          label: resource.name,
+          sublabel: `${resource.ready_replicas}/${resource.desired_replicas} ready`,
+          status: resource.ready_replicas >= resource.desired_replicas ? "ready" : "degraded",
+          color: resource.ready_replicas >= resource.desired_replicas ? KIND_COLORS.deployment : "#f97316",
+          resource: resource as GraphResource,
+        })),
+        "rgba(167,139,250,0.30)"
+      );
+    }
+
+    if (services.length > 0) {
+      addBranch(
+        {
+          id: "group:services",
+          kind: "service",
+          label: "Services",
+          sublabel: `${services.length} exposed`,
+          status: "ready",
+          color: KIND_COLORS.service,
+        },
+        services.slice(0, 24).map((resource) => ({
+          id: `service:${resource.namespace}/${resource.name}`,
+          kind: "service" as GraphKind,
+          label: resource.name,
+          sublabel: resource.type,
+          status: "ready",
+          color: KIND_COLORS.service,
+          resource: resource as GraphResource,
+        })),
+        "rgba(245,158,11,0.30)"
+      );
+    }
+
+    if (containers.length > 0) {
+      const running = containers.filter((item) => item.status.toLowerCase().includes("up")).length;
+      addBranch(
+        {
+          id: "group:docker",
+          kind: "container",
+          label: "Docker",
+          sublabel: `${running}/${containers.length} running`,
+          status: running === containers.length ? "ready" : "degraded",
+          color: KIND_COLORS.container,
+        },
+        containers.slice(0, 24).map((resource) => {
+          const metric = dockerStatsByName.get(resource.name);
+          const isUp = resource.status.toLowerCase().includes("up");
+          return {
+            id: `container:${resource.name || resource.id}`,
+            kind: "container" as GraphKind,
+            label: resource.name,
+            sublabel: metric?.cpu ? `CPU ${metric.cpu}` : resource.status,
+            status: resource.status,
+            color: isUp ? KIND_COLORS.container : "#64748b",
+            resource: resource as GraphResource,
+          };
+        }),
+        "rgba(251,113,133,0.30)"
+      );
+    }
+
+    // Root sits centered against everything it feeds.
+    const totalHeight = Math.max(cursorY - GROUP_GAP, 0);
+    nodes.unshift({
+      id: "cluster",
+      kind: "cluster",
+      label: "StackPilot Cluster",
+      sublabel: inventory?.kubernetes.available ? "Kubernetes reachable" : "Docker topology",
+      status: inventory?.kubernetes.available ? "ready" : "observed",
+      x: COL.cluster,
+      y: totalHeight / 2,
+      width: 200,
+      height: 64,
+      color: KIND_COLORS.cluster,
     });
 
     return { nodes, edges };
@@ -602,15 +672,60 @@ export function ClusterVisualization() {
     return `${href}${href.includes("?") ? "&" : "?"}connection_id=${encodeURIComponent(targetConnectionId)}`;
   }, [selectedResource, targetConnectionId]);
 
+  // Frames the whole topology instead of jumping to an arbitrary fixed offset.
+  // Takes explicit dimensions so callers holding fresher measurements than the
+  // canvasSize state (the ResizeObserver) can fit without waiting for a render.
+  const fitToSize = useCallback((viewportWidth: number, viewportHeight: number) => {
+    if (graph.nodes.length === 0 || viewportWidth === 0) return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const node of graph.nodes) {
+      minX = Math.min(minX, node.x - node.width / 2);
+      maxX = Math.max(maxX, node.x + node.width / 2);
+      minY = Math.min(minY, node.y - node.height / 2);
+      maxY = Math.max(maxY, node.y + node.height / 2);
+    }
+    const padding = 56;
+    const width = Math.max(maxX - minX, 1);
+    const height = Math.max(maxY - minY, 1);
+    const scale = clamp(
+      Math.min((viewportWidth - padding * 2) / width, (viewportHeight - padding * 2) / height),
+      0.25,
+      1.4
+    );
+    setView({
+      x: viewportWidth / 2 - ((minX + maxX) / 2) * scale,
+      y: viewportHeight / 2 - ((minY + maxY) / 2) * scale,
+      scale,
+    });
+  }, [graph.nodes]);
+
+  const fitToContent = useCallback(
+    () => fitToSize(canvasSize.width, canvasSize.height),
+    [canvasSize.height, canvasSize.width, fitToSize]
+  );
+
   useEffect(() => {
     const shell = shellRef.current;
     if (!shell) return;
     const update = () => {
       const rect = shell.getBoundingClientRect();
-      setCanvasSize({
-        width: Math.max(720, Math.floor(rect.width)),
-        height: Math.max(540, Math.min(760, Math.floor(window.innerHeight - 230))),
-      });
+      // Read fullscreen at call time so this observer never holds a stale value.
+      // Fullscreen drops the 760px cap and the 720px floor so the graph truly fills the screen.
+      const fullscreen = document.fullscreenElement !== null;
+      const width = fullscreen ? Math.floor(rect.width) : Math.max(720, Math.floor(rect.width));
+      const height = fullscreen
+        ? Math.max(320, Math.floor(rect.height))
+        : Math.max(540, Math.min(760, Math.floor(window.innerHeight - 230)));
+      setCanvasSize({ width, height });
+      // Re-frame only after a fullscreen transition — a plain window resize must
+      // not yank the viewport while the user is inspecting something.
+      if (pendingFullscreenFitRef.current) {
+        pendingFullscreenFitRef.current = false;
+        fitToSize(width, height);
+      }
     };
     update();
     const observer = new ResizeObserver(update);
@@ -620,12 +735,14 @@ export function ClusterVisualization() {
       observer.disconnect();
       window.removeEventListener("resize", update);
     };
-  }, []);
+  }, [fitToSize]);
 
   const screenToWorld = useCallback((x: number, y: number) => ({
     x: (x - view.x) / view.scale,
     y: (y - view.y) / view.scale,
   }), [view.scale, view.x, view.y]);
+
+  const themeVersion = useCanvasThemeVersion();
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -638,10 +755,17 @@ export function ClusterVisualization() {
     canvas.style.width = `${canvasSize.width}px`;
     canvas.style.height = `${canvasSize.height}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#090909";
+
+    // Resolved from the live CSS variables, so every theme is handled rather
+    // than just light and dark. themeVersion is in this callback's deps purely
+    // to force a repaint when the theme changes.
+    void themeVersion;
+    const palette = readCanvasTheme(ctx);
+
+    ctx.fillStyle = palette.background;
     ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
 
-    ctx.strokeStyle = "rgba(255,255,255,0.045)";
+    ctx.strokeStyle = palette.grid;
     ctx.lineWidth = 1;
     const grid = 42 * view.scale;
     const offsetX = view.x % grid;
@@ -664,17 +788,22 @@ export function ClusterVisualization() {
     ctx.translate(view.x, view.y);
     ctx.scale(view.scale, view.scale);
 
+    // Left-to-right hierarchy: leave from the parent's right edge and arrive at
+    // the child's left edge with a horizontal bezier, so lines read as branches
+    // instead of crossing through the boxes they connect.
+    const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
     for (const edge of graph.edges) {
-      const from = graph.nodes.find((node) => node.id === edge.from);
-      const to = graph.nodes.find((node) => node.id === edge.to);
+      const from = nodeById.get(edge.from);
+      const to = nodeById.get(edge.to);
       if (!from || !to) continue;
+      const startX = from.x + from.width / 2;
+      const endX = to.x - to.width / 2;
+      const control = Math.max(28, (endX - startX) / 2);
       ctx.strokeStyle = edge.color;
-      ctx.lineWidth = 1.3 / view.scale;
+      ctx.lineWidth = 1.4 / view.scale;
       ctx.beginPath();
-      ctx.moveTo(from.x, from.y);
-      const midX = (from.x + to.x) / 2;
-      const midY = (from.y + to.y) / 2;
-      ctx.quadraticCurveTo(midX, midY - 28, to.x, to.y);
+      ctx.moveTo(startX, from.y);
+      ctx.bezierCurveTo(startX + control, from.y, endX - control, to.y, endX, to.y);
       ctx.stroke();
     }
 
@@ -685,37 +814,76 @@ export function ClusterVisualization() {
       drawRoundedRect(ctx, x, y, node.width, node.height, 10);
       ctx.fillStyle = colorWithAlpha(node.color, selected ? 0.24 : 0.13);
       ctx.fill();
-      ctx.strokeStyle = selected ? "#ffffff" : colorWithAlpha(node.color, 0.46);
+      ctx.strokeStyle = selected ? palette.selection : colorWithAlpha(node.color, 0.46);
       ctx.lineWidth = selected ? 2 / view.scale : 1 / view.scale;
       ctx.stroke();
       ctx.fillStyle = node.color;
       ctx.beginPath();
       ctx.arc(x + 14, y + 19, 4.5, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#f8fafc";
+      ctx.fillStyle = palette.title;
       ctx.font = "600 13px Inter, system-ui, sans-serif";
       ctx.fillText(shortText(node.label, node.kind === "container" ? 19 : 18), x + 26, y + 21);
-      ctx.fillStyle = "rgba(226,232,240,0.62)";
+      ctx.fillStyle = palette.subtitle;
       ctx.font = "11px Inter, system-ui, sans-serif";
       ctx.fillText(shortText(node.sublabel, 24), x + 26, y + 38);
     }
     ctx.restore();
 
-    ctx.fillStyle = "rgba(10,10,10,0.78)";
-    drawRoundedRect(ctx, 14, 14, 280, 34, 17);
+    ctx.fillStyle = palette.pill;
+    drawRoundedRect(ctx, 14, 14, 268, 32, 16);
     ctx.fill();
-    ctx.fillStyle = "rgba(226,232,240,0.8)";
+    ctx.fillStyle = palette.pillText;
     ctx.font = "12px Inter, system-ui, sans-serif";
-    ctx.fillText(`Drag to move - wheel to zoom - ${Math.round(view.scale * 100)}%`, 30, 36);
-  }, [canvasSize.height, canvasSize.width, graph.edges, graph.nodes, selectedNodeId, view]);
+    ctx.fillText(`Drag to pan - wheel to zoom - ${Math.round(view.scale * 100)}%`, 28, 34);
+  }, [canvasSize.height, canvasSize.width, graph.edges, graph.nodes, selectedNodeId, themeVersion, view]);
 
   useEffect(() => {
     draw();
   }, [draw]);
 
-  const resetView = () => {
-    setView({ x: 80, y: 40, scale: 0.78 });
-  };
+  const resetView = fitToContent;
+
+  // Real fullscreen, not a CSS-only "maximize". The ResizeObserver on shellRef
+  // already re-measures the canvas, so entering/exiting resizes the graph for free.
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    const onChange = () => {
+      pendingFullscreenFitRef.current = true;
+      setIsFullscreen(document.fullscreenElement === cardRef.current);
+    };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const card = cardRef.current;
+    if (!card) return;
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await card.requestFullscreen();
+      }
+    } catch {
+      // Safari and locked-down embeds can reject the request; keep the graph usable.
+      toast.error("Fullscreen is not available in this browser");
+    }
+  }, []);
+
+
+  // Re-frame only when the set of resources changes. Metric-only refreshes must
+  // not yank the viewport while the user is inspecting something.
+  const topologySignature = useMemo(() => graph.nodes.map((node) => node.id).join("|"), [graph.nodes]);
+  const lastFitSignatureRef = useRef<string>("");
+  useEffect(() => {
+    if (canvasSize.width === 0 || graph.nodes.length === 0) return;
+    if (lastFitSignatureRef.current === topologySignature) return;
+    lastFitSignatureRef.current = topologySignature;
+    fitToContent();
+  }, [canvasSize.width, fitToContent, graph.nodes.length, topologySignature]);
 
   const zoomBy = (factor: number) => {
     const cx = canvasSize.width / 2;
@@ -1004,7 +1172,7 @@ export function ClusterVisualization() {
             </SelectTrigger>
             <SelectContent align="end" className="min-w-[280px]">
               <SelectItem value="local">Local StackPilot host</SelectItem>
-              {(connectionsQuery.data || []).map((connection) => (
+              {sshConnections.map((connection) => (
                 <SelectItem key={connection.id} value={connection.id}>
                   {connection.name} - {connection.username}@{connection.host}:{connection.port}
                 </SelectItem>
@@ -1035,7 +1203,15 @@ export function ClusterVisualization() {
       </div>
 
       <div className="grid gap-6 2xl:grid-cols-[minmax(0,1fr)_460px]">
-        <Card className="overflow-hidden">
+        <Card
+          ref={cardRef}
+          className={cn(
+            "overflow-hidden",
+            // The fullscreen element gets no page background of its own, so set one
+            // and let the canvas shell take the remaining height.
+            isFullscreen && "h-screen w-screen rounded-none bg-background py-0"
+          )}
+        >
           <CardHeader className="border-b border-border">
             <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
               <div>
@@ -1043,8 +1219,31 @@ export function ClusterVisualization() {
                   <Gauge className="h-5 w-5 text-primary" />
                   Cluster Graph
                 </CardTitle>
-                <CardDescription>
-                  Drag to pan, use the wheel to zoom, and click a resource to inspect it on the side.
+                <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium",
+                      inventoryQuery.isError
+                        ? "border-destructive/40 text-destructive"
+                        : "border-emerald-500/40 text-emerald-500"
+                    )}
+                  >
+                    <span className="relative flex h-1.5 w-1.5">
+                      {!inventoryQuery.isError && (
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500 opacity-70" />
+                      )}
+                      <span
+                        className={cn(
+                          "relative inline-flex h-1.5 w-1.5 rounded-full",
+                          inventoryQuery.isError ? "bg-destructive" : "bg-emerald-500"
+                        )}
+                      />
+                    </span>
+                    {inventoryQuery.isError ? "Disconnected" : "Live"}
+                  </span>
+                  <span>{graph.nodes.length} resources</span>
+                  <span aria-hidden="true">|</span>
+                  <span>Drag to pan, wheel to zoom, click to inspect.</span>
                 </CardDescription>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -1060,15 +1259,30 @@ export function ClusterVisualization() {
                   <Button size="icon-sm" variant="ghost" onClick={() => zoomBy(0.85)} title="Zoom out">
                     <Minus className="h-4 w-4" />
                   </Button>
-                  <Button size="icon-sm" variant="ghost" onClick={resetView} title="Reset view">
-                    <Maximize2 className="h-4 w-4" />
+                  <Button size="icon-sm" variant="ghost" onClick={resetView} title="Fit to content">
+                    <Focus className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    size="icon-sm"
+                    variant="ghost"
+                    onClick={toggleFullscreen}
+                    title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+                    aria-pressed={isFullscreen}
+                  >
+                    {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
                   </Button>
                 </div>
               </div>
             </div>
           </CardHeader>
-          <CardContent className="p-0">
-            <div ref={shellRef} className="relative min-h-[540px] w-full overflow-hidden">
+          <CardContent className={cn("p-0", isFullscreen && "min-h-0 flex-1")}>
+            <div
+              ref={shellRef}
+              className={cn(
+                "relative w-full overflow-hidden",
+                isFullscreen ? "h-full" : "min-h-[540px]"
+              )}
+            >
               <canvas
                 ref={canvasRef}
                 className={cn("block touch-none", drag?.moved ? "cursor-grabbing" : "cursor-grab")}

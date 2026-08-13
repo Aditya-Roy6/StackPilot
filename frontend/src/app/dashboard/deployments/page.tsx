@@ -17,6 +17,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+
+import { useChartTheme } from "@/lib/canvas-theme";
 import {
   Dialog,
   DialogContent,
@@ -204,6 +206,9 @@ interface DeploymentSocketMessage {
   deployment?: Deployment;
 }
 
+// Must cover every status the backend can emit. Statuses missing from this list
+// are unreachable by filter and fall through to an unlabelled grey chip:
+// paused/blocked/superseded/retired/failed_ci/canceled were all absent.
 const STATUS_FILTER_OPTIONS = [
   { value: "queued", label: "Queued" },
   { value: "pending", label: "Pending" },
@@ -211,8 +216,18 @@ const STATUS_FILTER_OPTIONS = [
   { value: "deploying", label: "Deploying" },
   { value: "built", label: "Built" },
   { value: "running", label: "Running" },
+  { value: "paused", label: "Paused" },
+  { value: "blocked", label: "Blocked" },
   { value: "failed", label: "Failed" },
+  { value: "failed_ci", label: "CI failed" },
+  { value: "canceled", label: "Canceled" },
+  { value: "superseded", label: "Superseded" },
+  { value: "retired", label: "Retired" },
 ];
+
+// Statuses that mean work is still in flight, so the list should keep polling.
+// `blocked` is included: a deployment waiting on GitHub checks can still change.
+const IN_FLIGHT_STATUSES = ["pending", "queued", "building", "deploying", "blocked"];
 
 const RUNTIME_FILTER_OPTIONS = [
   { value: "local_docker", label: "Local Docker" },
@@ -538,7 +553,7 @@ export default function DeploymentsPage() {
       const currentDeployments =
         (query.state.data as { deployments?: Deployment[] } | undefined)?.deployments || [];
       return currentDeployments.some((deployment) =>
-        ["pending", "queued", "building", "deploying"].includes(deployment.status)
+        IN_FLIGHT_STATUSES.includes(deployment.status)
       )
         ? 2000
         : false;
@@ -1285,6 +1300,15 @@ function DeploymentLogsDialog({
   const buildFixSteps = aiStringList(buildAnalysis?.structured_output, ["fix_steps", "steps", "suggested_fix", "commands"]);
   const buildRootCause = aiRootCause(buildAnalysis?.structured_output);
 
+  // Kept in refs so a changing `onClose` identity or updated `initialLogs` does
+  // not retrigger the socket effect below.
+  const onCloseRef = useRef(onClose);
+  const initialLogsRef = useRef(initialLogs);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+    initialLogsRef.current = initialLogs;
+  });
+
   useEffect(() => {
     if (!deploymentId) return;
 
@@ -1299,14 +1323,14 @@ function DeploymentLogsDialog({
         try {
           const data = JSON.parse(event.data) as DeploymentSocketMessage;
           if (data.type === 'log') {
-            setLiveLogs(prev => `${prev ?? initialLogs}${data.line ?? ""}\n`);
+            setLiveLogs(prev => `${prev ?? initialLogsRef.current}${data.line ?? ""}\n`);
           } else if (data.type === 'status') {
             setLiveStatus(data.status ?? null);
           } else if (data.type === "deployment_deleted") {
-            onClose();
+            onCloseRef.current();
           }
         } catch {
-          setLiveLogs(prev => `${prev ?? initialLogs}${event.data}\n`);
+          setLiveLogs(prev => `${prev ?? initialLogsRef.current}${event.data}\n`);
         }
       };
 
@@ -1332,7 +1356,7 @@ function DeploymentLogsDialog({
         socketRef.current = null;
       }
     };
-  }, [deploymentId, initialLogs, onClose]);
+  }, [deploymentId]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -2220,6 +2244,10 @@ function MetricsDialog({
   deployment: Deployment;
   onClose: () => void;
 }) {
+  // Axis, grid and tooltip chrome follow the active theme; the memory series
+  // keeps its green because it is a category, not chrome.
+  const chart = useChartTheme();
+
   const [history, setHistory] = useState<RuntimeMetricPoint[]>([]);
   const [browserGpuName] = useState(() => detectBrowserGpuName());
   const displayName = deploymentDisplayName(deployment);
@@ -2413,25 +2441,28 @@ function MetricsDialog({
                   <AreaChart data={chartHistory} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
                     <defs>
                       <linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.4} />
-                        <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0} />
+                        {/* Was hsl(var(--primary)). Every theme defines --primary
+                            as oklch(...) or a hex literal, so hsl() wrapped a value
+                            it could not parse and the gradient never rendered. */}
+                        <stop offset="5%" stopColor={chart.foreground} stopOpacity={0.4} />
+                        <stop offset="95%" stopColor={chart.foreground} stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#3f3f46" />
-                    <XAxis dataKey="sample" tickFormatter={() => ""} tickLine={false} axisLine={{ stroke: "#71717a" }} />
-                    <YAxis tick={{ fill: "#a1a1aa", fontSize: 11 }} width={36} axisLine={{ stroke: "#71717a" }} domain={[0, "dataMax + 5"]} />
+                    <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
+                    <XAxis dataKey="sample" tickFormatter={() => ""} tickLine={false} axisLine={{ stroke: chart.axisLine }} />
+                    <YAxis tick={{ fill: chart.axis, fontSize: 11 }} width={36} axisLine={{ stroke: chart.axisLine }} domain={[0, "dataMax + 5"]} />
                     <Tooltip
                       contentStyle={{
-                        background: "#18181b",
-                        border: "1px solid #3f3f46",
+                        background: chart.tooltipBackground,
+                        border: `1px solid ${chart.tooltipBorder}`,
                         borderRadius: 8,
-                        color: "#f4f4f5",
+                        color: chart.tooltipText,
                       }}
                       labelFormatter={(_label, payload) => payload?.[0]?.payload?.time || ""}
-                      labelStyle={{ color: "#f4f4f5" }}
-                      itemStyle={{ color: "#f4f4f5" }}
+                      labelStyle={{ color: chart.tooltipText }}
+                      itemStyle={{ color: chart.tooltipText }}
                     />
-                    <Area type="monotone" dataKey="cpu" stroke="#f4f4f5" fill="url(#cpuGradient)" name="CPU %" dot={false} isAnimationActive={false} />
+                    <Area type="monotone" dataKey="cpu" stroke={chart.foreground} fill="url(#cpuGradient)" name="CPU %" dot={false} isAnimationActive={false} />
                   </AreaChart>
                 </ResponsiveContainer>
               </div>
@@ -2451,19 +2482,19 @@ function MetricsDialog({
                         <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
                       </linearGradient>
                     </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#3f3f46" />
-                    <XAxis dataKey="sample" tickFormatter={() => ""} tickLine={false} axisLine={{ stroke: "#71717a" }} />
-                    <YAxis tick={{ fill: "#a1a1aa", fontSize: 11 }} width={44} axisLine={{ stroke: "#71717a" }} domain={["dataMin - 2", "dataMax + 2"]} />
+                    <CartesianGrid strokeDasharray="3 3" stroke={chart.grid} />
+                    <XAxis dataKey="sample" tickFormatter={() => ""} tickLine={false} axisLine={{ stroke: chart.axisLine }} />
+                    <YAxis tick={{ fill: chart.axis, fontSize: 11 }} width={44} axisLine={{ stroke: chart.axisLine }} domain={["dataMin - 2", "dataMax + 2"]} />
                     <Tooltip
                       contentStyle={{
-                        background: "#18181b",
-                        border: "1px solid #3f3f46",
+                        background: chart.tooltipBackground,
+                        border: `1px solid ${chart.tooltipBorder}`,
                         borderRadius: 8,
-                        color: "#f4f4f5",
+                        color: chart.tooltipText,
                       }}
                       labelFormatter={(_label, payload) => payload?.[0]?.payload?.time || ""}
                       formatter={(value) => [`${Number(value).toFixed(2)} GB`, "Memory"]}
-                      labelStyle={{ color: "#f4f4f5" }}
+                      labelStyle={{ color: chart.tooltipText }}
                       itemStyle={{ color: "#22c55e" }}
                     />
                     <Area type="monotone" dataKey="memoryGb" stroke="#22c55e" fill="url(#memoryGradient)" name="Memory GB" dot={false} isAnimationActive={false} />
@@ -2598,32 +2629,32 @@ function DeleteDeploymentDialog({
   return (
     <Dialog open={!!deployment} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="!w-[min(94vw,720px)] !max-w-[720px] max-h-[calc(100vh-2rem)] overflow-x-hidden overflow-y-auto p-0">
-        <div className="min-w-0 space-y-5 px-6 pt-6">
-          <DialogHeader className="gap-2">
-            <div className="mx-auto mb-2 flex h-12 w-12 items-center justify-center rounded-full border border-destructive/20 bg-destructive/10">
-              <AlertTriangle className="h-6 w-6 text-destructive" />
+        <div className="min-w-0 space-y-4 px-5 pt-5">
+          <DialogHeader className="gap-1.5">
+            <div className="mx-auto mb-1 flex h-10 w-10 items-center justify-center rounded-full border border-destructive/20 bg-destructive/10">
+              <AlertTriangle className="h-5 w-5 text-destructive" />
             </div>
-            <DialogTitle className="text-center text-lg font-bold text-foreground">Delete Deployment?</DialogTitle>
-            <DialogDescription className="mx-auto max-w-[58ch] text-center text-sm">
+            <DialogTitle className="text-center text-base font-bold text-foreground">Delete Deployment?</DialogTitle>
+            <DialogDescription className="mx-auto max-w-[58ch] text-center text-xs leading-relaxed">
               This removes the deployment record from the database. If a live runtime exists, it will be removed first.
             </DialogDescription>
           </DialogHeader>
 
-        <div className="rounded-xl border border-border bg-muted/30 p-4 text-sm">
-          <div className="grid grid-cols-[88px,minmax(0,1fr)] items-start gap-4">
+        <div className="rounded-xl border border-border bg-muted/30 p-3 text-sm">
+          <div className="grid grid-cols-[72px,minmax(0,1fr)] items-start gap-3">
             <span className="text-muted-foreground">Project</span>
             <span className="min-w-0 break-words text-right font-medium text-foreground">{displayName}</span>
           </div>
-          <div className="mt-2 grid grid-cols-[88px,minmax(0,1fr)] items-start gap-4">
+          <div className="mt-1.5 grid grid-cols-[72px,minmax(0,1fr)] items-start gap-3">
             <span className="text-muted-foreground">Version</span>
             <span className="min-w-0 break-words text-right font-medium text-foreground">{deployment.version}</span>
           </div>
-          <div className="mt-2 grid grid-cols-[88px,minmax(0,1fr)] items-start gap-4">
+          <div className="mt-1.5 grid grid-cols-[72px,minmax(0,1fr)] items-start gap-3">
             <span className="text-muted-foreground">Status</span>
             <span className="min-w-0 break-words text-right font-medium text-foreground">{formatRuntimeStatus(deployment.status)}</span>
           </div>
           {hasBuildImage && (
-            <div className="mt-2 grid grid-cols-[88px,minmax(0,1fr)] items-start gap-4">
+            <div className="mt-1.5 grid grid-cols-[72px,minmax(0,1fr)] items-start gap-3">
               <span className="text-muted-foreground">Image</span>
               <span className="min-w-0 break-all text-right font-mono text-xs text-foreground">
                 {savedImageName}
@@ -2633,7 +2664,7 @@ function DeleteDeploymentDialog({
         </div>
 
         {canDeleteBuildImage && (
-          <div className="rounded-xl border border-border bg-muted/20 p-4 text-sm">
+          <div className="rounded-xl border border-border bg-muted/20 p-3 text-sm">
             <div className="flex items-start gap-3">
               <Checkbox
                 id="delete-deployment-image"
@@ -2669,7 +2700,7 @@ function DeleteDeploymentDialog({
         </div>
         </div>
 
-        <DialogFooter className="mt-5 grid grid-cols-2 gap-3 border-t border-border bg-muted/30 px-6 py-5 sm:flex-row sm:justify-center">
+        <DialogFooter className="mt-4 grid grid-cols-2 gap-3 border-t border-border bg-muted/30 px-5 py-4 sm:flex-row sm:justify-center">
           <Button type="button" variant="ghost" onClick={onClose} className="w-full min-w-0">
             Cancel
           </Button>

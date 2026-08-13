@@ -34,6 +34,10 @@ import {
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 
+// Must exceed the ai-service (90s) and backend (120s) timeouts, otherwise the
+// browser aborts while the backend completes the generation and bills for it.
+const AI_REQUEST_TIMEOUT_MS = 130000;
+
 type AiMode = "fast" | "thinking";
 type AiProvider = "nvidia_nim" | "openai_compatible";
 type Role = "user" | "assistant" | "system";
@@ -595,13 +599,18 @@ export default function AiAgentPage() {
   const modelsQuery = useQuery({
     queryKey: ["ai-models"],
     queryFn: async () => {
-      const res = await api.get("/ai/models");
+      const res = await api.get("/ai/models", { timeout: AI_REQUEST_TIMEOUT_MS });
       return res.data as AiModelsResponse;
     },
   });
 
+  // These normalize to a bare array, whereas the dashboard and deployments pages
+  // cache the raw {projects}/{deployments} object under the same base key. Sharing
+  // the key made last-writer-wins corrupt whichever page read the other's shape.
+  // The extra segment isolates the cache entry while still matching prefix
+  // invalidation on ["projects"] / ["deployments"].
   const projectsQuery = useQuery({
-    queryKey: ["projects"],
+    queryKey: ["projects", "ai-picker"],
     queryFn: async () => {
       const res = await api.get<unknown>("/projects");
       return arrayFromResponse<Project>(res.data, ["projects", "data", "items"]);
@@ -609,7 +618,7 @@ export default function AiAgentPage() {
   });
 
   const deploymentsQuery = useQuery({
-    queryKey: ["deployments"],
+    queryKey: ["deployments", "ai-picker"],
     queryFn: async () => {
       const res = await api.get<unknown>("/deployments");
       return arrayFromResponse<Deployment>(res.data, ["deployments", "data", "items"]);
@@ -855,7 +864,7 @@ export default function AiAgentPage() {
           },
           history: messages.slice(-8).map((item) => ({ role: item.role, content: sanitizeHistoryContent(item.content) })),
         },
-        { timeout: 90000 }
+        { timeout: AI_REQUEST_TIMEOUT_MS }
       );
       return res.data as AiResponse;
     },
@@ -929,12 +938,12 @@ export default function AiAgentPage() {
                 status: deployment.status,
                 runtime_url: deployment.runtime_url,
               },
-            })
+            }, { timeout: AI_REQUEST_TIMEOUT_MS })
           : await api.post(`/deployments/${targetDeploymentId}/ai/analyze-build-failure`, {
               model: activeModelId,
               model_mode: mode,
               logs: logs.data?.deployment?.logs || "",
-            });
+            }, { timeout: AI_REQUEST_TIMEOUT_MS });
         return {
           title: "Diagnosis",
           body: formatAiOutput(res.data as AiResponse),
@@ -946,7 +955,7 @@ export default function AiAgentPage() {
         const res = await api.post(`/projects/${targetProjectId}/ai/dockerfile`, {
           model: activeModelId,
           model_mode: mode,
-        });
+        }, { timeout: AI_REQUEST_TIMEOUT_MS });
         return {
           title: "Dockerfile plan",
           body: formatAiOutput(res.data as AiResponse),
@@ -958,7 +967,7 @@ export default function AiAgentPage() {
         const res = await api.post(`/projects/${targetProjectId}/ai/analyze`, {
           model: activeModelId,
           model_mode: mode,
-        });
+        }, { timeout: AI_REQUEST_TIMEOUT_MS });
         return {
           title: "Project analysis",
           body: formatAiOutput(res.data as AiResponse),
@@ -1019,10 +1028,18 @@ export default function AiAgentPage() {
 
   const isDeployIntent = (text: string) => {
     const normalized = text.toLowerCase();
-    if (findApplicationIntent(text)) return true;
+    // The question guard MUST run before the template match. Previously
+    // findApplicationIntent returned true unconditionally first, so
+    // "How do I run a redis cache in production?" matched the redis template and
+    // was routed to autonomous provisioning — creating a project, credentials and
+    // a real build in response to a question.
     if (/\b(what|how|why|can|could|would|should|explain|tell me|help)\b/.test(normalized)) {
       return false;
     }
+    if (normalized.trim().endsWith("?")) {
+      return false;
+    }
+    if (findApplicationIntent(text)) return true;
     const hasActionVerb = /\b(deploy|redeploy|ship|release)\b/.test(normalized);
     if (!hasActionVerb) return false;
     if (/\b(this|current|selected|project|deployment|app|application)\b/.test(normalized)) {
@@ -1224,9 +1241,9 @@ export default function AiAgentPage() {
 
   return (
     <>
-      <div className="flex h-[calc(100dvh-2.5rem)] min-h-0 overflow-hidden rounded-xl border border-border bg-card text-card-foreground">
-        <section className="flex min-w-0 flex-1 flex-col bg-background/40">
-        <header className="flex shrink-0 items-center justify-between border-b border-border px-5 py-4">
+      <div className="flex h-full min-h-0 overflow-hidden bg-background text-foreground">
+        <section className="flex min-w-0 flex-1 flex-col">
+        <header className="flex shrink-0 items-center justify-between border-b border-border px-6 py-3.5">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <FilledStarIcon className="h-5 w-5 text-primary" />
@@ -1315,7 +1332,7 @@ export default function AiAgentPage() {
           </div>
         </div>
 
-        <div className="sticky bottom-0 z-20 shrink-0 bg-card/95 px-4 pb-3 pt-2 backdrop-blur">
+        <div className="sticky bottom-0 z-20 shrink-0 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur md:px-6">
           <div className="mx-auto max-w-5xl">
             {diagnoseDeploymentPickerOpen && (
               <div className="mb-2 max-h-72 overflow-y-auto rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { RefreshCw, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { readTerminalTheme, useCanvasThemeVersion } from "@/lib/canvas-theme";
 
 interface RemoteSshTerminalProps {
   connectionId: string;
@@ -31,6 +32,7 @@ function tryParseControlMessage(data: string) {
 }
 
 export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTerminalProps) {
+  const themeVersion = useCanvasThemeVersion();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const terminalRef = useRef<import("@xterm/xterm").Terminal | null>(null);
@@ -65,9 +67,9 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
         scrollback: 4000,
         scrollOnUserInput: true,
         theme: {
-          background: "#050505",
-          foreground: "#f4f4f5",
-          cursor: "#f4f4f5",
+          ...readTerminalTheme(),
+          // The ANSI sixteen stay fixed across themes: a program emitting
+          // "red" means red, and remapping it would misreport build output.
           black: "#18181b",
           brightBlack: "#71717a",
           red: "#ef4444",
@@ -171,6 +173,14 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
       fitAddonRef.current = null;
     };
   }, [connectionId, cwd, sessionKey]);
+
+  // Recolour a terminal that is already open. Without this, switching theme
+  // leaves the session on the palette it was created with until reconnect.
+  useEffect(() => {
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+    terminal.options.theme = { ...terminal.options.theme, ...readTerminalTheme() };
+  }, [themeVersion]);
 
   return (
     <div className={cn("flex h-full min-h-[420px] flex-col overflow-hidden rounded-xl border border-border bg-black", className)}>

@@ -26,6 +26,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+
+import { useChartTheme } from "@/lib/canvas-theme";
 import { useMutation, useQuery } from "@tanstack/react-query";
 
 import api from "@/lib/api";
@@ -108,12 +110,6 @@ const chartColors = [
   "#ef4444",
   "#a855f7",
 ];
-const chartAxisColor = "#a1a1aa";
-const chartGridColor = "#27272a";
-const chartTooltipBackground = "#18181b";
-const chartTooltipBorder = "#3f3f46";
-const chartTooltipText = "#fafafa";
-const chartCursorColor = "#27272a";
 
 function countMapToRows(map?: CountMap) {
   return Object.entries(map || {}).map(([name, value]) => ({
@@ -203,6 +199,17 @@ function StackCard({
 }
 
 export default function LoggingMonitoringPage() {
+  // Axes, gridlines and tooltips follow the active theme. The series colours
+  // below stay fixed: they are a legend, not chrome.
+  const {
+    axis: chartAxisColor,
+    grid: chartGridColor,
+    cursor: chartCursorColor,
+    tooltipBackground: chartTooltipBackground,
+    tooltipBorder: chartTooltipBorder,
+    tooltipText: chartTooltipText,
+  } = useChartTheme();
+
   const [mounted, setMounted] = useState(false);
   const [failureExplanationOpen, setFailureExplanationOpen] = useState(false);
   const [failureExplanation, setFailureExplanation] = useState<{
@@ -219,7 +226,10 @@ export default function LoggingMonitoringPage() {
     refetchInterval: 5000,
   });
   const deploymentsQuery = useQuery({
-    queryKey: ["logging-monitoring-deployments-fallback"],
+    // Namespaced under "deployments" so the existing
+    // invalidateQueries({queryKey:["deployments"]}) calls reach this entry too;
+    // as a standalone key it silently went stale after every mutation.
+    queryKey: ["deployments", "logging-fallback"],
     queryFn: async () => {
       const response = await api.get<{ deployments: DeploymentListItem[] }>("/deployments");
       return response.data.deployments || [];

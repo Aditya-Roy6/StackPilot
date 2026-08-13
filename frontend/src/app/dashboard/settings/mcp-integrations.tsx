@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import api from "@/lib/api";
@@ -90,28 +90,166 @@ export function McpIntegrations() {
 
   const tokens = query.data?.tokens || [];
 
-  const getIdeConfig = (token: string) => {
-    const serverPath = process.env.NEXT_PUBLIC_STACKPILOT_MCP_SERVER_PATH || "/absolute/path/to/StackPilot/mcp-server/src/index.js";
-    const localProjectsRoot =
-      process.env.NEXT_PUBLIC_STACKPILOT_LOCAL_PROJECTS_HOST_ROOT || "/absolute/path/to/StackPilot/local-projects";
-    
-    const config = {
-      mcpServers: {
-        "stackpilot-platform": {
-          command: "node",
-          args: [serverPath],
-          env: {
-            STACKPILOT_MCP_TOKEN: token,
-            STACKPILOT_API_URL: "http://localhost:8090/api/v1",
-            STACKPILOT_FRONTEND_URL: "http://localhost:3000",
-            STACKPILOT_LOCAL_PROJECTS_HOST_ROOT: localProjectsRoot,
-            STACKPILOT_LOCAL_PROJECTS_CONTAINER_ROOT: "/app/local-projects",
-          },
+  const serverPath =
+    process.env.NEXT_PUBLIC_STACKPILOT_MCP_SERVER_PATH || "/absolute/path/to/StackPilot/mcp-server/src/index.js";
+  const localProjectsRoot =
+    process.env.NEXT_PUBLIC_STACKPILOT_LOCAL_PROJECTS_HOST_ROOT || "/absolute/path/to/StackPilot/local-projects";
+
+  const serverEnv = (token: string) => ({
+    STACKPILOT_MCP_TOKEN: token,
+    STACKPILOT_API_URL: "http://localhost:8090/api/v1",
+    STACKPILOT_FRONTEND_URL: "http://localhost:3000",
+    STACKPILOT_LOCAL_PROJECTS_HOST_ROOT: localProjectsRoot,
+    STACKPILOT_LOCAL_PROJECTS_CONTAINER_ROOT: "/app/local-projects",
+  });
+
+  // Every client below reads `mcpServers` JSON except Codex, which uses TOML.
+  const getIdeConfig = (token: string) =>
+    JSON.stringify(
+      {
+        mcpServers: {
+          "stackpilot-platform": { command: "node", args: [serverPath], env: serverEnv(token) },
         },
       },
-    };
-    return JSON.stringify(config, null, 2);
+      null,
+      2
+    );
+
+  // Codex reads ~/.codex/config.toml, where servers are TOML tables, not JSON.
+  const getCodexConfig = (token: string) => {
+    const env = serverEnv(token);
+    const envLines = Object.entries(env)
+      .map(([key, value]) => `${key} = ${JSON.stringify(value)}`)
+      .join("\n");
+    return [
+      `[mcp_servers.stackpilot-platform]`,
+      `command = "node"`,
+      `args = [${JSON.stringify(serverPath)}]`,
+      ``,
+      `[mcp_servers.stackpilot-platform.env]`,
+      envLines,
+    ].join("\n");
   };
+
+  // Claude Code registers servers through its CLI rather than a hand-edited file.
+  const getClaudeCodeCommand = (token: string) => {
+    const env = serverEnv(token);
+    const envFlags = Object.entries(env)
+      .map(([key, value]) => `  --env ${key}=${value}`)
+      .join(" \\\n");
+    return `claude mcp add stackpilot-platform \\\n${envFlags} \\\n  -- node ${serverPath}`;
+  };
+
+  const ideGuides: {
+    id: typeof ideSelect;
+    label: string;
+    file: string;
+    lang: string;
+    snippet: (token: string) => string;
+    steps: ReactNode[];
+  }[] = [
+    {
+      id: "vscode",
+      label: "VS Code / Roo",
+      file: "cline_mcp_settings.json",
+      lang: "json",
+      snippet: getIdeConfig,
+      steps: [
+        <>
+          Install the{" "}
+          <a
+            href="https://marketplace.visualstudio.com/items?itemName=RooVeterinaryInc.roo-cline"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-primary hover:underline"
+          >
+            Roo Code <ExternalLink className="h-3 w-3" />
+          </a>{" "}
+          extension.
+        </>,
+        <>Open the MCP Servers panel in the Roo sidebar and choose Edit Configuration.</>,
+        <>
+          Merge this into <code className="rounded bg-muted px-1 py-0.5 text-xs">cline_mcp_settings.json</code>:
+        </>,
+      ],
+    },
+    {
+      id: "cursor",
+      label: "Cursor",
+      file: "~/.cursor/mcp.json",
+      lang: "json",
+      snippet: getIdeConfig,
+      steps: [
+        <>
+          Open Cursor Settings and go to <strong>MCP</strong> (older builds: Features &gt; MCP).
+        </>,
+        <>
+          Add the server to <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.cursor/mcp.json</code>, or{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-xs">.cursor/mcp.json</code> for a single project:
+        </>,
+      ],
+    },
+    {
+      id: "claude",
+      label: "Claude Desktop",
+      file: "claude_desktop_config.json",
+      lang: "json",
+      snippet: getIdeConfig,
+      steps: [
+        <>
+          Open Claude Desktop, then Settings &rarr; <strong>Developer</strong> &rarr; <strong>Edit Config</strong>.
+        </>,
+        <>
+          Merge this into <code className="rounded bg-muted px-1 py-0.5 text-xs">claude_desktop_config.json</code> and
+          restart Claude Desktop:
+        </>,
+      ],
+    },
+    {
+      id: "claude-code",
+      label: "Claude Code",
+      file: "terminal",
+      lang: "bash",
+      snippet: getClaudeCodeCommand,
+      steps: [
+        <>Register the server from your terminal — Claude Code writes the config for you:</>,
+        <>
+          Add <code className="rounded bg-muted px-1 py-0.5 text-xs">-s project</code> to share it with your team via{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-xs">.mcp.json</code>, or{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-xs">-s user</code> for every project on this machine.
+        </>,
+      ],
+    },
+    {
+      id: "codex",
+      label: "Codex",
+      file: "~/.codex/config.toml",
+      lang: "toml",
+      snippet: getCodexConfig,
+      steps: [
+        <>
+          Codex reads TOML, not JSON. Open{" "}
+          <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.codex/config.toml</code>.
+        </>,
+        <>Append these tables:</>,
+      ],
+    },
+    {
+      id: "antigravity",
+      label: "Antigravity / Gemini",
+      file: "~/.gemini/settings.json",
+      lang: "json",
+      snippet: getIdeConfig,
+      steps: [
+        <>
+          For Gemini CLI, add this to <code className="rounded bg-muted px-1 py-0.5 text-xs">~/.gemini/settings.json</code>.
+          Any other stdio MCP client takes the same block:
+        </>,
+      ],
+    },
+  ];
+
+  const activeGuide = ideGuides.find((guide) => guide.id === ideSelect) ?? ideGuides[0];
 
   return (
     <Card>
@@ -218,7 +356,7 @@ export function McpIntegrations() {
         </Dialog>
 
         <Dialog open={!!newToken} onOpenChange={(open) => !open && setNewToken(null)}>
-          <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogContent className="max-h-[85vh] overflow-y-auto overflow-x-hidden sm:max-w-2xl">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2 text-emerald-500">
                 <KeyRound className="h-5 w-5" />
@@ -229,9 +367,11 @@ export function McpIntegrations() {
               </DialogDescription>
             </DialogHeader>
             
-            <div className="space-y-6 py-2">
+            <div className="min-w-0 space-y-6 py-2">
               <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 p-3">
-                <code className="flex-1 overflow-x-auto text-sm text-foreground">
+                {/* min-w-0 lets the code block shrink so long tokens wrap instead of
+                    widening the dialog and forcing a horizontal scrollbar. */}
+                <code className="min-w-0 flex-1 break-all font-mono text-sm text-foreground">
                   {newToken?.raw}
                 </code>
                 <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken?.raw || "", "Token")} className="shrink-0">
@@ -242,119 +382,45 @@ export function McpIntegrations() {
               <div className="space-y-3">
                 <h4 className="font-medium text-foreground">IDE Setup Instructions</h4>
                 <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant={ideSelect === "vscode" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setIdeSelect("vscode")}
-                  >
-                    VS Code / Roo
-                  </Button>
-                  <Button
-                    variant={ideSelect === "cursor" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setIdeSelect("cursor")}
-                  >
-                    Cursor
-                  </Button>
-                  <Button
-                    variant={ideSelect === "claude" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setIdeSelect("claude")}
-                  >
-                    Claude Desktop
-                  </Button>
-                  <Button
-                    variant={ideSelect === "claude-code" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setIdeSelect("claude-code")}
-                  >
-                    Claude Code
-                  </Button>
-                  <Button
-                    variant={ideSelect === "codex" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setIdeSelect("codex")}
-                  >
-                    Codex
-                  </Button>
-                  <Button
-                    variant={ideSelect === "antigravity" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setIdeSelect("antigravity")}
-                  >
-                    Antigravity / Gemini
-                  </Button>
+                  {ideGuides.map((guide) => (
+                    <Button
+                      key={guide.id}
+                      variant={ideSelect === guide.id ? "default" : "outline"}
+                      size="sm"
+                      onClick={() => setIdeSelect(guide.id)}
+                    >
+                      {guide.label}
+                    </Button>
+                  ))}
                 </div>
 
-                <div className="rounded-lg border border-border bg-muted/30 p-4">
-                  {ideSelect === "cursor" ? (
-                    <div className="space-y-3 text-sm text-muted-foreground">
-                      <p>1. Open Cursor Settings <code className="text-xs">Ctrl/Cmd + Shift + J</code></p>
-                      <p>2. Go to <strong>Features &gt; MCP</strong></p>
-                      <p>3. Add this server config. The local deploy tool stages any IDE workspace into StackPilot local mode automatically:</p>
-                      <div className="relative mt-2">
-                        <pre className="p-3 bg-background rounded-lg border overflow-x-auto text-xs font-mono">
-                          {newToken ? getIdeConfig(newToken.raw) : ""}
-                        </pre>
-                        <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken ? getIdeConfig(newToken.raw) : "", "Config")} className="absolute top-2 right-2 h-7 w-7 opacity-70 hover:opacity-100 transition-opacity">
-                          <Copy className="h-3 w-3" />
-                        </Button>
-                      </div>
+                <div className="min-w-0 space-y-3 rounded-lg border border-border bg-muted/30 p-4">
+                  <ol className="list-decimal space-y-2 pl-5 text-sm text-muted-foreground marker:text-muted-foreground">
+                    {activeGuide.steps.map((step, index) => (
+                      <li key={index}>{step}</li>
+                    ))}
+                  </ol>
+                  <div className="relative min-w-0">
+                    <div className="flex items-center justify-between gap-2 rounded-t-lg border border-b-0 border-border bg-muted/60 px-3 py-1.5">
+                      <span className="truncate font-mono text-xs text-muted-foreground">{activeGuide.file}</span>
+                      <span className="shrink-0 rounded bg-background px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        {activeGuide.lang}
+                      </span>
                     </div>
-                  ) : ideSelect === "claude" ? (
-                    <div className="space-y-3 text-sm text-muted-foreground">
-                      <p>1. Open Claude Desktop</p>
-                      <p>2. Open Settings and go to the <strong>Developer</strong> section</p>
-                      <p>3. Click <strong>Edit Config</strong>. Add this to the <code className="text-xs">mcpServers</code> section:</p>
-                      <div className="relative mt-2">
-                        <pre className="p-3 bg-background rounded-lg border overflow-x-auto text-xs font-mono">
-                          {newToken ? getIdeConfig(newToken.raw) : ""}
-                        </pre>
-                        <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken ? getIdeConfig(newToken.raw) : "", "Config")} className="absolute top-2 right-2 h-7 w-7 opacity-70 hover:opacity-100 transition-opacity">
-                          <Copy className="h-3 w-3" />
-                        </Button>
-                      </div>
-                    </div>
-                  ) : ideSelect === "vscode" ? (
-                    <div className="space-y-3 text-sm text-muted-foreground">
-                      <p>1. Ensure you have the <a href="https://marketplace.visualstudio.com/items?itemName=RooVeterinaryInc.roo-cline" target="_blank" className="text-primary hover:underline inline-flex items-center gap-1">Roo Code <ExternalLink className="h-3 w-3" /></a> extension installed</p>
-                      <p>2. Click the MCP Servers icon (🧩) in the Roo sidebar</p>
-                      <p>3. Add the following to your <code className="text-xs">cline_mcp_settings.json</code>:</p>
-                      <div className="relative mt-2">
-                        <pre className="p-3 bg-background rounded-lg border overflow-x-auto text-xs font-mono">
-                          {newToken ? getIdeConfig(newToken.raw) : ""}
-                        </pre>
-                        <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken ? getIdeConfig(newToken.raw) : "", "Config")} className="absolute top-2 right-2 h-7 w-7 opacity-70 hover:opacity-100 transition-opacity">
-                          <Copy className="h-3 w-3" />
-                        </Button>
-                      </div>
-                    </div>
-                  ) : ideSelect === "claude-code" || ideSelect === "codex" ? (
-                    <div className="space-y-3 text-sm text-muted-foreground">
-                      <p>1. Add the StackPilot MCP server to your agent MCP configuration.</p>
-                      <p>2. Use the tool <strong>STACKPILOT_deploy_local_project</strong> when the prompt says deploy the current local project.</p>
-                      <div className="relative mt-2">
-                        <pre className="p-3 bg-background rounded-lg border overflow-x-auto text-xs font-mono">
-                          {newToken ? getIdeConfig(newToken.raw) : ""}
-                        </pre>
-                        <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken ? getIdeConfig(newToken.raw) : "", "Config")} className="absolute top-2 right-2 h-7 w-7 opacity-70 hover:opacity-100 transition-opacity">
-                          <Copy className="h-3 w-3" />
-                        </Button>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-3 text-sm text-muted-foreground">
-                      <p>1. For Antigravity, Gemini CLI, or any standard stdio MCP client, add this server config:</p>
-                      <div className="relative mt-2">
-                        <pre className="p-3 bg-background rounded-lg border overflow-x-auto text-xs font-mono">
-                          {newToken ? getIdeConfig(newToken.raw) : ""}
-                        </pre>
-                        <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken ? getIdeConfig(newToken.raw) : "", "Config")} className="absolute top-2 right-2 h-7 w-7 opacity-70 hover:opacity-100 transition-opacity">
-                          <Copy className="h-3 w-3" />
-                        </Button>
-                      </div>
-                    </div>
-                  )}
+                    {/* Only this pre scrolls sideways, so a long path never widens the dialog. */}
+                    <pre className="max-h-72 overflow-auto rounded-b-lg border border-border bg-background p-3 text-xs font-mono leading-relaxed">
+                      {newToken ? activeGuide.snippet(newToken.raw) : ""}
+                    </pre>
+                    <Button
+                      variant="secondary"
+                      size="icon"
+                      onClick={() => handleCopy(newToken ? activeGuide.snippet(newToken.raw) : "", "Config")}
+                      className="absolute right-2 top-11 h-7 w-7 opacity-70 transition-opacity hover:opacity-100"
+                      aria-label="Copy configuration"
+                    >
+                      <Copy className="h-3 w-3" />
+                    </Button>
+                  </div>
                 </div>
               </div>
             </div>

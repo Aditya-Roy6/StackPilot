@@ -398,10 +398,16 @@ export function InfrastructureMonitor() {
   const connectionsQuery = useQuery({
     queryKey: ["ssh-connections"],
     queryFn: async () => {
-      const response = await api.get<{ connections: SshConnection[] }>("/ssh/connections");
-      return response.data.connections || [];
+      // Must match the shape every other consumer of the ["ssh-connections"] key
+      // returns. React Query caches per key, so returning a bare array here made
+      // whichever query resolved last win, and the mismatched shape crashed render.
+      const response = await api.get<{ connections?: SshConnection[]; count?: number }>("/ssh/connections");
+      return response.data;
     },
   });
+  const sshConnections = Array.isArray(connectionsQuery.data?.connections)
+    ? connectionsQuery.data.connections
+    : [];
   const inventoryQuery = useQuery({
     queryKey: ["infrastructure-inventory", targetConnectionId],
     queryFn: async () => {
@@ -991,7 +997,7 @@ export function InfrastructureMonitor() {
               <SelectItem value="local">
                 Local StackPilot host
               </SelectItem>
-              {(connectionsQuery.data || []).map((connection) => (
+              {sshConnections.map((connection) => (
                 <SelectItem key={connection.id} value={connection.id}>
                   {connection.name} - {connection.username}@{connection.host}:{connection.port}
                 </SelectItem>

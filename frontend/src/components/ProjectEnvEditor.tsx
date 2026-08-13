@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, useRef } from "react";
+import { ChangeEvent, useEffect, useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -62,6 +62,18 @@ export function ProjectEnvEditor({
   onChange,
 }: ProjectEnvEditorProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const firstKeyInputRef = useRef<HTMLInputElement | null>(null);
+  const focusNewRowRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusNewRowRef.current) {
+      return;
+    }
+
+    focusNewRowRef.current = false;
+    firstKeyInputRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    firstKeyInputRef.current?.focus();
+  }, [envVars]);
 
   const setRow = (index: number, next: ProjectEnvVar) => {
     const copy = [...envVars];
@@ -69,7 +81,10 @@ export function ProjectEnvEditor({
     onChange(copy);
   };
 
-  const addRow = () => onChange([{ key: "", value: "" }, ...envVars]);
+  const addRow = () => {
+    focusNewRowRef.current = true;
+    onChange([{ key: "", value: "" }, ...envVars]);
+  };
 
   const removeRow = (index: number) => onChange(envVars.filter((_, rowIndex) => rowIndex !== index));
 
@@ -139,6 +154,7 @@ export function ProjectEnvEditor({
               className="grid gap-2 md:grid-cols-[minmax(0,0.95fr)_minmax(0,1.25fr)_auto] md:items-center"
             >
               <Input
+                ref={index === 0 ? firstKeyInputRef : undefined}
                 value={envVar.key}
                 onChange={(event) => setRow(index, { ...envVar, key: event.target.value })}
                 placeholder="EMAILJS_SERVICE_ID"

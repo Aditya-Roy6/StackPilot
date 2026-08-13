@@ -61,9 +61,14 @@ function SelectContent({
   children,
   side = "bottom",
   sideOffset = 4,
-  align = "center",
+  // Base UI defaults to macOS-style behaviour: align="center" plus
+  // alignItemWithTrigger renders the popup *over* the trigger with the selected
+  // item on top of it, which reads as a floating panel rather than a dropdown.
+  // These defaults give the familiar shadcn/Radix behaviour — a panel anchored
+  // below the trigger's start edge. Pass the props explicitly to opt back in.
+  align = "start",
   alignOffset = 0,
-  alignItemWithTrigger = true,
+  alignItemWithTrigger = false,
   ...props
 }: SelectPrimitive.Popup.Props &
   Pick<

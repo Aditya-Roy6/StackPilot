@@ -1,23 +1,24 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { 
-  LayoutDashboard, 
-  Server, 
-  Settings, 
-  LogOut, 
-  ChevronLeft, 
-  ChevronRight, 
-  Sun, 
-  Moon, 
+import {
+  LayoutDashboard,
+  Server,
+  Settings,
+  LogOut,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Sun,
+  Moon,
   Laptop,
   Activity,
   Star,
   Network,
   Boxes,
   Gauge,
+  KeyRound,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,8 +41,12 @@ const navigation = [
   { name: "Infrastructure", href: "/dashboard/logging-monitoring/infrastructure", icon: Network, nested: true },
   { name: "Cluster Builder", href: "/dashboard/logging-monitoring/clusters", icon: Boxes, nested: true },
   { name: "AI Agent", href: "/dashboard/ai", icon: Star, filled: true },
+  { name: "Secrets", href: "/dashboard/secrets", icon: KeyRound },
   { name: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
+
+// Routes that own their entire viewport (no shell padding, no page scroll).
+const FULL_BLEED_ROUTES = ["/dashboard/ai"];
 
 const themeOptions = [
   { value: "light", label: "Light", icon: Sun },
@@ -49,17 +54,57 @@ const themeOptions = [
   { value: "system", label: "System", icon: Laptop },
 ] as const;
 
+const SIDEBAR_STORAGE_KEY = "sidebar-collapsed";
+
+// localStorage is external state, so it is read through useSyncExternalStore
+// rather than mirrored into an effect. This keeps server and client markup in
+// agreement during hydration and avoids cascading renders.
+const sidebarListeners = new Set<() => void>();
+
+const sidebarStore = {
+  subscribe(listener: () => void) {
+    sidebarListeners.add(listener);
+    return () => {
+      sidebarListeners.delete(listener);
+    };
+  },
+  getSnapshot() {
+    return window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === "true";
+  },
+  getServerSnapshot() {
+    return false;
+  },
+  set(collapsed: boolean) {
+    window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(collapsed));
+    for (const listener of sidebarListeners) listener();
+  },
+};
+
 export default function DashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const [isCollapsed, setIsCollapsed] = useState(() => {
-    if (typeof window === "undefined") return false;
-    return window.localStorage.getItem("sidebar-collapsed") === "true";
-  });
+  const isCollapsed = useSyncExternalStore(
+    sidebarStore.subscribe,
+    sidebarStore.getSnapshot,
+    sidebarStore.getServerSnapshot
+  );
+  const asideRef = useRef<HTMLElement | null>(null);
   const [themeDialogOpen, setThemeDialogOpen] = useState(false);
   const { theme, setTheme } = useTheme();
   const activeThemeValue = theme === "light" || theme === "dark" || theme === "system" ? theme : "system";
   const activeTheme = themeOptions.find((option) => option.value === activeThemeValue) ?? themeOptions[2];
   const ActiveThemeIcon = activeTheme.icon;
+  const isFullBleed = FULL_BLEED_ROUTES.includes(pathname);
+
+  // Animate width only after the first paint, so restoring a collapsed sidebar
+  // on load appears instant instead of sliding in from the expanded width.
+  useEffect(() => {
+    const element = asideRef.current;
+    if (!element) return;
+    const frame = requestAnimationFrame(() => {
+      element.classList.add("transition-[width]", "duration-200", "ease-out");
+    });
+    return () => cancelAnimationFrame(frame);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,9 +128,7 @@ export default function DashboardShell({ children }: { children: React.ReactNode
   }, []);
 
   const toggleSidebar = () => {
-    const newState = !isCollapsed;
-    setIsCollapsed(newState);
-    localStorage.setItem("sidebar-collapsed", String(newState));
+    sidebarStore.set(!isCollapsed);
   };
 
   const handleLogout = async () => {
@@ -96,131 +139,163 @@ export default function DashboardShell({ children }: { children: React.ReactNode
     }
   };
 
-  const sidebarLabelClass = cn(
-    "min-w-0 overflow-hidden truncate whitespace-nowrap text-left text-sm font-semibold transition-[max-width,opacity,transform] duration-150",
-    isCollapsed
-      ? "pointer-events-none max-w-0 -translate-x-1 opacity-0"
-      : "max-w-36 translate-x-0 opacity-100 delay-75"
+  // The label lives in a collapsing grid column so it slides away instead of
+  // popping out of the DOM. Keeping it mounted is what makes the toggle smooth.
+  const labelClass = cn(
+    "min-w-0 overflow-hidden truncate whitespace-nowrap text-left text-[13px] font-medium transition-opacity duration-150",
+    isCollapsed ? "opacity-0" : "opacity-100"
   );
+
+  // Collapsed drops the gap and centers the tracks; otherwise the 8px gap sits
+  // entirely to the right of the icon and shifts it off-center in the rail.
+  const rowClass = (isCollapsed: boolean) =>
+    cn(
+      "grid h-9 items-center overflow-hidden rounded-lg transition-[grid-template-columns] duration-200 ease-out",
+      isCollapsed ? "grid-cols-[36px_0fr] justify-center gap-0" : "grid-cols-[36px_1fr] gap-2"
+    );
 
   const renderSidebarLink = (item: (typeof navigation)[number], isActive: boolean) => (
     <Link
       key={item.name}
       href={item.href}
+      aria-current={isActive ? "page" : undefined}
       className={cn(
-        "group grid items-center rounded-xl text-sm font-semibold transition-colors",
-        "overflow-hidden",
-        isCollapsed
-          ? "h-10 w-10 grid-cols-[40px_0fr] gap-0 justify-items-center px-0"
-          : cn("h-10 w-full grid-cols-[40px_1fr] gap-3 px-0", item.nested && "ml-3 w-[calc(100%-0.75rem)]"),
+        rowClass(isCollapsed),
+        "relative w-full",
+        !isCollapsed && item.nested && "pl-3",
         isActive
-          ? "bg-accent text-foreground shadow-sm"
-          : "text-muted-foreground hover:bg-accent/70 hover:text-foreground"
+          ? "bg-accent font-semibold text-foreground"
+          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
       )}
     >
-      <div className="flex h-10 w-10 items-center justify-center rounded-lg">
+      <span className="flex h-9 w-9 items-center justify-center">
         <item.icon
-          className={cn("h-5 w-5", isActive ? "text-primary" : "text-current")}
+          className={cn("h-[18px] w-[18px]", isActive ? "text-primary" : "text-current")}
           fill={item.filled ? "currentColor" : "none"}
-          strokeWidth={item.filled ? 2.4 : 2}
+          strokeWidth={item.filled ? 2.2 : 1.9}
         />
-      </div>
-      {!isCollapsed && <span className={sidebarLabelClass}>{item.name}</span>}
+      </span>
+      <span className={labelClass}>{item.name}</span>
     </Link>
   );
 
   return (
     <div className="flex h-screen overflow-hidden bg-background text-foreground">
       <aside
+        ref={asideRef}
         className={cn(
-          "relative z-20 flex h-full shrink-0 flex-col border-r border-border bg-card transition-[width] duration-200 ease-out",
-          isCollapsed ? "w-[72px]" : "w-[232px]"
+          "z-20 flex h-full shrink-0 flex-col border-r border-border bg-card",
+          isCollapsed ? "w-[60px]" : "w-[208px]"
         )}
       >
         <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={toggleSidebar}
-                  aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-                  className="absolute -right-3 top-8 z-30 h-7 w-7 rounded-full border border-border bg-card shadow-md hover:bg-accent"
-                >
-                  {isCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
-                </Button>
-              }
-            />
-            <TooltipContent side="right">{isCollapsed ? "Expand sidebar" : "Collapse sidebar"}</TooltipContent>
-          </Tooltip>
-
-          <div className="flex h-full flex-col px-4 py-4">
-            <div className="h-4 shrink-0" />
-            <nav className={cn("space-y-2", isCollapsed ? "flex w-10 flex-col items-center" : "w-full")}>
-              {navigation.map((item) => {
-                const isActive = pathname === item.href;
-                if (!isCollapsed) {
-                  return renderSidebarLink(item, isActive);
+          {/* Brand + toggle share a row, so the control never floats over content. */}
+          <div
+            className={cn(
+              "flex h-14 shrink-0 items-center border-b border-border",
+              isCollapsed ? "justify-center px-2" : "justify-between pl-3 pr-2"
+            )}
+          >
+            {!isCollapsed && (
+              <span className="flex min-w-0 items-center gap-2">
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
+                  <Star className="h-4 w-4" fill="currentColor" strokeWidth={0} />
+                </span>
+                <span className="truncate text-sm font-semibold tracking-tight">StackPilot</span>
+              </span>
+            )}
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={toggleSidebar}
+                    aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+                    aria-expanded={!isCollapsed}
+                    className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+                  >
+                    {isCollapsed ? (
+                      <PanelLeftOpen className="h-[18px] w-[18px]" />
+                    ) : (
+                      <PanelLeftClose className="h-[18px] w-[18px]" />
+                    )}
+                  </Button>
                 }
-                return (
-                  <Tooltip key={item.name}>
-                    <TooltipTrigger render={renderSidebarLink(item, isActive)} />
-                    <TooltipContent side="right">{item.name}</TooltipContent>
-                  </Tooltip>
-                );
-              })}
-            </nav>
+              />
+              <TooltipContent side="right">{isCollapsed ? "Expand sidebar" : "Collapse sidebar"}</TooltipContent>
+            </Tooltip>
+          </div>
 
-            <div className={cn("mt-auto flex shrink-0 flex-col gap-4 border-t border-border pt-5", isCollapsed ? "w-10 items-center" : "w-full items-stretch")}>
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      onClick={() => setThemeDialogOpen(true)}
-                      className={cn(
-                        "grid items-center rounded-xl p-0 text-muted-foreground transition-colors hover:bg-accent/70 hover:text-foreground",
-                        isCollapsed
-                          ? "h-10 w-10 grid-cols-[40px_0fr] gap-0 justify-items-center"
-                          : "h-10 w-full grid-cols-[40px_1fr] gap-3"
-                      )}
-                      aria-label="Theme"
-                    >
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg">
-                        <ActiveThemeIcon className="h-5 w-5" />
-                      </div>
-                      {!isCollapsed && <span className={sidebarLabelClass}>{activeTheme.label}</span>}
-                    </Button>
-                  }
-                />
-                <TooltipContent side={isCollapsed ? "right" : "top"}>{activeTheme.label} theme</TooltipContent>
-              </Tooltip>
+          <nav
+            className={cn(
+              "flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto overflow-x-hidden py-3 scrollbar-thin",
+              isCollapsed ? "items-center px-2" : "px-2"
+            )}
+          >
+            {navigation.map((item) => {
+              const isActive = pathname === item.href;
+              if (!isCollapsed) {
+                return renderSidebarLink(item, isActive);
+              }
+              return (
+                <Tooltip key={item.name}>
+                  <TooltipTrigger render={renderSidebarLink(item, isActive)} />
+                  <TooltipContent side="right">{item.name}</TooltipContent>
+                </Tooltip>
+              );
+            })}
+          </nav>
 
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Button
-                      variant="ghost"
-                      onClick={handleLogout}
-                      className={cn(
-                        "grid items-center rounded-xl p-0 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive",
-                        isCollapsed
-                          ? "h-10 w-10 grid-cols-[40px_0fr] gap-0 justify-items-center"
-                          : "h-10 w-full grid-cols-[40px_1fr] gap-3"
-                      )}
-                      aria-label="Logout"
-                    >
-                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg">
-                        <LogOut className="h-5 w-5" />
-                      </div>
-                      {!isCollapsed && <span className={sidebarLabelClass}>Logout</span>}
-                    </Button>
-                  }
-                />
-                <TooltipContent side={isCollapsed ? "right" : "top"}>Logout</TooltipContent>
-              </Tooltip>
-            </div>
+          <div
+            className={cn(
+              "flex shrink-0 flex-col gap-0.5 border-t border-border py-3",
+              isCollapsed ? "items-center px-2" : "px-2"
+            )}
+          >
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    onClick={() => setThemeDialogOpen(true)}
+                    aria-label="Theme"
+                    className={cn(
+                      rowClass(isCollapsed),
+                      "w-full justify-start p-0 text-muted-foreground hover:bg-accent/60 hover:text-foreground"
+                    )}
+                  >
+                    <span className="flex h-9 w-9 items-center justify-center">
+                      <ActiveThemeIcon className="h-[18px] w-[18px]" />
+                    </span>
+                    <span className={labelClass}>{activeTheme.label}</span>
+                  </Button>
+                }
+              />
+              <TooltipContent side="right">{activeTheme.label} theme</TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    variant="ghost"
+                    onClick={handleLogout}
+                    aria-label="Logout"
+                    className={cn(
+                      rowClass(isCollapsed),
+                      "w-full justify-start p-0 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                    )}
+                  >
+                    <span className="flex h-9 w-9 items-center justify-center">
+                      <LogOut className="h-[18px] w-[18px]" />
+                    </span>
+                    <span className={labelClass}>Logout</span>
+                  </Button>
+                }
+              />
+              <TooltipContent side="right">Logout</TooltipContent>
+            </Tooltip>
           </div>
 
           <Dialog open={themeDialogOpen} onOpenChange={setThemeDialogOpen}>
@@ -257,7 +332,12 @@ export default function DashboardShell({ children }: { children: React.ReactNode
       </aside>
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <main className="flex-1 overflow-y-auto bg-background/50 p-5 scrollbar-thin md:p-8">
+        <main
+          className={cn(
+            "flex-1 bg-background/50 scrollbar-thin",
+            isFullBleed ? "overflow-hidden p-0" : "overflow-y-auto p-5 md:p-8"
+          )}
+        >
           {children}
         </main>
       </div>

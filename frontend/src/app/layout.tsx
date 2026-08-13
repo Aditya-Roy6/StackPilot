@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 import Providers from "@/lib/providers";
+import { UI_THEME_INIT_SCRIPT } from "@/lib/ui-theme";
 import { Toaster } from "@/components/ui/sonner";
 
 const plusJakartaSans = Plus_Jakarta_Sans({
@@ -30,7 +31,13 @@ export default function RootLayout({
     <html
       lang="en"
       className={`${plusJakartaSans.variable} ${jetBrainsMono.variable} h-full antialiased`}
+      suppressHydrationWarning
     >
+      <head>
+        {/* Sets data-ui-theme before first paint so a non-default theme never
+            flashes the default palette. Mirrors how next-themes avoids FOUC. */}
+        <script dangerouslySetInnerHTML={{ __html: UI_THEME_INIT_SCRIPT }} />
+      </head>
       <body className="min-h-full flex flex-col">
         <Providers>
           {children}

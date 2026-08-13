@@ -4,12 +4,14 @@ import { AlertTriangle, ArrowLeft, RotateCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
+// This Next version passes `unstable_retry`, not `reset` — destructuring `reset`
+// yields undefined and the retry button throws on click.
 export default function AiAgentError({
   error,
-  reset,
+  unstable_retry,
 }: {
   error: Error & { digest?: string };
-  reset: () => void;
+  unstable_retry: () => void;
 }) {
   return (
     <div className="flex h-[calc(100dvh-8rem)] min-h-[32rem] items-center justify-center rounded-xl border border-border bg-card p-6 text-card-foreground">
@@ -26,7 +28,7 @@ export default function AiAgentError({
             <ArrowLeft className="h-4 w-4" />
             Back
           </Button>
-          <Button type="button" onClick={reset}>
+          <Button type="button" onClick={() => unstable_retry()}>
             <RotateCcw className="h-4 w-4" />
             Reload
           </Button>
