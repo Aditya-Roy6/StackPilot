@@ -5,6 +5,8 @@
 #include "DeploymentController.h"
 #include "../utils/StringUtils.h"
 #include "../utils/RuntimeRateLimiter.h"
+#include "../services/DeploymentJournal.h"
+#include "../services/LocalDockerRuntime.h"
 #include "LogWebSocketController.h"
 #include "../db/Database.h"
 #include "../utils/AgentPolicy.h"
@@ -42,7 +44,6 @@ namespace {
 using strings::trim;
 
 
-std::mutex deploymentLogMutex;
 
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -216,48 +217,6 @@ std::string jsonString(const Json::Value& value, const std::string& key, const s
     return value.isObject() && value.isMember(key) && value[key].isString() ? value[key].asString() : fallback;
 }
 
-void hydrateDeploymentRuntimeFields(Json::Value& dep, const pqxx::row& row) {
-    const Json::Value snapshot = parseJsonObject(
-        row["runtime_snapshot"].is_null() ? "" : row["runtime_snapshot"].as<std::string>()
-    );
-    const std::string imageName = jsonString(
-        snapshot,
-        "image_name",
-        row["image_name"].is_null() ? "" : row["image_name"].as<std::string>()
-    );
-    const std::string runtimeProvider = jsonString(
-        snapshot,
-        "provider",
-        row["runtime_provider"].is_null() ? "" : row["runtime_provider"].as<std::string>()
-    );
-    const std::string runtimeExposure = jsonString(
-        snapshot,
-        "exposure_mode",
-        row["runtime_exposure"].is_null() ? "" : row["runtime_exposure"].as<std::string>()
-    );
-    const std::string remoteContainerName =
-        row["remote_container_name"].is_null() ? "" : row["remote_container_name"].as<std::string>();
-    const std::string k8sDeploymentName =
-        row["k8s_deployment_name"].is_null() ? "" : row["k8s_deployment_name"].as<std::string>();
-
-    dep["image_name"] = imageName;
-    dep["k8s_namespace"] = row["k8s_namespace"].is_null() ? "" : row["k8s_namespace"].as<std::string>();
-    dep["k8s_deployment_name"] = k8sDeploymentName;
-    dep["k8s_service_name"] = row["k8s_service_name"].is_null() ? "" : row["k8s_service_name"].as<std::string>();
-    dep["k8s_ingress_name"] = row["k8s_ingress_name"].is_null() ? "" : row["k8s_ingress_name"].as<std::string>();
-    dep["desired_replicas"] = row["desired_replicas"].is_null() ? 1 : row["desired_replicas"].as<int>();
-    dep["runtime_url"] = jsonString(
-        snapshot,
-        "runtime_url",
-        row["runtime_url"].is_null() ? "" : row["runtime_url"].as<std::string>()
-    );
-    dep["runtime_exposure"] = runtimeExposure;
-    dep["runtime_provider"] = runtimeProvider;
-    dep["remote_container_name"] = remoteContainerName;
-    dep["runtime_paused"] = row["runtime_paused"].is_null() ? false : row["runtime_paused"].as<bool>();
-    dep["can_delete_image"] = !imageName.empty();
-}
-
 int jsonInt(const Json::Value& value, const std::string& key, int fallback) {
     if (!value.isObject() || !value.isMember(key)) {
         return fallback;
@@ -313,115 +272,6 @@ std::string remoteLogTailFromInspectOutput(const std::string& output) {
     return trim(output.substr(pos + marker.size()));
 }
 
-void appendDeploymentLog(const std::string& deploymentId, const std::string& line) {
-    std::lock_guard<std::mutex> lock(deploymentLogMutex);
-
-    try {
-        auto& db = Database::getInstance();
-        auto conn = db.getConnection();
-        pqxx::work txn(*conn);
-        txn.exec_params(
-            "UPDATE deployments "
-            "SET logs = COALESCE(logs, '') || $1 || E'\\n', updated_at = NOW() "
-            "WHERE id = $2",
-            line,
-            deploymentId
-        );
-        txn.commit();
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to append build log for {}: {}", deploymentId, e.what());
-    }
-}
-
-void appendDeploymentLogBlock(const std::string& deploymentId, const std::string& block) {
-    std::istringstream stream(block);
-    std::string line;
-    while (std::getline(stream, line)) {
-        if (!line.empty()) {
-            appendDeploymentLog(deploymentId, line);
-        }
-    }
-}
-
-Json::Value extractPortAdjustments(const std::string& logs) {
-    Json::Value adjustments(Json::arrayValue);
-    const std::string marker = "__STACKPILOT_PORT_ADJUSTED__=";
-    std::size_t offset = 0;
-    while ((offset = logs.find(marker, offset)) != std::string::npos) {
-        const std::size_t payloadStart = offset + marker.size();
-        const std::size_t lineEnd = logs.find('\n', payloadStart);
-        const std::string payload = trim(logs.substr(payloadStart, lineEnd == std::string::npos ? std::string::npos : lineEnd - payloadStart));
-        const std::size_t firstColon = payload.find(':');
-        const std::size_t secondColon = firstColon == std::string::npos ? std::string::npos : payload.find(':', firstColon + 1);
-        if (firstColon != std::string::npos && secondColon != std::string::npos) {
-            Json::Value item;
-            item["key"] = payload.substr(0, firstColon);
-            item["from"] = payload.substr(firstColon + 1, secondColon - firstColon - 1);
-            item["to"] = payload.substr(secondColon + 1);
-            adjustments.append(item);
-        }
-        offset = lineEnd == std::string::npos ? logs.size() : lineEnd + 1;
-    }
-    return adjustments;
-}
-
-Json::Value loadDeploymentSummary(const std::string& deploymentId) {
-    auto& db = Database::getInstance();
-    auto conn = db.getConnection();
-    pqxx::work txn(*conn);
-    auto rows = txn.exec_params(
-        "SELECT d.id, p.user_id AS owner_user_id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
-        "d.environment_id, e.name AS environment_name, d.branch, d.commit_sha, d.trigger_source, d.github_delivery_id, "
-        "d.ci_required, d.ci_status, d.logs, d.image_name, "
-        "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
-        "d.desired_replicas, d.runtime_url, d.runtime_exposure, d.runtime_provider, d.remote_container_name, "
-        "d.runtime_paused, d.runtime_snapshot::text AS runtime_snapshot, d.created_at "
-        "FROM deployments d "
-        "JOIN projects p ON d.project_id = p.id "
-        "LEFT JOIN project_environments e ON d.environment_id = e.id "
-        "WHERE d.id = $1",
-        deploymentId
-    );
-    txn.commit();
-
-    if (rows.empty()) {
-        return Json::Value();
-    }
-
-    const auto& row = rows[0];
-    Json::Value dep;
-    dep["id"] = row["id"].as<std::string>();
-    // Internal routing field, stripped before the payload is sent.
-    dep["__owner_user_id"] = row["owner_user_id"].as<std::string>();
-    dep["project_id"] = row["project_id"].as<std::string>();
-    dep["project_name"] = row["project_name"].as<std::string>();
-    dep["repo_url"] = row["repo_url"].is_null() ? "" : row["repo_url"].as<std::string>();
-    dep["status"] = row["status"].as<std::string>();
-    dep["version"] = row["version"].as<std::string>();
-    dep["commit_hash"] = row["commit_hash"].as<std::string>();
-    dep["environment_id"] = row["environment_id"].is_null() ? "" : row["environment_id"].as<std::string>();
-    dep["environment_name"] = row["environment_name"].is_null() ? "" : row["environment_name"].as<std::string>();
-    dep["branch"] = row["branch"].is_null() ? "" : row["branch"].as<std::string>();
-    dep["commit_sha"] = row["commit_sha"].is_null() ? "" : row["commit_sha"].as<std::string>();
-    dep["trigger_source"] = row["trigger_source"].is_null() ? "manual" : row["trigger_source"].as<std::string>();
-    dep["github_delivery_id"] = row["github_delivery_id"].is_null() ? "" : row["github_delivery_id"].as<std::string>();
-    dep["ci_required"] = row["ci_required"].is_null() ? false : row["ci_required"].as<bool>();
-    dep["ci_status"] = row["ci_status"].is_null() ? "not_required" : row["ci_status"].as<std::string>();
-    dep["port_adjustments"] = row["logs"].is_null() ? Json::Value(Json::arrayValue) : extractPortAdjustments(row["logs"].as<std::string>());
-    hydrateDeploymentRuntimeFields(dep, row);
-    dep["created_at"] = row["created_at"].as<std::string>();
-    return dep;
-}
-
-void broadcastDeploymentSummary(const std::string& deploymentId) {
-    Json::Value summary = loadDeploymentSummary(deploymentId);
-    if (!summary.isNull()) {
-        const std::string ownerUserId = summary.get("__owner_user_id", "").asString();
-        summary.removeMember("__owner_user_id");
-        LogWebSocketController::broadcastDeploymentUpdate(summary, ownerUserId);
-    }
-}
-
 std::filesystem::path getBuildWorkspaceRoot() {
     const char* workspaceEnv = std::getenv("BUILD_WORKSPACE_DIR");
     if (workspaceEnv && *workspaceEnv) {
@@ -451,18 +301,6 @@ std::string shellQuote(const std::string& value) {
     }
     quoted += "'";
     return quoted;
-}
-
-std::string markerValue(const std::string& output, const std::string& marker) {
-    std::istringstream stream(output);
-    std::string line;
-    const std::string prefix = marker + "=";
-    while (std::getline(stream, line)) {
-        if (line.rfind(prefix, 0) == 0) {
-            return trim(line.substr(prefix.size()));
-        }
-    }
-    return "";
 }
 
 std::string composePortFallbackShell(const std::string& composeFileArg,
@@ -563,147 +401,6 @@ fi
 )sh";
 }
 
-std::string makeDockerPauseCommand(const std::string& containerName, bool paused) {
-    const std::string container = shellQuote(containerName);
-    return "set -e; "
-           "command -v docker >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_MISSING__; exit 10; }; "
-           "docker info >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_DAEMON_DOWN__; exit 11; }; "
-           "docker inspect " + container + " >/dev/null 2>&1 || { echo __STACKPILOT_CONTAINER_MISSING__; exit 12; }; "
-           "docker " + std::string(paused ? "pause " : "unpause ") + container + " >/dev/null; "
-           "docker inspect --format 'status={{.State.Status}}\nrunning={{.State.Running}}\npaused={{.State.Paused}}\nimage={{.Config.Image}}\nstarted_at={{.State.StartedAt}}\nfinished_at={{.State.FinishedAt}}\nrestart_count={{.RestartCount}}' " + container;
-}
-
-int runLocalCommand(const std::string& command, std::string& output);
-
-std::string sanitizeDockerContainerName(const std::string& raw) {
-    std::string cleaned;
-    cleaned.reserve(std::min<size_t>(raw.size(), 96));
-    for (char c : raw) {
-        const bool ok = std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.' || c == '-';
-        cleaned.push_back(ok ? static_cast<char>(std::tolower(static_cast<unsigned char>(c))) : '-');
-        if (cleaned.size() >= 96) {
-            break;
-        }
-    }
-    while (!cleaned.empty() && cleaned.front() == '-') {
-        cleaned.erase(cleaned.begin());
-    }
-    while (!cleaned.empty() && cleaned.back() == '-') {
-        cleaned.pop_back();
-    }
-    return cleaned.empty() ? "deployment" : cleaned;
-}
-
-bool isValidRuntimeEnvKey(const std::string& key) {
-    if (key.empty()) {
-        return false;
-    }
-    if (!(std::isalpha(static_cast<unsigned char>(key.front())) || key.front() == '_')) {
-        return false;
-    }
-    for (char c : key) {
-        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::string makeLocalDockerRunCommand(const std::string& containerName,
-                                      const std::string& imageName,
-                                      int containerPort,
-                                      const std::vector<std::pair<std::string, std::string>>& envVars) {
-    std::string envArgs;
-    for (const auto& envVar : envVars) {
-        if (!isValidRuntimeEnvKey(envVar.first)) {
-            continue;
-        }
-        std::string value = envVar.second;
-        std::replace(value.begin(), value.end(), '\n', ' ');
-        envArgs += " --env " + shellQuote(envVar.first + "=" + value);
-    }
-
-    const std::string container = shellQuote(containerName);
-    const std::string image = shellQuote(imageName);
-    const std::string requestedPort = std::to_string(std::clamp(containerPort, 0, 65535));
-    return
-        "set -e; "
-        "command -v docker >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_MISSING__; exit 10; }; "
-        "docker info >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_DAEMON_DOWN__; exit 11; }; "
-        "docker image inspect " + image + " >/dev/null 2>&1 || { echo __STACKPILOT_IMAGE_MISSING__; exit 12; }; "
-        "requested_port=" + requestedPort + "; "
-        "if [ \"$requested_port\" -gt 0 ]; then "
-        "container_port=\"$requested_port\"; "
-        "else "
-        "container_port=$(docker image inspect --format '{{range $p, $_ := .Config.ExposedPorts}}{{println $p}}{{end}}' " + image + " 2>/dev/null | sed -n 's#/tcp$##p' | head -n 1); "
-        "[ -n \"$container_port\" ] || container_port=3000; "
-        "fi; "
-        "docker rm -f " + container + " >/dev/null 2>&1 || true; "
-        "docker run -d --restart unless-stopped --name " + container + envArgs +
-        " -p 127.0.0.1::$container_port " + image + " >/tmp/stackpilot-local-container-id; "
-        "host_port=$(docker port " + container + " $container_port/tcp 2>/dev/null | awk -F: 'NF {print $NF; exit}'); "
-        "[ -n \"$host_port\" ] || { echo __STACKPILOT_PORT_MISSING__; docker logs --tail 80 " + container + " || true; exit 13; }; "
-        "status=$(docker inspect --format '{{.State.Status}}' " + container + "); "
-        "running=$(docker inspect --format '{{.State.Running}}' " + container + "); "
-        "echo __STACKPILOT_LOCAL_DOCKER_RUNNING__; "
-        "echo container_name=" + containerName + "; "
-        "echo container_port=$container_port; "
-        "echo host_port=$host_port; "
-        "echo runtime_url=http://localhost:$host_port; "
-        "echo status=$status; "
-        "echo running=$running; "
-        "echo image=" + imageName + "; "
-        "echo __STACKPILOT_LOCAL_LOG_TAIL__; "
-        "docker logs --tail 80 " + container + " 2>&1 || true";
-}
-
-SshOperationResult removeLocalDockerContainer(const std::string& containerName,
-                                             const std::string& imageName,
-                                             bool removeImage) {
-    SshOperationResult result;
-    if (trim(containerName).empty()) {
-        result.error = "Local Docker container name is missing";
-        return result;
-    }
-    const std::string command =
-        "timeout 60s sh -lc " + shellQuote(
-            std::string("set -e; ")
-            + "command -v docker >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_MISSING__; exit 10; }; "
-            + "docker info >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_DAEMON_DOWN__; exit 11; }; "
-            + "docker rm -f " + shellQuote(containerName) + " >/dev/null 2>&1 || true; "
-            + "echo __STACKPILOT_LOCAL_CONTAINER_REMOVED__; "
-            + (removeImage && !imageName.empty()
-                ? "docker image rm -f " + shellQuote(imageName) + " >/dev/null 2>&1 || true; echo __STACKPILOT_LOCAL_IMAGE_REMOVE_ATTEMPTED__;"
-                : "")
-        );
-    std::string output;
-    const int exitCode = runLocalCommand(command, output);
-    result.exitCode = exitCode;
-    result.output = output;
-    if (exitCode != 0 || output.find("__STACKPILOT_LOCAL_CONTAINER_REMOVED__") == std::string::npos) {
-        result.error = exitCode == 124 ? "Local Docker runtime removal timed out" : "Failed to remove local Docker runtime";
-        return result;
-    }
-    result.success = true;
-    return result;
-}
-
-bool isValidDockerImageRefForCleanup(const std::string& value) {
-    const std::string cleaned = trim(value);
-    if (cleaned.empty() || cleaned.size() > 255) {
-        return false;
-    }
-    for (char c : cleaned) {
-        const bool ok = std::isalnum(static_cast<unsigned char>(c)) ||
-                        c == '_' || c == '.' || c == '-' || c == '/' ||
-                        c == ':' || c == '@';
-        if (!ok) {
-            return false;
-        }
-    }
-    return true;
-}
-
 std::string sanitizeRemoteWorkspaceSegment(const std::string& raw) {
     std::string cleaned;
     cleaned.reserve(std::min<size_t>(raw.size(), 128));
@@ -788,87 +485,6 @@ std::string normalizeResourcePreset(std::string value) {
         return value;
     }
     return "small";
-}
-
-int runLocalCommand(const std::string& command, std::string& output) {
-    output.clear();
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        output = "Failed to start local command";
-        return 1;
-    }
-
-    char buffer[4096];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
-    }
-
-    const int status = pclose(pipe);
-#ifdef _WIN32
-    return status;
-#else
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return status;
-#endif
-}
-
-SshOperationResult removeLocalDockerImage(const std::string& imageName) {
-    SshOperationResult result;
-    if (!isValidDockerImageRefForCleanup(imageName)) {
-        result.error = "Invalid or missing Docker image reference";
-        return result;
-    }
-
-    std::string registryImage = "localhost:5000/" + imageName;
-    const std::string dockerIoPrefix = "localhost:5000/docker.io/";
-    if (registryImage.rfind(dockerIoPrefix, 0) == 0) {
-        registryImage = "localhost:5000/" + registryImage.substr(dockerIoPrefix.size());
-    }
-
-    const std::string command =
-        "timeout 45s sh -lc " + shellQuote(
-            "set -e; "
-            "command -v docker >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_MISSING__; exit 10; }; "
-            "docker info >/dev/null 2>&1 || { echo __STACKPILOT_DOCKER_DAEMON_DOWN__; exit 11; }; "
-            "failed=0; "
-            "for img in " + shellQuote(imageName) + " " + shellQuote(registryImage) + "; do "
-            "  [ -n \"$img\" ] || continue; "
-            "  if docker image inspect \"$img\" >/dev/null 2>&1; then "
-            "    if docker image rm \"$img\" >/dev/null 2>&1; then "
-            "      echo __STACKPILOT_LOCAL_IMAGE_REMOVED__=$img; "
-            "    else "
-            "      echo __STACKPILOT_LOCAL_IMAGE_REMOVE_FAILED__=$img; failed=1; "
-            "    fi; "
-            "  else "
-            "    echo __STACKPILOT_LOCAL_IMAGE_ALREADY_ABSENT__=$img; "
-            "  fi; "
-            "done; "
-            "[ \"$failed\" -eq 0 ] || exit 12; "
-            "echo __STACKPILOT_LOCAL_IMAGE_CLEANUP_DONE__"
-        );
-
-    std::string output;
-    const int exitCode = runLocalCommand(command, output);
-    result.exitCode = exitCode;
-    result.output = output;
-    if (exitCode != 0 || output.find("__STACKPILOT_LOCAL_IMAGE_CLEANUP_DONE__") == std::string::npos) {
-        if (output.find("__STACKPILOT_DOCKER_MISSING__") != std::string::npos) {
-            result.error = "Docker is not installed on this host";
-        } else if (output.find("__STACKPILOT_DOCKER_DAEMON_DOWN__") != std::string::npos) {
-            result.error = "Docker daemon is not reachable on this host";
-        } else if (output.find("__STACKPILOT_LOCAL_IMAGE_REMOVE_FAILED__") != std::string::npos) {
-            result.error = "Docker image could not be deleted because it may still be in use";
-        } else if (exitCode == 124) {
-            result.error = "Docker image cleanup timed out";
-        } else {
-            result.error = "Failed to remove Docker image";
-        }
-        return result;
-    }
-    result.success = true;
-    return result;
 }
 
 double parseMetricNumber(const std::string& raw) {
@@ -1554,7 +1170,7 @@ void DeploymentController::createDeployment(
         auto resp = drogon::HttpResponse::newHttpJsonResponse(resp_body);
         resp->setStatusCode(drogon::k201Created);
         callback(resp);
-        broadcastDeploymentSummary(dep["id"].asString());
+        DeploymentJournal::broadcastSummary(dep["id"].asString());
 
     } catch (const std::exception& e) {
         spdlog::error("Create deployment error: {}", e.what());
@@ -1619,7 +1235,7 @@ void DeploymentController::listDeployments(
             dep["github_delivery_id"] = row["github_delivery_id"].is_null() ? "" : row["github_delivery_id"].as<std::string>();
             dep["ci_required"] = row["ci_required"].is_null() ? false : row["ci_required"].as<bool>();
             dep["ci_status"] = row["ci_status"].is_null() ? "not_required" : row["ci_status"].as<std::string>();
-            hydrateDeploymentRuntimeFields(dep, row);
+            DeploymentJournal::hydrateRuntimeFields(dep, row);
             dep["created_at"] = row["created_at"].as<std::string>();
             deps.append(dep);
         }
@@ -1689,7 +1305,7 @@ void DeploymentController::listUserDeployments(
             dep["github_delivery_id"] = row["github_delivery_id"].is_null() ? "" : row["github_delivery_id"].as<std::string>();
             dep["ci_required"] = row["ci_required"].is_null() ? false : row["ci_required"].as<bool>();
             dep["ci_status"] = row["ci_status"].is_null() ? "not_required" : row["ci_status"].as<std::string>();
-            hydrateDeploymentRuntimeFields(dep, row);
+            DeploymentJournal::hydrateRuntimeFields(dep, row);
             dep["created_at"] = row["created_at"].as<std::string>();
             deps.append(dep);
         }
@@ -2079,7 +1695,7 @@ void DeploymentController::deployToLocalDocker(
             );
             txn.commit();
             LogWebSocketController::broadcastStatus(deploymentId, "deploying");
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             const std::string quotedComposeFile = shellQuote(composeFile);
             const std::string quotedComposeProject = shellQuote(composeProject);
@@ -2114,8 +1730,8 @@ void DeploymentController::deployToLocalDocker(
                 "echo __STACKPILOT_COMPOSE_URL__=$runtime; "
                 "$compose_cmd -f " + quotedComposeFile + " -p " + quotedComposeProject + " ps";
             std::string output;
-            const int exitCode = runLocalCommand("timeout 180s sh -lc " + shellQuote(composeCommand), output);
-            appendDeploymentLogBlock(deploymentId, output);
+            const int exitCode = LocalDockerRuntime::run("timeout 180s sh -lc " + shellQuote(composeCommand), output);
+            DeploymentJournal::appendBlock(deploymentId, output);
             if (exitCode != 0) {
                 RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 auto updateConn = db.getConnection();
@@ -2134,7 +1750,7 @@ void DeploymentController::deployToLocalDocker(
                 callback(resp); return;
             }
 
-            const std::string updatedRuntimeUrl = markerValue(output, "__STACKPILOT_COMPOSE_URL__");
+            const std::string updatedRuntimeUrl = LocalDockerRuntime::markerValue(output, "__STACKPILOT_COMPOSE_URL__");
             const std::string runtimeUrl = updatedRuntimeUrl.empty()
                 ? jsonString(existingRuntimeSnapshot, "runtime_url")
                 : updatedRuntimeUrl;
@@ -2156,7 +1772,7 @@ void DeploymentController::deployToLocalDocker(
             );
             updateTxn.commit();
             LogWebSocketController::broadcastStatus(deploymentId, "running");
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
             RuntimeRateLimiter::clear(rateLimitKey);
 
             Json::Value payload;
@@ -2170,7 +1786,7 @@ void DeploymentController::deployToLocalDocker(
 
         const auto deploymentEnvVars = loadDeploymentEnvVarPairs(txn, deploymentId);
         const std::string projectName = row["project_name"].is_null() ? "deployment" : row["project_name"].as<std::string>();
-        const std::string containerName = "stackpilot-local-" + sanitizeDockerContainerName(projectName) + "-" + sanitizeDockerContainerName(deploymentId).substr(0, 12);
+        const std::string containerName = "stackpilot-local-" + LocalDockerRuntime::sanitizeContainerName(projectName) + "-" + LocalDockerRuntime::sanitizeContainerName(deploymentId).substr(0, 12);
         txn.exec_params(
             "UPDATE deployments SET status = 'deploying', updated_at = NOW() WHERE id = $1",
             deploymentId
@@ -2178,14 +1794,14 @@ void DeploymentController::deployToLocalDocker(
         txn.commit();
 
         LogWebSocketController::broadcastStatus(deploymentId, "deploying");
-        broadcastDeploymentSummary(deploymentId);
+        DeploymentJournal::broadcastSummary(deploymentId);
 
         std::string output;
-        const int exitCode = runLocalCommand(
-            "timeout 120s sh -lc " + shellQuote(makeLocalDockerRunCommand(containerName, imageName, requestedContainerPort, deploymentEnvVars)),
+        const int exitCode = LocalDockerRuntime::run(
+            "timeout 120s sh -lc " + shellQuote(LocalDockerRuntime::makeRunCommand(containerName, imageName, requestedContainerPort, deploymentEnvVars)),
             output
         );
-        appendDeploymentLogBlock(deploymentId, output);
+        DeploymentJournal::appendBlock(deploymentId, output);
 
         const std::string runtimeUrl = valueFromKeyValueOutput(output, "runtime_url");
         int containerPort = requestedContainerPort > 0 ? requestedContainerPort : 3000;
@@ -2209,7 +1825,7 @@ void DeploymentController::deployToLocalDocker(
             );
             updateTxn.commit();
             LogWebSocketController::broadcastStatus(deploymentId, "failed");
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             Json::Value err;
             if (output.find("__STACKPILOT_DOCKER_MISSING__") != std::string::npos) {
@@ -2250,7 +1866,7 @@ void DeploymentController::deployToLocalDocker(
 
         RuntimeRateLimiter::clear(rateLimitKey);
         LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
-        broadcastDeploymentSummary(deploymentId);
+        DeploymentJournal::broadcastSummary(deploymentId);
 
         Json::Value payload;
         payload["message"] = "Deployment is running in local Docker";
@@ -2363,7 +1979,7 @@ void DeploymentController::deployToKubernetes(
         );
         txn.commit();
         LogWebSocketController::broadcastStatus(deploymentId, "deploying");
-        broadcastDeploymentSummary(deploymentId);
+        DeploymentJournal::broadcastSummary(deploymentId);
 
         KubernetesService service;
         KubernetesDeployOptions options;
@@ -2391,7 +2007,7 @@ void DeploymentController::deployToKubernetes(
         options.envVars = deploymentEnvVars;
 
         KubernetesRuntimeInfo runtime = service.deploy(options);
-        appendDeploymentLogBlock(deploymentId, runtime.logs);
+        DeploymentJournal::appendBlock(deploymentId, runtime.logs);
 
         auto connUpdate = db.getConnection();
         pqxx::work updateTxn(*connUpdate);
@@ -2428,7 +2044,7 @@ void DeploymentController::deployToKubernetes(
             updateTxn.commit();
             RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, runtime.status.empty() ? "running" : runtime.status);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         } else {
             RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             updateTxn.exec_params(
@@ -2437,7 +2053,7 @@ void DeploymentController::deployToKubernetes(
             );
             updateTxn.commit();
             LogWebSocketController::broadcastStatus(deploymentId, "failed");
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         }
 
         Json::Value payload;
@@ -2579,7 +2195,7 @@ void DeploymentController::scaleKubernetesDeployment(
             runtime = service.scale(nameSpace, deploymentName, serviceName, exposureMode, replicas, runtimeScheme);
             runtime.runtimeScheme = runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme;
         }
-        appendDeploymentLogBlock(deploymentId, runtime.logs);
+        DeploymentJournal::appendBlock(deploymentId, runtime.logs);
 
         auto connUpdate = db.getConnection();
         pqxx::work updateTxn(*connUpdate);
@@ -2595,12 +2211,12 @@ void DeploymentController::scaleKubernetesDeployment(
             updateTxn.commit();
             RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, runtime.status.empty() ? "running" : runtime.status);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         } else {
             RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         }
 
         Json::Value payload;
@@ -2787,12 +2403,12 @@ void DeploymentController::setRuntimePausedState(
             const auto op = sshService.runRemoteCommand(
                 remoteConfig,
                 "/tmp",
-                makeDockerPauseCommand(remoteContainerName, paused),
+                LocalDockerRuntime::makePauseCommand(remoteContainerName, paused),
                 20
             );
-            appendDeploymentLogBlock(deploymentId, op.output);
+            DeploymentJournal::appendBlock(deploymentId, op.output);
             if (!op.error.empty()) {
-                appendDeploymentLogBlock(deploymentId, op.error);
+                DeploymentJournal::appendBlock(deploymentId, op.error);
             }
 
             if (!op.success) {
@@ -2822,7 +2438,7 @@ void DeploymentController::setRuntimePausedState(
 
             RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             payload["message"] = paused ? "Runtime paused successfully" : "Runtime resumed successfully";
             payload["runtime"]["provider"] = "remote_docker";
@@ -2877,7 +2493,7 @@ void DeploymentController::setRuntimePausedState(
                 );
             }
 
-            appendDeploymentLogBlock(deploymentId, runtime.logs);
+            DeploymentJournal::appendBlock(deploymentId, runtime.logs);
             if (!runtime.success) {
                 RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
                 payload["error"] = runtime.error.empty() ? std::string(paused ? "Failed to pause runtime" : "Failed to resume runtime") : runtime.error;
@@ -2906,7 +2522,7 @@ void DeploymentController::setRuntimePausedState(
 
             RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             payload["message"] = paused ? "Runtime paused successfully" : "Runtime resumed successfully";
             payload["runtime"]["provider"] = isRemoteKubernetes ? "remote_kubernetes" : "kubernetes";
@@ -3129,7 +2745,7 @@ void DeploymentController::getDeploymentMetrics(
 
         if (isLocalDocker && !remoteContainerName.empty()) {
             std::string output;
-            const int exitCode = runLocalCommand("timeout 12s sh -lc " + shellQuote(makeDockerMetricsCommand(remoteContainerName)), output);
+            const int exitCode = LocalDockerRuntime::run("timeout 12s sh -lc " + shellQuote(makeDockerMetricsCommand(remoteContainerName)), output);
             Json::Value payload = parseDockerMetrics(output, "local_docker", deploymentId);
             if (exitCode != 0 && !payload["available"].asBool()) {
                 payload["message"] = "Unable to collect local Docker metrics.";
@@ -3140,7 +2756,7 @@ void DeploymentController::getDeploymentMetrics(
 
         if (isLocalCompose && !remoteContainerName.empty()) {
             std::string output;
-            const int exitCode = runLocalCommand("timeout 12s sh -lc " + shellQuote(makeDockerComposeMetricsCommand(remoteContainerName)), output);
+            const int exitCode = LocalDockerRuntime::run("timeout 12s sh -lc " + shellQuote(makeDockerComposeMetricsCommand(remoteContainerName)), output);
             Json::Value payload = parseDockerMetrics(output, "local_compose", deploymentId);
             if (exitCode != 0 && !payload["available"].asBool()) {
                 payload["message"] = "Unable to collect local Compose metrics.";
@@ -3153,7 +2769,7 @@ void DeploymentController::getDeploymentMetrics(
 
         if (isKubernetes) {
             std::string output;
-            const int exitCode = runLocalCommand("timeout 12s sh -lc " + shellQuote(makeKubernetesMetricsCommand(nameSpace, deploymentName)), output);
+            const int exitCode = LocalDockerRuntime::run("timeout 12s sh -lc " + shellQuote(makeKubernetesMetricsCommand(nameSpace, deploymentName)), output);
             Json::Value payload = parseKubernetesMetrics(output, deploymentId, deploymentName);
             if (exitCode != 0 && !payload["available"].asBool()) {
                 payload["message"] = "Unable to collect Kubernetes metrics. Check kubectl access and metrics-server.";
@@ -3242,7 +2858,7 @@ void DeploymentController::getRuntimeHealth(
             const std::string inspectCommand =
                 "docker inspect --format 'running={{.State.Running}}\npaused={{.State.Paused}}\nstatus={{.State.Status}}' " +
                 shellQuote(containerName) + " 2>&1";
-            const int exitCode = runLocalCommand("timeout 8s sh -lc " + shellQuote(inspectCommand), output);
+            const int exitCode = LocalDockerRuntime::run("timeout 8s sh -lc " + shellQuote(inspectCommand), output);
             const bool running = valueFromKeyValueOutput(output, "running") == "true";
             const bool paused = valueFromKeyValueOutput(output, "paused") == "true";
             Json::Value payload;
@@ -3306,7 +2922,7 @@ void DeploymentController::getRuntimeHealth(
             output = probe.output + (probe.error.empty() ? "" : "\n" + probe.error);
             exitCode = probe.success ? 0 : probe.exitCode;
         } else {
-            exitCode = runLocalCommand("timeout 12s sh -lc " + shellQuote(probeCommand), output);
+            exitCode = LocalDockerRuntime::run("timeout 12s sh -lc " + shellQuote(probeCommand), output);
         }
 
         const std::string statusRaw = valueFromKeyValueOutput(output, "status");
@@ -3455,7 +3071,7 @@ void DeploymentController::getKubernetesStatus(
                 deploymentId
             );
             updateTxn.commit();
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             callback(drogon::HttpResponse::newHttpJsonResponse(payload));
             return;
@@ -3488,7 +3104,7 @@ void DeploymentController::getKubernetesStatus(
                 "echo published_ports=$(docker port " + shellQuote(remoteContainerName) + " 2>/dev/null | tr '\\n' ',' | sed 's/,$//'); "
                 "echo __STACKPILOT_REMOTE_LOG_TAIL__; "
                 "docker logs --tail 80 " + shellQuote(remoteContainerName) + " 2>&1 || true";
-            const int exitCode = runLocalCommand("timeout 12s sh -lc " + shellQuote(inspectCommand), output);
+            const int exitCode = LocalDockerRuntime::run("timeout 12s sh -lc " + shellQuote(inspectCommand), output);
             if (exitCode != 0) {
                 payload["runtime"]["deployed"] = false;
                 payload["runtime"]["status"] = "not_ready";
@@ -3524,7 +3140,7 @@ void DeploymentController::getKubernetesStatus(
                 deploymentId
             );
             updateTxn.commit();
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             callback(drogon::HttpResponse::newHttpJsonResponse(payload));
             return;
@@ -3576,7 +3192,7 @@ void DeploymentController::getKubernetesStatus(
                 deploymentId
             );
             updateTxn.commit();
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             payload["runtime"]["deployed"] = true;
             payload["runtime"]["paused"] = runtimePaused;
@@ -3637,7 +3253,7 @@ void DeploymentController::getKubernetesStatus(
             deploymentId
         );
         updateTxn.commit();
-        broadcastDeploymentSummary(deploymentId);
+        DeploymentJournal::broadcastSummary(deploymentId);
 
         payload["runtime"]["deployed"] = true;
         payload["runtime"]["paused"] = runtimePaused;
@@ -3870,7 +3486,7 @@ void DeploymentController::rollbackKubernetesDeployment(
         );
         txn.commit();
         LogWebSocketController::broadcastStatus(deploymentId, "deploying");
-        broadcastDeploymentSummary(deploymentId);
+        DeploymentJournal::broadcastSummary(deploymentId);
 
         KubernetesDeployOptions options;
         options.deploymentId = deploymentId;
@@ -3900,7 +3516,7 @@ void DeploymentController::rollbackKubernetesDeployment(
             KubernetesService service;
             runtime = service.deploy(options);
         }
-        appendDeploymentLogBlock(deploymentId, runtime.logs);
+        DeploymentJournal::appendBlock(deploymentId, runtime.logs);
 
         auto connUpdate = db.getConnection();
         pqxx::work updateTxn(*connUpdate);
@@ -3934,12 +3550,12 @@ void DeploymentController::rollbackKubernetesDeployment(
             updateTxn.commit();
             RuntimeRateLimiter::clear(rateLimitKey);
             LogWebSocketController::broadcastStatus(deploymentId, runtime.status.empty() ? "running" : runtime.status);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         } else {
             RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         }
 
         Json::Value payload;
@@ -4072,7 +3688,7 @@ void DeploymentController::removeKubernetesDeployment(
 
             SshService sshService;
             const auto removal = sshService.removeDockerContainer(remoteConfig, remoteContainerName, imageName, deleteRemoteImage);
-            appendDeploymentLogBlock(deploymentId, removal.output);
+            DeploymentJournal::appendBlock(deploymentId, removal.output);
 
             auto connUpdate = db.getConnection();
             pqxx::work updateTxn(*connUpdate);
@@ -4089,7 +3705,7 @@ void DeploymentController::removeKubernetesDeployment(
                 updateTxn.commit();
                 RuntimeRateLimiter::clear(rateLimitKey);
                 LogWebSocketController::broadcastStatus(deploymentId, "built");
-                broadcastDeploymentSummary(deploymentId);
+                DeploymentJournal::broadcastSummary(deploymentId);
 
                 Json::Value payload;
                 const bool imageDeleted = deleteRemoteImage && removal.output.find("__STACKPILOT_REMOTE_IMAGE_REMOVED__") != std::string::npos;
@@ -4113,7 +3729,7 @@ void DeploymentController::removeKubernetesDeployment(
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
             RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             Json::Value err;
             err["error"] = removal.error.empty() ? "Failed to remove remote Docker runtime" : removal.error;
@@ -4135,8 +3751,8 @@ void DeploymentController::removeKubernetesDeployment(
             }
 
             txn.commit();
-            const auto removal = removeLocalDockerContainer(remoteContainerName, imageName, deleteRemoteImage);
-            appendDeploymentLogBlock(deploymentId, removal.output);
+            const auto removal = LocalDockerRuntime::removeContainer(remoteContainerName, imageName, deleteRemoteImage);
+            DeploymentJournal::appendBlock(deploymentId, removal.output);
 
             auto connUpdate = db.getConnection();
             pqxx::work updateTxn(*connUpdate);
@@ -4153,7 +3769,7 @@ void DeploymentController::removeKubernetesDeployment(
                 updateTxn.commit();
                 RuntimeRateLimiter::clear(rateLimitKey);
                 LogWebSocketController::broadcastStatus(deploymentId, "built");
-                broadcastDeploymentSummary(deploymentId);
+                DeploymentJournal::broadcastSummary(deploymentId);
 
                 Json::Value payload;
                 payload["message"] = deleteRemoteImage ? "Local Docker runtime removed; image cleanup attempted" : "Local Docker runtime removed";
@@ -4171,7 +3787,7 @@ void DeploymentController::removeKubernetesDeployment(
             updateTxn.exec_params("UPDATE deployments SET updated_at = NOW() WHERE id = $1", deploymentId);
             updateTxn.commit();
             RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             Json::Value err;
             err["error"] = removal.error.empty() ? "Failed to remove local Docker runtime" : removal.error;
@@ -4197,7 +3813,7 @@ void DeploymentController::removeKubernetesDeployment(
 
             SshService sshService;
             KubernetesRuntimeInfo removal = sshService.removeKubernetesRuntime(remoteConfig, nameSpace, deploymentName, serviceName, exposureMode);
-            appendDeploymentLogBlock(deploymentId, removal.logs);
+            DeploymentJournal::appendBlock(deploymentId, removal.logs);
 
             auto connUpdate = db.getConnection();
             pqxx::work updateTxn(*connUpdate);
@@ -4217,7 +3833,7 @@ void DeploymentController::removeKubernetesDeployment(
                 RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
             }
             LogWebSocketController::broadcastStatus(deploymentId, "built");
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
 
             if (!removal.success) {
                 Json::Value err;
@@ -4251,7 +3867,7 @@ void DeploymentController::removeKubernetesDeployment(
 
         KubernetesService service;
         KubernetesRuntimeInfo removal = service.remove(nameSpace, deploymentName, serviceName, exposureMode);
-        appendDeploymentLogBlock(deploymentId, removal.logs);
+        DeploymentJournal::appendBlock(deploymentId, removal.logs);
 
         auto connUpdate = db.getConnection();
         pqxx::work updateTxn(*connUpdate);
@@ -4271,7 +3887,7 @@ void DeploymentController::removeKubernetesDeployment(
             RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
         }
         LogWebSocketController::broadcastStatus(deploymentId, "built");
-        broadcastDeploymentSummary(deploymentId);
+        DeploymentJournal::broadcastSummary(deploymentId);
 
         if (!removal.success) {
             Json::Value err;

@@ -1,0 +1,73 @@
+// ============================================================
+// LocalDockerRuntime.h — shell commands for the local Docker runtime
+// ============================================================
+// Every function that builds a `docker ...` command line for the local
+// execution mode. Extracted from DeploymentController's anonymous namespace,
+// where none of it could be tested.
+//
+// That mattered more here than anywhere else in the controller: these
+// functions interpolate user-controlled strings — container names, image
+// references, environment values — into shell commands. A mistake is a command
+// injection with the platform's own privileges, and the only thing standing in
+// the way is quoting that was previously unreachable from a test.
+//
+// The command builders are pure: given the same inputs they return the same
+// string and touch nothing. Only run(), removeContainer() and removeImage()
+// actually execute anything.
+
+#pragma once
+
+#include "SshService.h"  // SshOperationResult
+
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace stackpilot {
+
+class LocalDockerRuntime {
+public:
+    // ─── pure helpers ───────────────────────────────────────────
+
+    /// Reads `marker=value` out of command output, or "" when absent.
+    static std::string markerValue(const std::string& output, const std::string& marker);
+
+    /// Coerces an arbitrary string into a legal Docker container name:
+    /// lowercase, `[a-z0-9_.-]`, no leading or trailing dash, max 96 chars.
+    /// Never returns empty — falls back to "deployment".
+    static std::string sanitizeContainerName(const std::string& raw);
+
+    /// True for a POSIX-shaped environment variable name. Keys that fail this
+    /// are dropped rather than escaped: a key is not a value, and there is no
+    /// safe way to quote `FOO=bar; rm -rf /` as a variable name.
+    static bool isValidRuntimeEnvKey(const std::string& key);
+
+    /// Conservative allow-list for an image reference used in a cleanup
+    /// command. Rejects anything outside `[A-Za-z0-9_.\-/:@]`.
+    static bool isValidImageRef(const std::string& value);
+
+    /// `docker run` for a built image, with the port either pinned or
+    /// discovered from the image's exposed ports.
+    static std::string makeRunCommand(const std::string& containerName,
+                                      const std::string& imageName,
+                                      int containerPort,
+                                      const std::vector<std::pair<std::string, std::string>>& envVars);
+
+    /// `docker pause`/`unpause`, followed by an inspect so the caller can
+    /// report the resulting state without a second round trip.
+    static std::string makePauseCommand(const std::string& containerName, bool paused);
+
+    // ─── execution ──────────────────────────────────────────────
+
+    /// Runs a command through the shell, capturing stdout. Returns the exit
+    /// status, or the raw wait status when the child did not exit normally.
+    static int run(const std::string& command, std::string& output);
+
+    static SshOperationResult removeContainer(const std::string& containerName,
+                                              const std::string& imageName,
+                                              bool removeImage);
+
+    static SshOperationResult removeImage(const std::string& imageName);
+};
+
+}  // namespace stackpilot

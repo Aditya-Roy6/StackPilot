@@ -4,6 +4,7 @@
 
 #include "DeploymentCleanupService.h"
 #include "../utils/StringUtils.h"
+#include "DeploymentJournal.h"
 
 #include "../controllers/LogWebSocketController.h"
 #include "../db/Database.h"
@@ -217,24 +218,6 @@ SshOperationResult removeLocalDockerContainer(const std::string& containerName) 
     return result;
 }
 
-void appendDeploymentLogBlock(const std::string& deploymentId, const std::string& block) {
-    if (block.empty()) {
-        return;
-    }
-    try {
-        auto conn = Database::getInstance().getConnection();
-        pqxx::work txn(*conn);
-        txn.exec_params(
-            "UPDATE deployments SET logs = COALESCE(logs, '') || $1 || E'\\n', updated_at = NOW() WHERE id = $2",
-            block,
-            deploymentId
-        );
-        txn.commit();
-    } catch (const std::exception& e) {
-        spdlog::warn("Failed to append cleanup logs for {}: {}", deploymentId, e.what());
-    }
-}
-
 SshConnectionConfig rowToRemoteRuntimeConfig(const pqxx::row& row) {
     SshConnectionConfig config;
     config.connectionType = row["remote_connection_type"].is_null() ? "ssh" : row["remote_connection_type"].as<std::string>();
@@ -365,7 +348,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 "echo __STACKPILOT_COMPOSE_REMOVED__";
             const auto removal = sshService.runRemoteCommand(rowToRemoteRuntimeConfig(row), "/", command, 180);
             result.logs += removal.output;
-            appendDeploymentLogBlock(deploymentId, removal.output);
+            DeploymentJournal::appendBlock(deploymentId, removal.output);
             if (!removal.success || removal.output.find("__STACKPILOT_COMPOSE_REMOVED__") == std::string::npos) {
                 result.error = removal.error.empty() ? "Failed to remove remote Compose runtime before deleting deployment" : removal.error;
                 return result;
@@ -396,7 +379,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             std::string output;
             const int exitCode = runCommand(command, output);
             result.logs += output;
-            appendDeploymentLogBlock(deploymentId, output);
+            DeploymentJournal::appendBlock(deploymentId, output);
             if (exitCode != 0 || output.find("__STACKPILOT_COMPOSE_REMOVED__") == std::string::npos) {
                 result.error = "Failed to remove local Compose runtime before deleting deployment";
                 return result;
@@ -429,7 +412,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 exposureMode
             );
             result.logs += removal.logs;
-            appendDeploymentLogBlock(deploymentId, removal.logs);
+            DeploymentJournal::appendBlock(deploymentId, removal.logs);
             if (!removal.success) {
                 result.error = removal.error.empty() ? "Failed to remove remote Compose Kubernetes runtime before deleting deployment" : removal.error;
                 return result;
@@ -447,7 +430,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                     "echo __STACKPILOT_COMPOSE_IMAGES_REMOVED__";
                 const auto imageRemoval = sshService.runRemoteCommand(rowToRemoteRuntimeConfig(row), "/", command, 180);
                 result.logs += imageRemoval.output;
-                appendDeploymentLogBlock(deploymentId, imageRemoval.output);
+                DeploymentJournal::appendBlock(deploymentId, imageRemoval.output);
                 if (!imageRemoval.success || imageRemoval.output.find("__STACKPILOT_COMPOSE_IMAGES_REMOVED__") == std::string::npos) {
                     result.error = imageRemoval.error.empty() ? "Failed to clean remote Compose images" : imageRemoval.error;
                     return result;
@@ -461,7 +444,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             KubernetesService service;
             const KubernetesRuntimeInfo removal = service.removeComposeStack(nameSpace, composeProject, exposureMode);
             result.logs += removal.logs;
-            appendDeploymentLogBlock(deploymentId, removal.logs);
+            DeploymentJournal::appendBlock(deploymentId, removal.logs);
             if (!removal.success) {
                 result.error = removal.error.empty() ? "Failed to remove Compose Kubernetes runtime before deleting deployment" : removal.error;
                 return result;
@@ -482,7 +465,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 std::string output;
                 const int exitCode = runCommand(command, output);
                 result.logs += output;
-                appendDeploymentLogBlock(deploymentId, output);
+                DeploymentJournal::appendBlock(deploymentId, output);
                 if (exitCode != 0 || output.find("__STACKPILOT_COMPOSE_IMAGES_REMOVED__") == std::string::npos) {
                     result.error = "Failed to clean local Compose images";
                     return result;
@@ -495,7 +478,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             SshService sshService;
             const auto removal = sshService.removeDockerContainer(rowToRemoteRuntimeConfig(row), remoteContainerName, imageName, false);
             result.logs += removal.output;
-            appendDeploymentLogBlock(deploymentId, removal.output);
+            DeploymentJournal::appendBlock(deploymentId, removal.output);
             if (!removal.success) {
                 result.error = removal.error.empty() ? "Failed to remove remote runtime before deleting deployment" : removal.error;
                 return result;
@@ -504,7 +487,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             result.runtimeCleanupAttempted = true;
             const auto removal = removeLocalDockerContainer(remoteContainerName);
             result.logs += removal.output;
-            appendDeploymentLogBlock(deploymentId, removal.output);
+            DeploymentJournal::appendBlock(deploymentId, removal.output);
             if (!removal.success) {
                 result.error = removal.error.empty() ? "Failed to remove local Docker runtime before deleting deployment" : removal.error;
                 return result;
@@ -520,7 +503,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             SshService sshService;
             const KubernetesRuntimeInfo removal = sshService.removeKubernetesRuntime(rowToRemoteRuntimeConfig(row), nameSpace, deploymentName, serviceName, exposureMode);
             result.logs += removal.logs;
-            appendDeploymentLogBlock(deploymentId, removal.logs);
+            DeploymentJournal::appendBlock(deploymentId, removal.logs);
             if (!removal.success) {
                 result.error = removal.error.empty() ? "Failed to remove remote Kubernetes runtime before deleting deployment" : removal.error;
                 return result;
@@ -530,7 +513,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             KubernetesService service;
             const KubernetesRuntimeInfo removal = service.remove(nameSpace, deploymentName, serviceName, exposureMode);
             result.logs += removal.logs;
-            appendDeploymentLogBlock(deploymentId, removal.logs);
+            DeploymentJournal::appendBlock(deploymentId, removal.logs);
             if (!removal.success) {
                 result.error = removal.error.empty() ? "Failed to remove runtime before deleting deployment" : removal.error;
                 return result;
@@ -547,7 +530,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 imageRemoval = removeLocalDockerImage(imageName);
             }
             result.logs += imageRemoval.output;
-            appendDeploymentLogBlock(deploymentId, imageRemoval.output);
+            DeploymentJournal::appendBlock(deploymentId, imageRemoval.output);
             if (!imageRemoval.success) {
                 result.error = imageRemoval.error.empty() ? "Failed to remove Docker image" : imageRemoval.error;
                 return result;
@@ -569,7 +552,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 60
             );
             result.logs += cleanup.output;
-            appendDeploymentLogBlock(deploymentId, cleanup.output);
+            DeploymentJournal::appendBlock(deploymentId, cleanup.output);
             if (!cleanup.success) {
                 result.error = cleanup.error.empty() ? "Failed to clean remote build workspace" : cleanup.error;
                 return result;

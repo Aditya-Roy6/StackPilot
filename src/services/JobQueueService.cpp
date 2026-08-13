@@ -4,6 +4,7 @@
 
 #include "JobQueueService.h"
 #include "../utils/StringUtils.h"
+#include "DeploymentJournal.h"
 
 #include "../controllers/LogWebSocketController.h"
 #include "../db/Database.h"
@@ -40,7 +41,6 @@ namespace {
 using strings::trim;
 
 
-std::mutex deploymentLogMutex;
 
 std::string getEnvOrDefault(const char* name, const std::string& fallback) {
     const char* value = std::getenv(name);
@@ -517,110 +517,6 @@ GitHubCheckProbe queryGitHubCheckRuns(const std::string& repoUrl,
     return probe;
 }
 
-void appendDeploymentLog(const std::string& deploymentId, const std::string& line) {
-    std::lock_guard<std::mutex> lock(deploymentLogMutex);
-    try {
-        auto conn = Database::getInstance().getConnection();
-        pqxx::work txn(*conn);
-        txn.exec_params(
-            "UPDATE deployments "
-            "SET logs = COALESCE(logs, '') || $1 || E'\\n', updated_at = NOW() "
-            "WHERE id = $2",
-            line,
-            deploymentId
-        );
-        txn.commit();
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to append queued build log for {}: {}", deploymentId, e.what());
-    }
-}
-
-Json::Value extractPortAdjustments(const std::string& logs) {
-    Json::Value adjustments(Json::arrayValue);
-    const std::string marker = "__STACKPILOT_PORT_ADJUSTED__=";
-    std::size_t offset = 0;
-    while ((offset = logs.find(marker, offset)) != std::string::npos) {
-        const std::size_t payloadStart = offset + marker.size();
-        const std::size_t lineEnd = logs.find('\n', payloadStart);
-        const std::string payload = trim(logs.substr(payloadStart, lineEnd == std::string::npos ? std::string::npos : lineEnd - payloadStart));
-        const std::size_t firstColon = payload.find(':');
-        const std::size_t secondColon = firstColon == std::string::npos ? std::string::npos : payload.find(':', firstColon + 1);
-        if (firstColon != std::string::npos && secondColon != std::string::npos) {
-            Json::Value item;
-            item["key"] = payload.substr(0, firstColon);
-            item["from"] = payload.substr(firstColon + 1, secondColon - firstColon - 1);
-            item["to"] = payload.substr(secondColon + 1);
-            adjustments.append(item);
-        }
-        offset = lineEnd == std::string::npos ? logs.size() : lineEnd + 1;
-    }
-    return adjustments;
-}
-
-Json::Value loadDeploymentSummary(const std::string& deploymentId) {
-    auto conn = Database::getInstance().getConnection();
-    pqxx::work txn(*conn);
-    auto rows = txn.exec_params(
-        "SELECT d.id, p.user_id AS owner_user_id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
-        "d.environment_id, e.name AS environment_name, d.branch, d.commit_sha, d.trigger_source, d.github_delivery_id, "
-        "d.ci_required, d.ci_status, d.logs, d.image_name, "
-        "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
-        "d.desired_replicas, d.runtime_url, d.runtime_exposure, d.runtime_provider, d.remote_container_name, d.created_at "
-        "FROM deployments d "
-        "JOIN projects p ON d.project_id = p.id "
-        "LEFT JOIN project_environments e ON d.environment_id = e.id "
-        "WHERE d.id = $1",
-        deploymentId
-    );
-    txn.commit();
-
-    if (rows.empty()) {
-        return Json::Value();
-    }
-
-    const auto& row = rows[0];
-    Json::Value dep;
-    dep["id"] = row["id"].as<std::string>();
-    // Internal routing field, stripped before the payload is sent.
-    dep["__owner_user_id"] = row["owner_user_id"].as<std::string>();
-    dep["project_id"] = row["project_id"].as<std::string>();
-    dep["project_name"] = row["project_name"].as<std::string>();
-    dep["repo_url"] = row["repo_url"].is_null() ? "" : row["repo_url"].as<std::string>();
-    dep["status"] = row["status"].as<std::string>();
-    dep["version"] = row["version"].as<std::string>();
-    dep["commit_hash"] = row["commit_hash"].as<std::string>();
-    dep["environment_id"] = row["environment_id"].is_null() ? "" : row["environment_id"].as<std::string>();
-    dep["environment_name"] = row["environment_name"].is_null() ? "" : row["environment_name"].as<std::string>();
-    dep["branch"] = row["branch"].is_null() ? "" : row["branch"].as<std::string>();
-    dep["commit_sha"] = row["commit_sha"].is_null() ? "" : row["commit_sha"].as<std::string>();
-    dep["trigger_source"] = row["trigger_source"].is_null() ? "manual" : row["trigger_source"].as<std::string>();
-    dep["github_delivery_id"] = row["github_delivery_id"].is_null() ? "" : row["github_delivery_id"].as<std::string>();
-    dep["ci_required"] = row["ci_required"].is_null() ? false : row["ci_required"].as<bool>();
-    dep["ci_status"] = row["ci_status"].is_null() ? "not_required" : row["ci_status"].as<std::string>();
-    dep["port_adjustments"] = row["logs"].is_null() ? Json::Value(Json::arrayValue) : extractPortAdjustments(row["logs"].as<std::string>());
-    dep["image_name"] = row["image_name"].is_null() ? "" : row["image_name"].as<std::string>();
-    dep["k8s_namespace"] = row["k8s_namespace"].is_null() ? "" : row["k8s_namespace"].as<std::string>();
-    dep["k8s_deployment_name"] = row["k8s_deployment_name"].is_null() ? "" : row["k8s_deployment_name"].as<std::string>();
-    dep["k8s_service_name"] = row["k8s_service_name"].is_null() ? "" : row["k8s_service_name"].as<std::string>();
-    dep["k8s_ingress_name"] = row["k8s_ingress_name"].is_null() ? "" : row["k8s_ingress_name"].as<std::string>();
-    dep["desired_replicas"] = row["desired_replicas"].is_null() ? 1 : row["desired_replicas"].as<int>();
-    dep["runtime_url"] = row["runtime_url"].is_null() ? "" : row["runtime_url"].as<std::string>();
-    dep["runtime_exposure"] = row["runtime_exposure"].is_null() ? "" : row["runtime_exposure"].as<std::string>();
-    dep["runtime_provider"] = row["runtime_provider"].is_null() ? "" : row["runtime_provider"].as<std::string>();
-    dep["remote_container_name"] = row["remote_container_name"].is_null() ? "" : row["remote_container_name"].as<std::string>();
-    dep["created_at"] = row["created_at"].as<std::string>();
-    return dep;
-}
-
-void broadcastDeploymentSummary(const std::string& deploymentId) {
-    Json::Value summary = loadDeploymentSummary(deploymentId);
-    if (!summary.isNull()) {
-        const std::string ownerUserId = summary.get("__owner_user_id", "").asString();
-        summary.removeMember("__owner_user_id");
-        LogWebSocketController::broadcastDeploymentUpdate(summary, ownerUserId);
-    }
-}
-
 SshConnectionConfig rowToSshConfig(const pqxx::row& row,
                                    const std::string& prefix,
                                    const std::string& fallbackConnectionType = "ssh") {
@@ -730,7 +626,7 @@ Json::Value JobQueueService::enqueueDeploymentBuild(const std::string& deploymen
 
     pushRedisJob(jobId);
     LogWebSocketController::broadcastStatus(deploymentId, "queued");
-    broadcastDeploymentSummary(deploymentId);
+    DeploymentJournal::broadcastSummary(deploymentId);
     LogWebSocketController::broadcastLog(deploymentId, queuedLog);
 
     Json::Value job;
@@ -930,7 +826,7 @@ void JobQueueService::failJob(const DeploymentJobRecord& job, const std::string&
             txn.commit();
             pushRedisJob(job.id);
             LogWebSocketController::broadcastStatus(job.deploymentId, "queued");
-            broadcastDeploymentSummary(job.deploymentId);
+            DeploymentJournal::broadcastSummary(job.deploymentId);
             return;
         }
 
@@ -1006,9 +902,9 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
         const std::string githubTokenForCi = !projectTokenForCi.empty() ? projectTokenForCi : linkedGitHubTokenForCi;
         if (shouldSkipDeploymentJob(deploymentStatus)) {
             txn.commit();
-            appendDeploymentLog(job.deploymentId, "Deployment job skipped because this deployment is " + deploymentStatus + ".");
+            DeploymentJournal::appendLine(job.deploymentId, "Deployment job skipped because this deployment is " + deploymentStatus + ".");
             completeJob(job);
-            broadcastDeploymentSummary(job.deploymentId);
+            DeploymentJournal::broadcastSummary(job.deploymentId);
             return;
         }
         if (ciRequired && ciStatus == "pending" &&
@@ -1045,7 +941,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     );
                     txn.commit();
                     LogWebSocketController::broadcastStatus(job.deploymentId, "blocked");
-                    broadcastDeploymentSummary(job.deploymentId);
+                    DeploymentJournal::broadcastSummary(job.deploymentId);
                     return;
                 }
                 if (probe.hasChecks) {
@@ -1062,7 +958,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                         txn.commit();
                         failJob(job, "GitHub checks failed", false);
                         LogWebSocketController::broadcastStatus(job.deploymentId, "failed_ci");
-                        broadcastDeploymentSummary(job.deploymentId);
+                        DeploymentJournal::broadcastSummary(job.deploymentId);
                         return;
                     }
                     if (probe.pending) {
@@ -1082,7 +978,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                         );
                         txn.commit();
                         LogWebSocketController::broadcastStatus(job.deploymentId, "blocked");
-                        broadcastDeploymentSummary(job.deploymentId);
+                        DeploymentJournal::broadcastSummary(job.deploymentId);
                         return;
                     }
                     txn.exec_params(
@@ -1122,7 +1018,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 );
                 txn.commit();
                 LogWebSocketController::broadcastStatus(job.deploymentId, "blocked");
-                broadcastDeploymentSummary(job.deploymentId);
+                DeploymentJournal::broadcastSummary(job.deploymentId);
                 return;
             }
         }
@@ -1146,7 +1042,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 txn.commit();
                 completeJob(job);
                 LogWebSocketController::broadcastStatus(job.deploymentId, "superseded");
-                broadcastDeploymentSummary(job.deploymentId);
+                DeploymentJournal::broadcastSummary(job.deploymentId);
                 return;
             }
         }
@@ -1328,11 +1224,11 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
         txn.commit();
 
         LogWebSocketController::broadcastStatus(job.deploymentId, "building");
-        broadcastDeploymentSummary(job.deploymentId);
+        DeploymentJournal::broadcastSummary(job.deploymentId);
 
         BuildService buildService;
         const auto logSink = [deploymentId = job.deploymentId](const std::string& line) {
-            appendDeploymentLog(deploymentId, line);
+            DeploymentJournal::appendLine(deploymentId, line);
             LogWebSocketController::broadcastLog(deploymentId, line);
         };
 
@@ -1781,11 +1677,11 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     DeploymentCleanupService cleanupService;
                     const auto cleanup = cleanupService.cleanupDeployment(job.userId, job.deploymentId, cleanupOptions);
                     if (!cleanup.success) {
-                        appendDeploymentLog(job.deploymentId, "Superseded runtime cleanup failed: " + cleanup.error);
+                        DeploymentJournal::appendLine(job.deploymentId, "Superseded runtime cleanup failed: " + cleanup.error);
                     }
                     completeJob(job);
                     LogWebSocketController::broadcastStatus(job.deploymentId, "superseded");
-                    broadcastDeploymentSummary(job.deploymentId);
+                    DeploymentJournal::broadcastSummary(job.deploymentId);
                     return;
                 }
 
@@ -1831,7 +1727,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
             LogWebSocketController::broadcastStatus(job.deploymentId, "failed");
         }
         updateTxn.commit();
-        broadcastDeploymentSummary(job.deploymentId);
+        DeploymentJournal::broadcastSummary(job.deploymentId);
 
         if (buildResult.success) {
             if (cleanupPreviousDeployment && !deploymentToRetire.empty() && deploymentToRetire != job.deploymentId) {
@@ -1861,7 +1757,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                         );
                     }
                     cleanupTxn.commit();
-                    broadcastDeploymentSummary(deploymentToRetire);
+                    DeploymentJournal::broadcastSummary(deploymentToRetire);
                 } catch (const std::exception& cleanupDbError) {
                     spdlog::warn("Failed to persist replacement cleanup result for {}: {}", deploymentToRetire, cleanupDbError.what());
                 }
@@ -1882,7 +1778,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
             );
             txn.commit();
             LogWebSocketController::broadcastStatus(job.deploymentId, "failed");
-            broadcastDeploymentSummary(job.deploymentId);
+            DeploymentJournal::broadcastSummary(job.deploymentId);
         } catch (const std::exception& dbError) {
             spdlog::error("Failed to persist worker failure for {}: {}", job.deploymentId, dbError.what());
         }

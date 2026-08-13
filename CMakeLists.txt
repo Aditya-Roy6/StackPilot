@@ -78,6 +78,11 @@ if(STACKPILOT_BUILD_TESTS)
         src/db/Database.cpp
         src/services/ComposeKubernetesPlanner.cpp
         src/utils/RuntimeRateLimiter.cpp
+        src/services/LocalDockerRuntime.cpp
+        src/services/DeploymentJournal.cpp
+        src/services/SshService.cpp
+        src/controllers/LogWebSocketController.cpp
+        src/utils/TokenCrypto.cpp
     )
 
     target_include_directories(stackpilot_unit_tests PRIVATE

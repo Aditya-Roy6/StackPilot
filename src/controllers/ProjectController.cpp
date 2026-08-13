@@ -4,6 +4,7 @@
 
 #include "ProjectController.h"
 #include "../utils/StringUtils.h"
+#include "../services/DeploymentJournal.h"
 #include "LogWebSocketController.h"
 #include "../db/Database.h"
 #include "../services/ApplicationCatalog.h"
@@ -42,7 +43,6 @@ namespace {
 using strings::trim;
 
 
-std::mutex projectDeploymentLogMutex;
 
 bool isSupportedSourceType(const std::string& sourceType) {
     return sourceType == "github" || sourceType == "ssh" || sourceType == "local" ||
@@ -806,86 +806,6 @@ void replaceProjectEnvVars(pqxx::transaction_base& txn,
     }
 }
 
-void appendDeploymentLog(const std::string& deploymentId, const std::string& line) {
-    std::lock_guard<std::mutex> lock(projectDeploymentLogMutex);
-
-    try {
-        auto& db = Database::getInstance();
-        auto conn = db.getConnection();
-        pqxx::work txn(*conn);
-        txn.exec_params(
-            "UPDATE deployments "
-            "SET logs = COALESCE(logs, '') || $1 || E'\\n', updated_at = NOW() "
-            "WHERE id = $2",
-            line,
-            deploymentId
-        );
-        txn.commit();
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to append deployment log for {}: {}", deploymentId, e.what());
-    }
-}
-
-void appendDeploymentLogBlock(const std::string& deploymentId, const std::string& block) {
-    std::istringstream stream(block);
-    std::string line;
-    while (std::getline(stream, line)) {
-        if (!line.empty()) {
-            appendDeploymentLog(deploymentId, line);
-        }
-    }
-}
-
-Json::Value loadDeploymentSummary(const std::string& deploymentId) {
-    auto& db = Database::getInstance();
-    auto conn = db.getConnection();
-    pqxx::work txn(*conn);
-    auto rows = txn.exec_params(
-        "SELECT d.id, p.user_id AS owner_user_id, d.project_id, p.name AS project_name, d.status, d.version, d.commit_hash, d.image_name, "
-        "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
-        "d.desired_replicas, d.runtime_url, d.runtime_exposure, d.created_at "
-        "FROM deployments d "
-        "JOIN projects p ON d.project_id = p.id "
-        "WHERE d.id = $1",
-        deploymentId
-    );
-    txn.commit();
-
-    if (rows.empty()) {
-        return Json::Value();
-    }
-
-    const auto& row = rows[0];
-    Json::Value dep;
-    dep["id"] = row["id"].as<std::string>();
-    // Internal routing field, stripped before the payload is sent.
-    dep["__owner_user_id"] = row["owner_user_id"].as<std::string>();
-    dep["project_id"] = row["project_id"].as<std::string>();
-    dep["project_name"] = row["project_name"].as<std::string>();
-    dep["status"] = row["status"].as<std::string>();
-    dep["version"] = row["version"].as<std::string>();
-    dep["commit_hash"] = row["commit_hash"].as<std::string>();
-    dep["image_name"] = row["image_name"].is_null() ? "" : row["image_name"].as<std::string>();
-    dep["k8s_namespace"] = row["k8s_namespace"].is_null() ? "" : row["k8s_namespace"].as<std::string>();
-    dep["k8s_deployment_name"] = row["k8s_deployment_name"].is_null() ? "" : row["k8s_deployment_name"].as<std::string>();
-    dep["k8s_service_name"] = row["k8s_service_name"].is_null() ? "" : row["k8s_service_name"].as<std::string>();
-    dep["k8s_ingress_name"] = row["k8s_ingress_name"].is_null() ? "" : row["k8s_ingress_name"].as<std::string>();
-    dep["desired_replicas"] = row["desired_replicas"].is_null() ? 1 : row["desired_replicas"].as<int>();
-    dep["runtime_url"] = row["runtime_url"].is_null() ? "" : row["runtime_url"].as<std::string>();
-    dep["runtime_exposure"] = row["runtime_exposure"].is_null() ? "" : row["runtime_exposure"].as<std::string>();
-    dep["created_at"] = row["created_at"].as<std::string>();
-    return dep;
-}
-
-void broadcastDeploymentSummary(const std::string& deploymentId) {
-    Json::Value summary = loadDeploymentSummary(deploymentId);
-    if (!summary.isNull()) {
-        const std::string ownerUserId = summary.get("__owner_user_id", "").asString();
-        summary.removeMember("__owner_user_id");
-        LogWebSocketController::broadcastDeploymentUpdate(summary, ownerUserId);
-    }
-}
-
 void startBackgroundBuild(const std::string& deploymentId,
                           const std::string& sourceType,
                           const std::string& repoUrl,
@@ -904,7 +824,7 @@ void startBackgroundBuild(const std::string& deploymentId,
         try {
             BuildService buildService;
             const auto logSink = [deploymentId](const std::string& line) {
-                appendDeploymentLog(deploymentId, line);
+                DeploymentJournal::appendLine(deploymentId, line);
                 LogWebSocketController::broadcastLog(deploymentId, line);
             };
 
@@ -1200,7 +1120,7 @@ void startBackgroundBuild(const std::string& deploymentId,
                 LogWebSocketController::broadcastStatus(deploymentId, "failed");
             }
             updateTxn.commit();
-            broadcastDeploymentSummary(deploymentId);
+            DeploymentJournal::broadcastSummary(deploymentId);
         } catch (const std::exception& e) {
             spdlog::error("Background build error for {}: {}", deploymentId, e.what());
             try {
@@ -1214,7 +1134,7 @@ void startBackgroundBuild(const std::string& deploymentId,
                 );
                 updateTxn.commit();
                 LogWebSocketController::broadcastStatus(deploymentId, "failed");
-                broadcastDeploymentSummary(deploymentId);
+                DeploymentJournal::broadcastSummary(deploymentId);
             } catch (const std::exception& dbError) {
                 spdlog::error("Failed to persist env auto-build failure for {}: {}", deploymentId, dbError.what());
             }
