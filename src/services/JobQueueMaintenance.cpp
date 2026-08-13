@@ -12,6 +12,7 @@
 #include "JobQueueService.h"
 
 #include "CostModel.h"
+#include "DeploymentCleanupService.h"
 #include "PreviewEnvironments.h"
 #include "../db/Database.h"
 #include "../utils/StringUtils.h"
@@ -20,6 +21,8 @@
 #include <pqxx/pqxx>
 #include <spdlog/spdlog.h>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace stackpilot {
 namespace {
@@ -77,8 +80,31 @@ void sampleRunningDeployments(pqxx::transaction_base& txn) {
     }
 }
 
-/// Flags previews past their TTL. Actual teardown is the cleanup service's
-/// job; this only decides that a preview's time is up.
+/// Deletes samples and drift checks past their retention window.
+///
+/// Without this both tables grow forever: one cost sample per running
+/// deployment per minute is ~525,000 rows per deployment per year. Nothing
+/// fails when that happens — the cost query just gets slower every week, which
+/// is the kind of problem that gets diagnosed as "the dashboard is slow" a year
+/// after the cause.
+void pruneOldTelemetry(pqxx::transaction_base& txn, int retentionDays) {
+    const std::string window = std::to_string(retentionDays) + " days";
+    txn.exec_params(
+        "DELETE FROM deployment_cost_samples WHERE sampled_at < NOW() - $1::interval", window);
+    // Always keep the newest check per deployment regardless of age, so a
+    // deployment nobody has touched in months still reports its last known
+    // state rather than showing "never checked".
+    txn.exec_params(
+        "DELETE FROM deployment_drift_checks d "
+        "WHERE d.checked_at < NOW() - $1::interval "
+        "AND d.id <> (SELECT id FROM deployment_drift_checks n "
+        "             WHERE n.deployment_id = d.deployment_id "
+        "             ORDER BY n.checked_at DESC LIMIT 1)",
+        window);
+}
+
+/// Flags previews past their TTL. Actual teardown is performed by
+/// tearDownExpiredPreviews below; this only decides that a preview's time is up.
 int expirePreviews(pqxx::transaction_base& txn) {
     const auto result = txn.exec(
         "UPDATE deployments SET status = 'pending_teardown', "
@@ -90,10 +116,83 @@ int expirePreviews(pqxx::transaction_base& txn) {
     return static_cast<int>(result.affected_rows());
 }
 
+/// Actually destroys previews marked `pending_teardown`.
+///
+/// This is the half that was missing: the webhook and the TTL sweep both wrote
+/// `pending_teardown` and nothing ever read it, so previews were marked for
+/// destruction and then quietly kept running. Nothing errors in that state —
+/// the row says the right thing while the container bills forever, which is
+/// exactly the failure mode preview environments are notorious for.
+///
+/// Runs outside the maintenance transaction because cleanup shells out to
+/// Docker and kubectl and can take tens of seconds per deployment.
+int tearDownExpiredPreviews() {
+    std::vector<std::pair<std::string, std::string>> pending;  // deploymentId, ownerUserId
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+        // Cleanup is access-gated, so it needs a user who can see the project.
+        // The project owner always can, which keeps automated teardown inside
+        // the same authorization model rather than bypassing it.
+        const auto rows = txn.exec(
+            "SELECT d.id, p.user_id FROM deployments d JOIN projects p ON p.id = d.project_id "
+            "WHERE d.is_preview AND d.status = 'pending_teardown' LIMIT 20"
+        );
+        for (const auto& row : rows) {
+            pending.emplace_back(row["id"].as<std::string>(), row["user_id"].as<std::string>());
+        }
+        txn.commit();
+    } catch (const std::exception& e) {
+        spdlog::warn("Could not list previews awaiting teardown: {}", e.what());
+        return 0;
+    }
+
+    int destroyed = 0;
+    for (const auto& [deploymentId, ownerUserId] : pending) {
+        try {
+            DeploymentCleanupService cleanup;
+            DeploymentCleanupOptions options;
+            options.deleteImage = true;
+            options.deleteRemoteWorkspace = true;
+            // The row is kept: a destroyed preview is still the record of what
+            // that pull request cost, and deleting it would take its cost
+            // samples with it via the foreign key.
+            options.deleteDatabaseRow = false;
+
+            const DeploymentCleanupResult result =
+                cleanup.cleanupDeployment(ownerUserId, deploymentId, options);
+
+            auto conn = Database::getInstance().getConnection();
+            pqxx::work txn(*conn);
+            if (result.success) {
+                txn.exec_params(
+                    "UPDATE deployments SET status = 'destroyed', runtime_url = '', updated_at = NOW(), "
+                    "logs = COALESCE(logs, '') || 'Preview environment torn down.' || E'\\n' "
+                    "WHERE id = $1", deploymentId);
+                ++destroyed;
+            } else {
+                // Leave it pending so the next tick retries. A preview that
+                // cannot be destroyed must keep asking rather than be marked
+                // done and forgotten.
+                txn.exec_params(
+                    "UPDATE deployments SET updated_at = NOW(), "
+                    "logs = COALESCE(logs, '') || $2 || E'\\n' WHERE id = $1",
+                    deploymentId,
+                    "Preview teardown attempt failed, will retry: " + result.error);
+            }
+            txn.commit();
+        } catch (const std::exception& e) {
+            spdlog::warn("Preview teardown failed for {}: {}", deploymentId, e.what());
+        }
+    }
+    return destroyed;
+}
+
 }  // namespace
 
 void JobQueueService::maintenanceLoop() {
     const int intervalSeconds = envInt("STACKPILOT_MAINTENANCE_INTERVAL_SECONDS", kSampleWindowSeconds);
+    const int retentionDays = envInt("STACKPILOT_TELEMETRY_RETENTION_DAYS", 90);
     spdlog::info("Deployment maintenance worker online (every {}s)", intervalSeconds);
 
     while (running_) {
@@ -108,9 +207,16 @@ void JobQueueService::maintenanceLoop() {
             pqxx::work txn(*conn);
             sampleRunningDeployments(txn);
             const int expired = expirePreviews(txn);
+            pruneOldTelemetry(txn, retentionDays);
             txn.commit();
             if (expired > 0) {
                 spdlog::info("Expired {} preview environment(s)", expired);
+            }
+
+            // Outside the transaction above: this shells out per deployment.
+            const int destroyed = tearDownExpiredPreviews();
+            if (destroyed > 0) {
+                spdlog::info("Tore down {} preview environment(s)", destroyed);
             }
         } catch (const std::exception& e) {
             // Never fatal. Losing a sample under-reports cost slightly; killing

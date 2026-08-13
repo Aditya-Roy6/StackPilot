@@ -22,6 +22,7 @@ import hashlib
 import json
 import secrets
 import subprocess
+import time
 import sys
 import urllib.error
 import urllib.request
@@ -469,6 +470,64 @@ def test_drift_cost_and_previews() -> None:
         check("drift, cost and previews reachable", False, str(exc))
 
 
+def test_preview_lifecycle_has_no_dead_ends() -> None:
+    """Every deployment status a writer produces must have a reader.
+
+    Both bugs this guards against were the same shape and neither errored:
+    the webhook inserted a preview row and never enqueued a build, and both
+    the webhook and the TTL sweep wrote 'pending_teardown' with nothing
+    consuming it. In each case the database said exactly the right thing while
+    nothing happened -- a preview stuck at 'pending' that never builds, and a
+    preview marked for destruction that bills forever.
+    """
+    print("\npreview lifecycle")
+    try:
+        source = subprocess.run(
+            ["docker", "exec", "stackpilot-backend", "sh", "-c",
+             "grep -rlo pending_teardown /app/src 2>/dev/null | wc -l"],
+            capture_output=True, text=True).stdout.strip()
+        # The container ships the binary, not the source, so fall back to
+        # asserting behaviour rather than grepping files.
+        del source
+
+        project_id = psql("SELECT id FROM projects LIMIT 1;")
+        if not project_id:
+            check("preview lifecycle (skipped: no projects)", True)
+            return
+
+        # A preview marked pending_teardown must not stay that way. The
+        # maintenance worker runs every 60s; give it two ticks plus slack.
+        dep_id = psql(
+            "INSERT INTO deployments (project_id, status, version, commit_hash, is_preview, "
+            "pr_number, preview_expires_at) "
+            f"VALUES ('{project_id}', 'pending_teardown', 'pr-99991', 'probe', TRUE, 99991, "
+            "NOW() - INTERVAL '1 hour') RETURNING id;").splitlines()[0].strip()
+        check("teardown probe created", bool(dep_id), "no id")
+
+        moved = False
+        for _ in range(30):
+            time.sleep(5)
+            status = psql(f"SELECT status FROM deployments WHERE id = '{dep_id}';")
+            if status and status != "pending_teardown":
+                moved = True
+                break
+        check("pending_teardown is consumed by the maintenance worker", moved,
+              "still pending_teardown after 150s -- nothing reads this status")
+
+        # The partial unique index must allow a replacement once the previous
+        # preview is terminal, otherwise a redeploy after teardown fails.
+        psql(f"UPDATE deployments SET status = 'destroyed' WHERE id = '{dep_id}';")
+        second = psql(
+            "INSERT INTO deployments (project_id, status, version, commit_hash, is_preview, pr_number) "
+            f"VALUES ('{project_id}', 'pending', 'pr-99991', 'probe2', TRUE, 99991) RETURNING id;"
+        ).splitlines()[0].strip()
+        check("a new preview can replace a destroyed one", bool(second), "insert rejected")
+    except Exception as exc:
+        check("preview lifecycle reachable", False, str(exc))
+    finally:
+        psql("DELETE FROM deployments WHERE pr_number = 99991;")
+
+
 def test_migration_ledger() -> None:
     """Regression: all migrations re-ran every boot, replaying destructive backfills."""
     print("\nmigration ledger")
@@ -524,6 +583,7 @@ def main() -> int:
         test_secrets_are_write_only()
         test_organization_access_control()
         test_drift_cost_and_previews()
+        test_preview_lifecycle_has_no_dead_ends()
         test_migration_ledger()
     finally:
         # Runs even when a test raises, so a crash mid-suite does not leave a

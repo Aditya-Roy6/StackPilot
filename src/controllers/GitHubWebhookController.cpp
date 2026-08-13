@@ -570,7 +570,18 @@ void GitHubWebhookController::handleWebhook(
                             std::to_string(preview.prNumber) + " (" + decision.reason + ").\n"
                     );
                     if (!inserted.empty()) {
-                        entry["deployment_id"] = inserted[0][0].as<std::string>();
+                        const std::string previewDeploymentId = inserted[0][0].as<std::string>();
+                        entry["deployment_id"] = previewDeploymentId;
+                        // Insert without enqueue leaves the preview sitting at
+                        // 'pending' forever -- a row that says the right thing
+                        // while nothing builds. Enqueued after commit, below,
+                        // so the worker cannot pick it up before it exists.
+                        pendingEnqueues.push_back(PendingEnqueue{
+                            previewDeploymentId,
+                            row["user_id"].as<std::string>(),
+                            "Preview environment queued for pull request #" +
+                                std::to_string(preview.prNumber) + "."
+                        });
                     }
                 }
 
@@ -578,6 +589,11 @@ void GitHubWebhookController::handleWebhook(
             }
 
             txn.commit();
+            for (const auto& enqueue : pendingEnqueues) {
+                JobQueueService::getInstance().enqueueDeploymentBuild(
+                    enqueue.deploymentId, enqueue.userId, enqueue.message);
+            }
+
             Json::Value body = okPayload("Pull request event processed");
             body["previews"] = handled;
             callback(drogon::HttpResponse::newHttpJsonResponse(body));
