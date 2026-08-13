@@ -1480,10 +1480,18 @@ export default function AiAgentPage() {
             <DialogDescription>Configure provider keys, model, reasoning mode, project context, and deployment context.</DialogDescription>
           </DialogHeader>
 
-          <div className="grid gap-3">
-            <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-5">
+            {/* ── 1. How it answers ─────────────────────────────── */}
+            <section className="space-y-3">
+              <div>
+                <h3 className="text-sm font-medium">How it answers</h3>
+                <p className="text-xs text-muted-foreground">
+                  Applies immediately. No need to save.
+                </p>
+              </div>
+
               <div className="space-y-2">
-                <Label>Mode</Label>
+                <Label>Reasoning mode</Label>
                 <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-muted/30 p-1">
                   <Button
                     type="button"
@@ -1508,6 +1516,51 @@ export default function AiAgentPage() {
                     Thinking
                   </Button>
                 </div>
+                {/* Sits under the control it describes, rather than at the
+                    bottom of the dialog where it read as a general footnote. */}
+                <p className="text-xs text-muted-foreground">
+                  {mode === "fast"
+                    ? "Quick replies for chat and simple commands. Switching modes also picks a matching model."
+                    : "Slower and more careful. Use for diagnosing failures, planning Dockerfiles, and deployment decisions."}
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label>Model</Label>
+                <div className="relative">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full justify-between"
+                    onClick={() => {
+                      setSettingsModelOpen((open) => !open);
+                      setProjectOpen(false);
+                      setDeploymentOpen(false);
+                      setComposerModelOpen(false);
+                    }}
+                  >
+                    <span className="truncate">{modelLabel(activeModel)}</span>
+                    <ChevronDown className="h-4 w-4" />
+                  </Button>
+                  {settingsModelOpen && (
+                    <div className="absolute left-0 right-0 top-full z-50 mt-2">
+                      {renderModelPicker(closePickers)}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            {/* ── 2. Where it runs ──────────────────────────────── */}
+            <section className="space-y-3 border-t border-border pt-4">
+              <div>
+                <h3 className="text-sm font-medium">Where it runs</h3>
+                <p className="text-xs text-muted-foreground">
+                  Which service answers, and the key used to reach it.
+                  {/* The one genuinely confusing thing about the old layout:
+                      the button looked like it saved the whole dialog. */}{" "}
+                  Changes here need saving.
+                </p>
               </div>
 
               <div className="space-y-2">
@@ -1525,35 +1578,62 @@ export default function AiAgentPage() {
                     variant={provider === "openai_compatible" ? "default" : "ghost"}
                     onClick={() => setProvider("openai_compatible")}
                   >
-                    Compatible
+                    OpenAI-compatible
                   </Button>
                 </div>
               </div>
-            </div>
 
-            <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge variant="outline">{modelsQuery.data?.provider || provider}</Badge>
-                <Badge variant="outline">{modelsQuery.data?.source || "loading"}</Badge>
-                <Badge variant={settingsQuery.data?.has_nvidia_key ? "default" : "outline"}>
-                  NVIDIA {settingsQuery.data?.has_nvidia_key ? "key detected" : "env key missing"}
-                </Badge>
-                {provider === "openai_compatible" && (
-                  <Badge variant={settingsQuery.data?.has_openai_compatible_key ? "default" : "outline"}>
-                    Compatible {settingsQuery.data?.has_openai_compatible_key ? "key saved" : "key not saved"}
-                  </Badge>
+              {/* Plain language instead of the raw `nvidia_nim` /
+                  `provider_verified` identifiers the old badges printed. */}
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                {provider === "nvidia_nim" ? (
+                  settingsQuery.data?.has_nvidia_key ? (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-600 dark:text-emerald-400">
+                      <Check className="h-3 w-3" />
+                      NVIDIA key found
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-1 text-destructive">
+                      No NVIDIA key — set NVIDIA_API_KEY on the server
+                    </span>
+                  )
+                ) : settingsQuery.data?.has_openai_compatible_key ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-600 dark:text-emerald-400">
+                    <Check className="h-3 w-3" />
+                    API key saved
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-muted-foreground">
+                    No API key saved yet
+                  </span>
+                )}
+                {/* Where the model list came from. `fallback` means the probe
+                    failed and we are showing a built-in list, which is worth
+                    saying — a model that is not actually available otherwise
+                    fails later, at send time, with a confusing error. */}
+                {modelsQuery.data?.source === "provider_verified" && (
+                  <span className="text-muted-foreground">Model list confirmed with the provider</span>
+                )}
+                {(modelsQuery.data?.source === "fallback" ||
+                  modelsQuery.data?.source === "fallback_probe_failed") && (
+                  <span className="text-amber-600 dark:text-amber-400">
+                    Could not reach the provider — showing a built-in model list
+                  </span>
                 )}
               </div>
 
               {provider === "openai_compatible" && (
-                <div className="grid gap-2 sm:grid-cols-2">
+                <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 sm:grid-cols-2">
                   <div className="space-y-2 sm:col-span-2">
-                    <Label>OpenAI-compatible base URL</Label>
+                    <Label>Base URL</Label>
                     <Input
                       value={compatibleBaseUrl}
                       onChange={(event) => setCompatibleBaseUrl(event.target.value)}
-                      placeholder="https://api.openai.com/v1 or provider /v1 endpoint"
+                      placeholder="https://api.openai.com/v1"
                     />
+                    <p className="text-xs text-muted-foreground">
+                      Must be HTTPS. Private and loopback addresses are rejected.
+                    </p>
                   </div>
                   <div className="space-y-2">
                     <Label>Model ID</Label>
@@ -1563,7 +1643,7 @@ export default function AiAgentPage() {
                         setCompatibleModel(event.target.value);
                         setSelectedModel(event.target.value);
                       }}
-                      placeholder="gpt-4o-mini, claude..., gemini..."
+                      placeholder="gpt-4o-mini"
                     />
                   </div>
                   <div className="space-y-2">
@@ -1574,7 +1654,7 @@ export default function AiAgentPage() {
                       onChange={(event) => setCompatibleApiKey(event.target.value)}
                       placeholder={
                         settingsQuery.data?.has_openai_compatible_key
-                          ? "Leave blank to keep saved key"
+                          ? "Leave blank to keep the saved key"
                           : "Paste API key"
                       }
                     />
@@ -1582,159 +1662,148 @@ export default function AiAgentPage() {
                 </div>
               )}
 
-              <div className="flex justify-end">
+              <div className="flex items-center justify-end gap-3">
+                {saveSettingsMutation.isSuccess && !saveSettingsMutation.isPending && (
+                  <span className="text-xs text-muted-foreground">Saved</span>
+                )}
                 <Button
                   type="button"
                   onClick={() => saveSettingsMutation.mutate()}
                   disabled={saveSettingsMutation.isPending}
                 >
-                  {saveSettingsMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-                  Save AI settings
+                  {saveSettingsMutation.isPending ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Check className="h-4 w-4" />
+                  )}
+                  Save provider
                 </Button>
               </div>
               {saveSettingsMutation.isError && (
                 <p className="text-xs text-destructive">
-                  {errorMessage(saveSettingsMutation.error, "Failed to save AI settings.")}
+                  {errorMessage(saveSettingsMutation.error, "Could not save provider settings.")}
                 </p>
               )}
-            </div>
+            </section>
 
-            <div className="space-y-2">
-              <Label>Model</Label>
-              <div className="relative">
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="w-full justify-between"
-                  onClick={() => {
-                    setSettingsModelOpen((open) => !open);
-                    setProjectOpen(false);
-                    setDeploymentOpen(false);
-                    setComposerModelOpen(false);
-                  }}
-                >
-                  <span className="truncate">{modelLabel(activeModel)}</span>
-                  <ChevronDown className="h-4 w-4" />
-                </Button>
-                {settingsModelOpen && (
-                  <div className="absolute left-0 right-0 top-full z-50 mt-2">
-                    {renderModelPicker(closePickers)}
-                  </div>
-                )}
+            {/* ── 3. What it can see ────────────────────────────── */}
+            <section className="space-y-3 border-t border-border pt-4">
+              <div>
+                <h3 className="text-sm font-medium">What it can see</h3>
+                <p className="text-xs text-muted-foreground">
+                  Scopes the agent to one project or deployment so it stops guessing which you mean.
+                  Applies immediately.
+                </p>
               </div>
-            </div>
 
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label>Project Context</Label>
-                <div className="relative">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="w-full justify-between"
-                    onClick={() => {
-                      setProjectOpen((open) => !open);
-                      setSettingsModelOpen(false);
-                      setDeploymentOpen(false);
-                      setComposerModelOpen(false);
-                    }}
-                  >
-                    <span className="truncate">{selectedProject?.name || "No project selected"}</span>
-                    <ChevronDown className="h-4 w-4" />
-                  </Button>
-                  {projectOpen && (
-                    <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSelectedProjectId("");
-                          setProjectOpen(false);
-                        }}
-                        className="flex min-h-9 w-full items-center rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
-                      >
-                        No project selected
-                        {!selectedProjectId && <Check className="ml-auto h-4 w-4" />}
-                      </button>
-                      <div className="my-1 h-px bg-border" />
-                      {projects.map((project) => (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>Project</Label>
+                  <div className="relative">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="w-full justify-between"
+                      onClick={() => {
+                        setProjectOpen((open) => !open);
+                        setSettingsModelOpen(false);
+                        setDeploymentOpen(false);
+                        setComposerModelOpen(false);
+                      }}
+                    >
+                      <span className="truncate">{selectedProject?.name || "Any project"}</span>
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                    {projectOpen && (
+                      <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
                         <button
-                          key={project.id}
                           type="button"
                           onClick={() => {
-                            setSelectedProjectId(project.id);
+                            setSelectedProjectId("");
                             setProjectOpen(false);
                           }}
-                          className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                          className="flex min-h-9 w-full items-center rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                         >
-                          <span className="min-w-0 truncate">{project.name}</span>
-                          {project.id === selectedProjectId && <Check className="ml-auto h-4 w-4" />}
+                          Any project
+                          {!selectedProjectId && <Check className="ml-auto h-4 w-4" />}
                         </button>
-                      ))}
-                    </div>
-                  )}
+                        <div className="my-1 h-px bg-border" />
+                        {projects.map((project) => (
+                          <button
+                            key={project.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedProjectId(project.id);
+                              setProjectOpen(false);
+                            }}
+                            className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                          >
+                            <span className="min-w-0 truncate">{project.name}</span>
+                            {project.id === selectedProjectId && <Check className="ml-auto h-4 w-4" />}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
 
-              <div className="space-y-2">
-                <Label>Deployment Context</Label>
-                <div className="relative">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="w-full justify-between"
-                    onClick={() => {
-                      setDeploymentOpen((open) => !open);
-                      setSettingsModelOpen(false);
-                      setProjectOpen(false);
-                      setComposerModelOpen(false);
-                    }}
-                  >
-                    <span className="truncate">
-                      {selectedDeployment
-                        ? `${selectedDeployment.project_name} | ${selectedDeployment.status}`
-                        : "No deployment selected"}
-                    </span>
-                    <ChevronDown className="h-4 w-4" />
-                  </Button>
-                  {deploymentOpen && (
-                    <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setSelectedDeploymentId("");
-                          setDeploymentOpen(false);
-                        }}
-                        className="flex min-h-9 w-full items-center rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
-                      >
-                        No deployment selected
-                        {!selectedDeploymentId && <Check className="ml-auto h-4 w-4" />}
-                      </button>
-                      <div className="my-1 h-px bg-border" />
-                      {deployments.map((deployment) => (
+                <div className="space-y-2">
+                  <Label>Deployment</Label>
+                  <div className="relative">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="w-full justify-between"
+                      onClick={() => {
+                        setDeploymentOpen((open) => !open);
+                        setSettingsModelOpen(false);
+                        setProjectOpen(false);
+                        setComposerModelOpen(false);
+                      }}
+                    >
+                      <span className="truncate">
+                        {selectedDeployment
+                          ? `${selectedDeployment.project_name} · ${selectedDeployment.status}`
+                          : "Any deployment"}
+                      </span>
+                      <ChevronDown className="h-4 w-4" />
+                    </Button>
+                    {deploymentOpen && (
+                      <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
                         <button
-                          key={deployment.id}
                           type="button"
                           onClick={() => {
-                            setSelectedDeploymentId(deployment.id);
+                            setSelectedDeploymentId("");
                             setDeploymentOpen(false);
                           }}
-                          className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                          className="flex min-h-9 w-full items-center rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                         >
-                          <span className="min-w-0 truncate">
-                            {deployment.project_name} | {deployment.status} | {shortId(deployment.id)}
-                          </span>
-                          {deployment.id === selectedDeploymentId && <Check className="ml-auto h-4 w-4" />}
+                          Any deployment
+                          {!selectedDeploymentId && <Check className="ml-auto h-4 w-4" />}
                         </button>
-                      ))}
-                    </div>
-                  )}
+                        <div className="my-1 h-px bg-border" />
+                        {deployments.map((deployment) => (
+                          <button
+                            key={deployment.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedDeploymentId(deployment.id);
+                              setDeploymentOpen(false);
+                            }}
+                            className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                          >
+                            <span className="min-w-0 truncate">
+                              {deployment.project_name} · {deployment.status} · {shortId(deployment.id)}
+                            </span>
+                            {deployment.id === selectedDeploymentId && <Check className="ml-auto h-4 w-4" />}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-
-            <div className="rounded-lg border border-border bg-muted/30 p-2.5 text-xs text-muted-foreground">
-              Fast mode is for low-latency chat and simple commands. Thinking mode is for diagnosis, Dockerfile planning, and safer deployment reasoning.
-            </div>
+            </section>
 
             <div className="space-y-2 rounded-lg border border-border p-3">
               <div>

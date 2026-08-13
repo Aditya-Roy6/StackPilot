@@ -761,7 +761,11 @@ void AiController::updateSettings(const drogon::HttpRequestPtr& req,
             "enabled = EXCLUDED.enabled, provider = EXCLUDED.provider, model = EXCLUDED.model, "
             "openai_compatible_base_url = EXCLUDED.openai_compatible_base_url, "
             "openai_compatible_api_key = CASE "
-            "WHEN $9 THEN NULL "
+            // $10 is clearCompatibleKey. This said $9, which is
+            // agent_access_mode (a varchar), so Postgres rejected the whole
+            // statement with "argument of CASE/WHEN must be type boolean" and
+            // every attempt to save AI settings returned a 500.
+            "WHEN $10 THEN NULL "
             "WHEN NULLIF($6, '') IS NULL THEN ai_preferences.openai_compatible_api_key "
             "ELSE EXCLUDED.openai_compatible_api_key END, "
             "confidence_threshold = EXCLUDED.confidence_threshold, history_retention_days = EXCLUDED.history_retention_days, "

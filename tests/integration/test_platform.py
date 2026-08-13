@@ -528,6 +528,70 @@ def test_preview_lifecycle_has_no_dead_ends() -> None:
         psql("DELETE FROM deployments WHERE pr_number = 99991;")
 
 
+def test_ai_settings_can_be_saved() -> None:
+    """Regression: saving AI settings returned 500 for every user, always.
+
+    The upsert's CASE referenced $9 for the clear-key flag, but $9 is
+    agent_access_mode -- a varchar. Postgres rejected the whole statement with
+    "argument of CASE/WHEN must be type boolean", so the Agent Settings dialog
+    showed "Failed to update AI settings" on every attempt and no one could
+    ever change provider or model.
+
+    Nothing caught it because no test had ever exercised a *successful* write
+    to this endpoint; the parameter mismatch is invisible until Postgres plans
+    the statement.
+    """
+    print("\nAI settings")
+    label = "integration-ai-settings"
+    try:
+        token = mint_mcp_token(["deploy", "read"], label)
+        headers = {"Authorization": f"Bearer {token}", "X-stackpilot-MCP": "1"}
+
+        status, body = request(
+            "PUT", f"{BACKEND}/api/v1/ai/settings",
+            {"enabled": True, "provider": "nvidia_nim",
+             "model": "meta/llama-3.1-8b-instruct",
+             "openai_compatible_base_url": ""},
+            headers=headers,
+        )
+        check("saving AI settings succeeds", status in (200, 201), f"got {status} {body[:160]}")
+
+        # The write must actually land, not merely return 200.
+        status, body = request("GET", f"{BACKEND}/api/v1/ai/settings", headers=headers)
+        if status == 200:
+            saved = json.loads(body)
+            check("the saved model is read back",
+                  saved.get("model") == "meta/llama-3.1-8b-instruct",
+                  f"got {saved.get('model')}")
+
+        # A second save is the upsert's ON CONFLICT path -- the branch that
+        # actually contained the broken CASE.
+        status, body = request(
+            "PUT", f"{BACKEND}/api/v1/ai/settings",
+            {"enabled": True, "provider": "nvidia_nim",
+             "model": "meta/llama-3.1-70b-instruct",
+             "openai_compatible_base_url": ""},
+            headers=headers,
+        )
+        check("re-saving takes the upsert conflict path", status in (200, 201),
+              f"got {status} {body[:160]}")
+
+        # An invalid base URL must still be rejected; the fix must not have
+        # loosened the SSRF guard on this route.
+        status, _ = request(
+            "PUT", f"{BACKEND}/api/v1/ai/settings",
+            {"enabled": True, "provider": "openai_compatible",
+             "model": "gpt-4o-mini",
+             "openai_compatible_base_url": "http://169.254.169.254/v1"},
+            headers=headers,
+        )
+        check("an unsafe compatible base URL is still refused", status == 400, f"got {status}")
+    except Exception as exc:
+        check("AI settings reachable", False, str(exc))
+    finally:
+        cleanup(label)
+
+
 def test_migration_ledger() -> None:
     """Regression: all migrations re-ran every boot, replaying destructive backfills."""
     print("\nmigration ledger")
@@ -584,6 +648,7 @@ def main() -> int:
         test_organization_access_control()
         test_drift_cost_and_previews()
         test_preview_lifecycle_has_no_dead_ends()
+        test_ai_settings_can_be_saved()
         test_migration_ledger()
     finally:
         # Runs even when a test raises, so a crash mid-suite does not leave a
