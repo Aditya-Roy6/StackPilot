@@ -1219,7 +1219,7 @@ void SshController::deleteConnection(
         pqxx::work txn(*conn);
 
         auto projectUse = txn.exec_params(
-            "SELECT id FROM projects WHERE user_id = $1 AND ssh_connection_id = $2 LIMIT 1",
+            "SELECT id FROM projects WHERE has_project_access(id, $1) AND ssh_connection_id = $2 LIMIT 1",
             userId,
             id
         );

@@ -872,7 +872,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
             "LEFT JOIN source_artifacts sa ON d.source_artifact_id = sa.id AND sa.user_id = p.user_id "
             "LEFT JOIN ssh_connections s ON p.ssh_connection_id = s.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             job.deploymentId,
             job.userId
         );

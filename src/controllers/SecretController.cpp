@@ -83,7 +83,7 @@ bool SecretController::userOwnsProject(const std::string& projectId, const std::
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
         auto rows = txn.exec_params(
-            "SELECT 1 FROM projects WHERE id = $1 AND user_id = $2",
+            "SELECT 1 FROM projects WHERE id = $1 AND has_project_access(id, $2)",
             projectId,
             userId
         );
@@ -115,7 +115,7 @@ void SecretController::listAllSecrets(
             "FROM project_secrets s "
             "JOIN projects p ON s.project_id = p.id "
             "LEFT JOIN project_environments e ON s.environment_id = e.id "
-            "WHERE p.user_id = $1 "
+            "WHERE has_project_access(p.id, $1) "
             "ORDER BY p.name ASC, s.key ASC",
             userId
         );

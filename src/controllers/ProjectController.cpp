@@ -1561,8 +1561,11 @@ void ProjectController::createProject(
         const std::string encryptedGithubPat = TokenCrypto::encrypt(githubPat);
 
         auto result = txn.exec_params(
-            "INSERT INTO projects (user_id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, application_template_id, application_config) "
-            "VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid, $8, $9, NULLIF($10, '')::uuid, $11, $12, $13, $14, $15, $16::jsonb) "
+            "INSERT INTO projects (organization_id, user_id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, application_template_id, application_config) "
+            // New projects land in the caller's personal organization. A future
+            // "create in org X" flow would pass the id explicitly; until then this
+            // keeps organization_id NOT NULL satisfiable without a second round trip.
+            "VALUES ((SELECT o.id FROM organizations o JOIN organization_members m ON m.organization_id = o.id WHERE m.user_id = $1 AND o.is_personal LIMIT 1), $1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid, $8, $9, NULLIF($10, '')::uuid, $11, $12, $13, $14, $15, $16::jsonb) "
             "RETURNING id, user_id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, application_template_id, application_config::text AS application_config, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, status, created_at",
             userId, name, description, repoUrl, encryptedGithubPat, sourceType, sshConnectionId, sourcePath, executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled, applicationTemplateId, compactJson(applicationConfig)
         );
@@ -1670,7 +1673,7 @@ void ProjectController::listProjects(
             "p.application_template_id, p.application_config::text AS application_config, "
             "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.status, p.created_at, "
             "(SELECT COUNT(*)::int FROM project_env_vars pe WHERE pe.project_id = p.id) AS env_var_count "
-            "FROM projects p WHERE p.user_id = $1 ORDER BY p.created_at DESC", userId
+            "FROM projects p WHERE has_project_access(p.id, $1) ORDER BY p.created_at DESC", userId
         );
         txn.commit();
 
@@ -1716,7 +1719,7 @@ void ProjectController::getProject(
             "p.application_template_id, p.application_config::text AS application_config, "
             "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.status, p.created_at, p.updated_at, "
             "(SELECT COUNT(*)::int FROM project_env_vars pe WHERE pe.project_id = p.id) AS env_var_count "
-            "FROM projects p WHERE p.id = $1 AND p.user_id = $2", id, userId
+            "FROM projects p WHERE p.id = $1 AND has_project_access(p.id, $2)", id, userId
         );
 
         if (result.empty()) {
@@ -1840,7 +1843,7 @@ void ProjectController::updateProject(
             "p.application_template_id, u.github_access_token "
             "FROM projects p "
             "JOIN users u ON p.user_id = u.id "
-            "WHERE p.id = $1 AND p.user_id = $2",
+            "WHERE p.id = $1 AND has_project_access(p.id, $2)",
             id,
             userId
         );
@@ -2249,7 +2252,7 @@ void ProjectController::deleteProject(
         {
             pqxx::work txn(*conn);
             auto projectRows = txn.exec_params(
-                "SELECT id FROM projects WHERE id = $1 AND user_id = $2",
+                "SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2)",
                 id,
                 userId
             );
@@ -2319,7 +2322,7 @@ void ProjectController::deleteProject(
 
         pqxx::work txn(*conn);
         auto result = txn.exec_params(
-            "DELETE FROM projects WHERE id = $1 AND user_id = $2 RETURNING id",
+            "DELETE FROM projects WHERE id = $1 AND has_project_access(id, $2) RETURNING id",
             id, userId
         );
         txn.commit();

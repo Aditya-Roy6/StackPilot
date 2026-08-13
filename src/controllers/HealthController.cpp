@@ -697,25 +697,25 @@ void HealthController::loggingMonitoringSummary(
         pqxx::work txn(*conn);
 
         payload["projects"]["active"] = Json::Value::Int64(
-            txn.exec_params("SELECT COUNT(*) FROM projects WHERE user_id = $1 AND status = 'active'", userId)[0][0].as<long long>());
+            txn.exec_params("SELECT COUNT(*) FROM projects WHERE has_project_access(id, $1) AND status = 'active'", userId)[0][0].as<long long>());
         payload["deployments"]["total"] = Json::Value::Int64(
             txn.exec_params(
-                "SELECT COUNT(*) FROM deployments d JOIN projects p ON p.id = d.project_id WHERE p.user_id = $1",
+                "SELECT COUNT(*) FROM deployments d JOIN projects p ON p.id = d.project_id WHERE has_project_access(p.id, $1)",
                 userId)[0][0].as<long long>());
         payload["deployments"]["running"] = Json::Value::Int64(
             txn.exec_params(
                 "SELECT COUNT(*) FROM deployments d JOIN projects p ON p.id = d.project_id "
-                "WHERE p.user_id = $1 AND d.status = 'running'",
+                "WHERE has_project_access(p.id, $1) AND d.status = 'running'",
                 userId)[0][0].as<long long>());
         payload["deployments"]["failed_current"] = Json::Value::Int64(
             txn.exec_params(
                 "SELECT COUNT(*) FROM deployments d JOIN projects p ON p.id = d.project_id "
-                "WHERE p.user_id = $1 AND d.status = 'failed'",
+                "WHERE has_project_access(p.id, $1) AND d.status = 'failed'",
                 userId)[0][0].as<long long>());
         payload["deployments"]["failed_last_24h"] = Json::Value::Int64(
             txn.exec_params(
                 "SELECT COUNT(*) FROM deployments d JOIN projects p ON p.id = d.project_id "
-                "WHERE p.user_id = $1 AND d.status = 'failed' AND d.created_at > NOW() - INTERVAL '24 hours'",
+                "WHERE has_project_access(p.id, $1) AND d.status = 'failed' AND d.created_at > NOW() - INTERVAL '24 hours'",
                 userId)[0][0].as<long long>());
 
         payload["deployments"]["by_status"] = groupedCountsForUser(
@@ -723,13 +723,13 @@ void HealthController::loggingMonitoringSummary(
             userId,
             "SELECT COALESCE(d.status, 'unknown'), COUNT(*) "
             "FROM deployments d JOIN projects p ON p.id = d.project_id "
-            "WHERE p.user_id = $1 GROUP BY 1 ORDER BY 1");
+            "WHERE has_project_access(p.id, $1) GROUP BY 1 ORDER BY 1");
         payload["deployments"]["by_runtime"] = groupedCountsForUser(
             txn,
             userId,
             "SELECT COALESCE(NULLIF(d.runtime_provider, ''), 'docker'), COUNT(*) "
             "FROM deployments d JOIN projects p ON p.id = d.project_id "
-            "WHERE p.user_id = $1 GROUP BY 1 ORDER BY 1");
+            "WHERE has_project_access(p.id, $1) GROUP BY 1 ORDER BY 1");
         payload["jobs"]["by_status"] = groupedCountsForUser(
             txn,
             userId,
@@ -740,7 +740,7 @@ void HealthController::loggingMonitoringSummary(
         auto failureRows = txn.exec_params(
             "SELECT d.id, p.name, d.version, d.status, COALESCE(d.logs, '') AS logs, d.created_at "
             "FROM deployments d JOIN projects p ON p.id = d.project_id "
-            "WHERE p.user_id = $1 AND d.status = 'failed' "
+            "WHERE has_project_access(p.id, $1) AND d.status = 'failed' "
             "ORDER BY d.created_at DESC LIMIT 5",
             userId
         );

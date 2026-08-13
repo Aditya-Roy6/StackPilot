@@ -342,7 +342,7 @@ Json::Value projectContext(pqxx::work& txn, const std::string& userId, const std
         "p.created_at, p.updated_at, "
         "COALESCE((SELECT jsonb_agg(jsonb_build_object('key', key, 'has_value', true) ORDER BY key) "
         "FROM project_env_vars WHERE project_id = p.id), '[]'::jsonb)::text AS env_keys "
-        "FROM projects p WHERE p.id = $1 AND p.user_id = $2",
+        "FROM projects p WHERE p.id = $1 AND has_project_access(p.id, $2)",
         projectId,
         userId);
     if (rows.empty()) {
@@ -370,7 +370,7 @@ Json::Value deploymentContext(pqxx::work& txn, const std::string& userId, const 
         "d.runtime_snapshot::text AS runtime_snapshot, d.remote_runtime_details::text AS remote_runtime_details, "
         "d.created_at, d.updated_at, p.name AS project_name "
         "FROM deployments d JOIN projects p ON p.id = d.project_id "
-        "WHERE d.id = $1 AND p.user_id = $2",
+        "WHERE d.id = $1 AND has_project_access(p.id, $2)",
         deploymentId,
         userId);
     if (rows.empty()) {

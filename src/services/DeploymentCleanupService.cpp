@@ -294,7 +294,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId,
             userId
         );
@@ -573,7 +573,7 @@ DeploymentCleanupResult DeploymentCleanupService::cleanupDeployment(
                 "DELETE FROM deployments USING projects "
                 "WHERE deployments.project_id = projects.id "
                 "AND deployments.id = $1 "
-                "AND projects.user_id = $2 "
+                "AND has_project_access(projects.id, $2) "
                 "RETURNING deployments.id",
                 deploymentId,
                 userId

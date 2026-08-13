@@ -309,6 +309,92 @@ def test_secrets_are_write_only() -> None:
         cleanup(label)
 
 
+def test_organization_access_control() -> None:
+    """A second user must not reach the first user's projects.
+
+    This is the check the whole RBAC migration exists to make true. Every
+    project query now routes through has_project_access() instead of
+    `user_id = $1`; if any of the 41 rewritten predicates dropped its gate, an
+    outsider would start seeing rows here.
+    """
+    print("\norganization access control")
+    outsider_email = f"rbac-outsider-{secrets.token_hex(6)}@stackpilot.invalid"
+    try:
+        owner_id = ensure_user()
+
+        # Every user must land in exactly one personal organization, as owner.
+        personal = psql(
+            "SELECT count(*) FROM organizations o "
+            "JOIN organization_members m ON m.organization_id = o.id "
+            f"WHERE m.user_id = '{owner_id}' AND o.is_personal AND m.role = 'owner';")
+        check("owner has a personal organization", personal == "1", f"got {personal}")
+
+        orphans = psql("SELECT count(*) FROM projects WHERE organization_id IS NULL;")
+        check("no project is orphaned from an organization", orphans == "0", f"{orphans} orphaned")
+
+        project_id = psql("SELECT id FROM projects LIMIT 1;")
+        if not project_id:
+            check("access control (skipped: no projects exist)", True)
+            return
+
+        check("owner reaches their own project",
+              psql(f"SELECT has_project_access('{project_id}', '{owner_id}');") == "t")
+
+        # A real second account, created the same way a real signup would be,
+        # so the personal-org trigger is exercised too.
+        status, body = request(
+            "POST", f"{BACKEND}/api/v1/auth/register",
+            {"username": f"rbac-outsider-{secrets.token_hex(4)}",
+             "email": outsider_email,
+             "password": "Outsider-" + secrets.token_hex(12) + "!aA1"},
+            headers={"Origin": BROWSER_ORIGIN, "X-stackpilot-CSRF": "1"},
+        )
+        if status not in (200, 201):
+            check("could register a second user", False, f"{status} {body[:120]}")
+            return
+
+        outsider_id = psql(f"SELECT id FROM users WHERE email = '{outsider_email}';")
+        check("signup trigger created a personal organization",
+              psql("SELECT count(*) FROM organization_members "
+                   f"WHERE user_id = '{outsider_id}' AND role = 'owner';") == "1")
+
+        check("outsider cannot reach another user's project",
+              psql(f"SELECT has_project_access('{project_id}', '{outsider_id}');") == "f")
+        check("outsider has no role on it",
+              psql(f"SELECT coalesce(project_role('{project_id}', '{outsider_id}'), 'none');") == "none")
+
+        # Grant viewer, then confirm the role ladder is enforced rather than
+        # collapsing into "member or not".
+        org_id = psql(f"SELECT organization_id FROM projects WHERE id = '{project_id}';")
+        psql("INSERT INTO organization_members (organization_id, user_id, role) "
+             f"VALUES ('{org_id}', '{outsider_id}', 'viewer') "
+             "ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'viewer';")
+
+        check("viewer can read the project",
+              psql(f"SELECT has_project_access('{project_id}', '{outsider_id}', 'viewer');") == "t")
+        check("viewer cannot write (member bar)",
+              psql(f"SELECT has_project_access('{project_id}', '{outsider_id}', 'member');") == "f")
+        check("viewer cannot delete (admin bar)",
+              psql(f"SELECT has_project_access('{project_id}', '{outsider_id}', 'admin');") == "f")
+
+        psql("UPDATE organization_members SET role = 'member' "
+             f"WHERE organization_id = '{org_id}' AND user_id = '{outsider_id}';")
+        check("member can write",
+              psql(f"SELECT has_project_access('{project_id}', '{outsider_id}', 'member');") == "t")
+        check("member still cannot delete",
+              psql(f"SELECT has_project_access('{project_id}', '{outsider_id}', 'admin');") == "f")
+
+        # An unknown minimum must deny, not pass. If role_rank returned 0 for
+        # both sides this would silently grant everything.
+        check("an unknown required role denies",
+              psql(f"SELECT has_project_access('{project_id}', '{owner_id}', 'superuser');") == "f")
+    except Exception as exc:
+        check("organization access control reachable", False, str(exc))
+    finally:
+        if outsider_email:
+            psql(f"DELETE FROM users WHERE email = '{outsider_email}';")
+
+
 def test_migration_ledger() -> None:
     """Regression: all migrations re-ran every boot, replaying destructive backfills."""
     print("\nmigration ledger")
@@ -362,6 +448,7 @@ def main() -> int:
         test_mcp_token_scopes()
         test_agent_policy_gate()
         test_secrets_are_write_only()
+        test_organization_access_control()
         test_migration_ledger()
     finally:
         # Runs even when a test raises, so a crash mid-suite does not leave a

@@ -28,7 +28,7 @@ bool userOwnsDeployment(const std::string& deploymentId, const std::string& user
         auto rows = txn.exec_params(
             "SELECT 1 FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId,
             userId
         );

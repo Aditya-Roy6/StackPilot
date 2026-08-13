@@ -78,6 +78,7 @@ if(STACKPILOT_BUILD_TESTS)
         src/db/Database.cpp
         src/services/ComposeKubernetesPlanner.cpp
         src/utils/RuntimeRateLimiter.cpp
+        src/utils/Authz.cpp
         src/services/LocalDockerRuntime.cpp
         src/services/DeploymentJournal.cpp
         src/services/SshService.cpp

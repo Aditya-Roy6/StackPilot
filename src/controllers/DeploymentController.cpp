@@ -1019,7 +1019,7 @@ void DeploymentController::createDeployment(
         pqxx::work txn(*conn);
 
         // Verify project ownership
-        auto check = txn.exec_params("SELECT id, source_type, repo_url FROM projects WHERE id = $1 AND user_id = $2", projectId, userId);
+        auto check = txn.exec_params("SELECT id, source_type, repo_url FROM projects WHERE id = $1 AND has_project_access(id, $2)", projectId, userId);
         if (check.empty()) {
             Json::Value err; err["error"] = "Project not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -1199,7 +1199,7 @@ void DeploymentController::listDeployments(
         auto conn = db.getConnection();
         pqxx::work txn(*conn);
 
-        auto check = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND user_id = $2", projectId, userId);
+        auto check = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2)", projectId, userId);
         if (check.empty()) {
             Json::Value err; err["error"] = "Project not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -1281,7 +1281,7 @@ void DeploymentController::listUserDeployments(
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id "
-            "WHERE p.user_id = $1 "
+            "WHERE has_project_access(p.id, $1) "
             "ORDER BY d.created_at DESC",
             userId
         );
@@ -1368,7 +1368,7 @@ void DeploymentController::triggerBuild(
             // simultaneous POSTs both read 'built', both enqueue, and two workers
             // build the same deployment — colliding on identical derived image and
             // container names, where `docker rm -f` kills the other run's container.
-            "WHERE d.id = $1 AND p.user_id = $2 "
+            "WHERE d.id = $1 AND has_project_access(p.id, $2) "
             "FOR UPDATE OF d",
             deploymentId,
             userId
@@ -1488,7 +1488,7 @@ void DeploymentController::getDeploymentLogs(
             "d.k8s_service_name, d.k8s_ingress_name, d.desired_replicas, d.runtime_url, d.runtime_exposure, d.updated_at "
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
         txn.commit();
@@ -1563,7 +1563,7 @@ void DeploymentController::deleteDeployment(
                 "SELECT COUNT(*) FROM deployments d "
                 "JOIN deployment_jobs j ON j.deployment_id = d.id "
                 "JOIN projects p ON d.project_id = p.id "
-                "WHERE d.id = $1 AND p.user_id = $2 "
+                "WHERE d.id = $1 AND has_project_access(p.id, $2) "
                 "  AND j.status IN ('running', 'queued', 'retrying')",
                 deploymentId,
                 userId
@@ -1646,7 +1646,7 @@ void DeploymentController::deployToLocalDocker(
             "p.name AS project_name "
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId,
             userId
         );
@@ -1942,7 +1942,7 @@ void DeploymentController::deployToKubernetes(
             "p.name AS project_name, p.runtime_scheme, p.local_https_enabled "
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 
@@ -2134,7 +2134,7 @@ void DeploymentController::scaleKubernetesDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 
@@ -2308,7 +2308,7 @@ void DeploymentController::setRuntimePausedState(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 
@@ -2610,7 +2610,7 @@ void DeploymentController::getDeploymentMetrics(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 
@@ -2821,7 +2821,7 @@ void DeploymentController::getRuntimeHealth(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
         if (rows.empty()) {
@@ -2979,7 +2979,7 @@ void DeploymentController::getKubernetesStatus(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 
@@ -3306,7 +3306,7 @@ void DeploymentController::getKubernetesEvents(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
         if (rows.empty()) {
@@ -3421,7 +3421,7 @@ void DeploymentController::rollbackKubernetesDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 
@@ -3636,7 +3636,7 @@ void DeploymentController::removeKubernetesDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND p.user_id = $2",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
             deploymentId, userId
         );
 

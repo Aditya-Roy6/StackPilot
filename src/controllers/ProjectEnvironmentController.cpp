@@ -51,7 +51,7 @@ Json::Value environmentRowToJson(const pqxx::row& row) {
 bool projectBelongsToUser(pqxx::transaction_base& txn,
                           const std::string& projectId,
                           const std::string& userId) {
-    auto rows = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND user_id = $2", projectId, userId);
+    auto rows = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2)", projectId, userId);
     return !rows.empty();
 }
 
@@ -420,7 +420,7 @@ void ProjectEnvironmentController::createEnvironment(
         auto projectRows = txn.exec_params(
             "SELECT p.repo_url, p.github_pat, u.github_access_token "
             "FROM projects p JOIN users u ON p.user_id = u.id "
-            "WHERE p.id = $1 AND p.user_id = $2",
+            "WHERE p.id = $1 AND has_project_access(p.id, $2)",
             projectId,
             userId
         );
@@ -517,7 +517,7 @@ void ProjectEnvironmentController::updateEnvironment(
         auto projectRows = txn.exec_params(
             "SELECT p.repo_url, p.github_pat, u.github_access_token "
             "FROM projects p JOIN users u ON p.user_id = u.id "
-            "WHERE p.id = $1 AND p.user_id = $2",
+            "WHERE p.id = $1 AND has_project_access(p.id, $2)",
             projectId,
             userId
         );
