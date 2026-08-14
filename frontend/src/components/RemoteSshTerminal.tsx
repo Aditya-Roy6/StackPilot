@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { RefreshCw, TerminalIcon } from "lucide-react";
+import { Maximize2, Minimize2, RefreshCw, TerminalIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { readTerminalTheme, useCanvasThemeVersion } from "@/lib/canvas-theme";
@@ -37,6 +37,32 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
   const socketRef = useRef<WebSocket | null>(null);
   const terminalRef = useRef<import("@xterm/xterm").Terminal | null>(null);
   const fitAddonRef = useRef<import("@xterm/addon-fit").FitAddon | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Track the browser's own fullscreen state rather than a local boolean, so
+  // pressing Escape (which exits fullscreen without touching our button) does
+  // not leave the icon lying about which mode we are in.
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(document.fullscreenElement === rootRef.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, []);
+
+  const toggleFullscreen = async () => {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+      } else {
+        await rootRef.current?.requestFullscreen();
+      }
+      // The ResizeObserver already refits on size change, so xterm reflows to
+      // the new dimensions without any extra work here.
+    } catch {
+      // Fullscreen can be refused by policy or an unsupported browser. Not
+      // worth an error toast for a convenience control.
+    }
+  };
   const [connectionState, setConnectionState] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
   const [sessionKey, setSessionKey] = useState(0);
 
@@ -183,7 +209,16 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
   }, [themeVersion]);
 
   return (
-    <div className={cn("flex h-full min-h-[420px] flex-col overflow-hidden rounded-xl border border-border bg-black", className)}>
+    <div
+      ref={rootRef}
+      className={cn(
+        "flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-border bg-black",
+        // In fullscreen the element is the whole viewport, so the rounded
+        // corners and border would draw a box around the screen edge.
+        isFullscreen && "min-h-0 rounded-none border-0",
+        className
+      )}
+    >
       <div className="flex items-center justify-between border-b border-white/10 bg-zinc-950 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2 text-xs text-zinc-300">
           <TerminalIcon className="h-4 w-4 shrink-0" />
@@ -200,20 +235,33 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
             {connectionState}
           </span>
         </div>
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="h-7 px-2 text-zinc-300 hover:bg-white/10 hover:text-white"
-          onClick={() => setSessionKey((value) => value + 1)}
-        >
-          <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-          Reconnect
-        </Button>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={() => setSessionKey((value) => value + 1)}
+          >
+            <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+            Reconnect
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-zinc-300 hover:bg-white/10 hover:text-white"
+            onClick={toggleFullscreen}
+            title={isFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
+            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          >
+            {isFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+          </Button>
+        </div>
       </div>
       <div
         ref={containerRef}
-        className="min-h-0 flex-1 overflow-hidden p-2 [&_.xterm-screen]:min-h-full [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
+        className="ssh-terminal-surface min-h-0 flex-1 overflow-hidden p-2 [&_.xterm-screen]:min-h-full [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
       />
     </div>
   );
