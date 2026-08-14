@@ -160,102 +160,119 @@ interface AgentApplicationTemplate {
 const commands = [
   {
     name: "/cost",
+    arg: "none" as const,
     icon: Star,
     usage: "/cost [days]",
     description: "What deployments have cost, by project, with preview spend broken out.",
   },
   {
     name: "/drift",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/drift <deployment-id>",
     description: "Compare recorded desired state against what the cluster actually has.",
   },
   {
     name: "/secrets",
+    arg: "project" as const,
     icon: Star,
     usage: "/secrets [project-id]",
     description: "List stored secret keys. Values are never shown here.",
   },
   {
     name: "/scale",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/scale <deployment-id> <replicas>",
     description: "Change replica count on a running Kubernetes deployment.",
   },
   {
     name: "/rollback",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/rollback <deployment-id>",
     description: "Roll a Kubernetes deployment back to its previous revision.",
   },
   {
     name: "/pause",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/pause <deployment-id>",
     description: "Pause a running runtime so it stops serving traffic.",
   },
   {
     name: "/resume",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/resume <deployment-id>",
     description: "Resume a paused runtime.",
   },
   {
     name: "/events",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/events <deployment-id>",
     description: "Kubernetes events — often explains a crash loop better than logs.",
   },
   {
     name: "/metrics",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/metrics <deployment-id>",
     description: "CPU, memory and runtime metrics for a deployment.",
   },
   {
     name: "/org",
+    arg: "none" as const,
     icon: Star,
     usage: "/org",
     description: "Organizations you belong to and your role in each.",
   },
   {
     name: "/environments",
+    arg: "project" as const,
     icon: Star,
     usage: "/environments <project-id>",
     description: "A project's environments, branches and auto-deploy settings.",
   },
   {
     name: "/diagnose",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/diagnose <deployment-id>",
     description: "Analyze failed builds or runtime health using logs and deployment context.",
   },
   {
     name: "/build",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/build <deployment-id>",
     description: "Queue a real deployment build in the platform worker.",
   },
   {
     name: "/deploy",
+    arg: "deployment" as const,
     icon: Star,
     usage: "/deploy <deployment-id> [port]",
     description: "Deploy an already built image to Kubernetes with safe defaults.",
   },
   {
     name: "/dockerfile",
+    arg: "project" as const,
     icon: Star,
     usage: "/dockerfile <project-id>",
     description: "Generate a Dockerfile plan for scripts, apps, and unknown project types.",
   },
   {
     name: "/analyze",
+    arg: "project" as const,
     icon: Star,
     usage: "/analyze <project-id>",
     description: "Classify a project and infer runtime, entrypoint, framework, and port.",
   },
   {
     name: "/app",
+    arg: "app" as const,
     icon: Star,
     usage: "/app mysql",
     description: "Create and deploy an Application-source service such as MySQL, PostgreSQL, Redis, Grafana, or MinIO.",
@@ -759,11 +776,47 @@ export default function AiAgentPage() {
     (activeModelId ? { id: activeModelId, label: activeModelId, mode } : undefined);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const selectedDeployment = deployments.find((deployment) => deployment.id === selectedDeploymentId);
-  const diagnoseDeploymentPickerOpen = /^\/diagnose\s*$/i.test(input.trimEnd());
-  const diagnoseDeployments = deployments
+  // A command with a trailing space is a command waiting for its argument.
+  // Nobody remembers a project id, so the picker opens on its own and the
+  // user chooses by name -- the id is filled in behind the scenes.
+  const pendingCommand = useMemo(() => {
+    const match = /^(\/[a-z]+)\s+$/i.exec(input);
+    if (!match) return null;
+    const entry = commands.find((command) => command.name === match[1].toLowerCase());
+    if (!entry || entry.arg === "none") return null;
+    return entry;
+  }, [input]);
+
+  const argPickerOpen = pendingCommand !== null;
+
+  // Failed deployments first: a command that takes a deployment id is usually
+  // being pointed at something broken.
+  const pickableDeployments = deployments
     .slice()
     .sort((a, b) => Number(b.status === "failed") - Number(a.status === "failed"));
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerRef = useRef<HTMLDivElement>(null);
+
+  // Clicking anywhere outside the composer dismisses the command palette.
+  // Previously it stayed open until something was chosen, which made a
+  // mistyped "/" feel like the page had locked up.
+  useEffect(() => {
+    if (!showCommands) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (composerRef.current?.contains(event.target as Node)) return;
+      setShowCommands(false);
+    };
+    // Escape is the other half of the same expectation.
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowCommands(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [showCommands]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -1504,8 +1557,23 @@ _${event.error}_`;
   const chooseDeploymentForCommand = (deployment: Deployment) => {
     setSelectedDeploymentId(deployment.id);
     setSelectedProjectId(deployment.project_id);
-    setInput(`/diagnose ${deployment.id}`);
+    // Keep whichever command is pending rather than hardcoding one.
+    setInput(`${pendingCommand?.name || "/diagnose"} ${deployment.id} `);
     setShowCommands(false);
+    textareaRef.current?.focus();
+  };
+
+  const chooseProjectForCommand = (project: Project) => {
+    setSelectedProjectId(project.id);
+    setInput(`${pendingCommand?.name || "/analyze"} ${project.id} `);
+    setShowCommands(false);
+    textareaRef.current?.focus();
+  };
+
+  const chooseAppForCommand = (template: string) => {
+    setInput(`/app ${template} `);
+    setShowCommands(false);
+    textareaRef.current?.focus();
   };
 
   const commandDraft = (name: (typeof commands)[number]["name"]) => {
@@ -1703,16 +1771,16 @@ _${event.error}_`;
         </div>
 
         <div className="sticky bottom-0 z-20 shrink-0 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur md:px-6">
-          <div className="mx-auto max-w-5xl">
-            {diagnoseDeploymentPickerOpen && (
-              <div className="mb-2 max-h-72 overflow-y-auto rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">
+          <div ref={composerRef} className="mx-auto max-w-5xl">
+            {argPickerOpen && pendingCommand?.arg === "deployment" && (
+              <div className="mb-2 max-h-64 overflow-y-auto rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">
                 <div className="px-3 py-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Deployments
+                  Pick a deployment for {pendingCommand.name}
                 </div>
-                {diagnoseDeployments.length === 0 ? (
-                  <div className="px-3 py-4 text-sm text-muted-foreground">No deployment found.</div>
+                {pickableDeployments.length === 0 ? (
+                  <div className="px-3 py-4 text-sm text-muted-foreground">No deployments yet.</div>
                 ) : (
-                  diagnoseDeployments.map((deployment) => (
+                  pickableDeployments.map((deployment) => (
                     <button
                       key={deployment.id}
                       type="button"
@@ -1722,7 +1790,7 @@ _${event.error}_`;
                       <span className="min-w-0">
                         <span className="block truncate text-sm font-medium">{deployment.project_name}</span>
                         <span className="block truncate text-xs text-muted-foreground">
-                          {deployment.version || "unversioned"} | {deployment.status} | {shortId(deployment.id)}
+                          {deployment.version || "unversioned"} · {shortId(deployment.id)}
                         </span>
                       </span>
                       <Badge variant={deployment.status === "failed" ? "destructive" : "outline"}>
@@ -1734,24 +1802,81 @@ _${event.error}_`;
               </div>
             )}
 
-            {showCommands && !diagnoseDeploymentPickerOpen && filteredCommands.length > 0 && (
-              <div className="mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-xl">
-                {filteredCommands.map((command) => (
+            {argPickerOpen && pendingCommand?.arg === "project" && (
+              <div className="mb-2 max-h-64 overflow-y-auto rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">
+                <div className="px-3 py-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Pick a project for {pendingCommand.name}
+                </div>
+                {projects.length === 0 ? (
+                  <div className="px-3 py-4 text-sm text-muted-foreground">No projects yet.</div>
+                ) : (
+                  projects.map((project) => (
                     <button
-                      key={command.name}
+                      key={project.id}
                       type="button"
-                      className="flex w-full items-start gap-3 px-3 py-2 text-left hover:bg-muted"
-                      onClick={() => {
-                        setInput(`${command.usage} `);
-                        setShowCommands(false);
-                      }}
+                      className="flex w-full items-start justify-between gap-3 rounded-lg px-3 py-2 text-left hover:bg-muted"
+                      onClick={() => chooseProjectForCommand(project)}
                     >
-                      <FilledStarIcon className="mt-0.5 size-4 shrink-0 text-primary" />
-                      <span>
-                        <span className="block text-sm font-medium">{command.usage}</span>
-                        <span className="text-xs text-muted-foreground">{command.description}</span>
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium">{project.name}</span>
+                        <span className="block truncate text-xs text-muted-foreground">
+                          {project.source_type || "project"} · {shortId(project.id)}
+                        </span>
                       </span>
                     </button>
+                  ))
+                )}
+              </div>
+            )}
+
+            {argPickerOpen && pendingCommand?.arg === "app" && (
+              <div className="mb-2 max-h-64 overflow-y-auto rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">
+                <div className="px-3 py-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  Pick an application to deploy
+                </div>
+                {/* Straight from the list /app actually accepts, so the
+                    picker cannot drift from the handler. */}
+                {agentApplicationTemplates.map((template) => (
+                  <button
+                    key={template.id}
+                    type="button"
+                    className="flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left hover:bg-muted"
+                    onClick={() => chooseAppForCommand(template.id)}
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium">{template.name}</span>
+                      <span className="block truncate text-xs text-muted-foreground">
+                        /app {template.id}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {showCommands && !argPickerOpen && filteredCommands.length > 0 && (
+              // Capped and scrollable. Unbounded, twenty commands covered the
+              // entire conversation behind it.
+              <div className="mb-2 max-h-64 overflow-y-auto overflow-x-hidden rounded-xl border border-border bg-popover shadow-xl">
+                {filteredCommands.map((command) => (
+                  <button
+                    key={command.name}
+                    type="button"
+                    className="flex w-full items-start gap-3 px-3 py-2 text-left hover:bg-muted"
+                    onClick={() => {
+                      // Trailing space is the signal that an argument is
+                      // expected, which is what opens the next picker.
+                      setInput(`${command.name} `);
+                      setShowCommands(false);
+                      textareaRef.current?.focus();
+                    }}
+                  >
+                    <FilledStarIcon className="mt-0.5 size-4 shrink-0 text-primary" />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium">{command.usage}</span>
+                      <span className="block text-xs text-muted-foreground">{command.description}</span>
+                    </span>
+                  </button>
                 ))}
               </div>
             )}
@@ -1762,7 +1887,10 @@ _${event.error}_`;
                 value={input}
                 onChange={(event) => {
                   setInput(event.target.value);
-                  setShowCommands(event.target.value.startsWith("/"));
+                  // Only while the command name itself is being typed. Once a
+                  // space is entered the user has moved on to the argument,
+                  // and the palette reappearing over the picker is noise.
+                  setShowCommands(/^\/[a-z-]*$/i.test(event.target.value));
                 }}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
