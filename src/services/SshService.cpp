@@ -1271,7 +1271,17 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
         "  echo __STACKPILOT_SERVER_UNREACHABLE__; exit 25; "
         "fi; "
         "echo server_reachable=yes; "
-        "if systemctl is-active --quiet k3s-agent 2>/dev/null || systemctl is-active --quiet k3s 2>/dev/null; then echo STACKPILOT_k3s_existing=yes; "
+        // Only a running *agent* means this node is already a worker. The
+        // original check also accepted a running k3s *server*, which is a
+        // different thing entirely: a node that Prepare Kubernetes turned into
+        // its own standalone control plane. That made the join skip the agent
+        // install, and the verification then saw the same active server unit
+        // and reported the node as joined. Two workers ended up running
+        // separate single-node clusters while the UI showed a three-node one.
+        "if systemctl is-active --quiet k3s 2>/dev/null && ! systemctl is-active --quiet k3s-agent 2>/dev/null; then "
+        "  echo __STACKPILOT_NODE_IS_SERVER__; exit 26; "
+        "fi; "
+        "if systemctl is-active --quiet k3s-agent 2>/dev/null; then echo STACKPILOT_k3s_existing=yes; "
         "else tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
         "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_AGENT_INSTALL_FAILED__; exit 23; }; rm -f \"$tmp\"; fi; "
         // `systemctl is-active` only says systemd started the unit. A k3s agent
@@ -1317,6 +1327,11 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
             result.error = "Unable to download the k3s installer on the worker";
         } else if (output.find("__STACKPILOT_K3S_AGENT_INSTALL_FAILED__") != std::string::npos) {
             result.error = "k3s agent installation failed on the worker";
+        } else if (output.find("__STACKPILOT_NODE_IS_SERVER__") != std::string::npos) {
+            result.error = "This node is already running k3s as its own control plane, so it cannot "
+                           "join another cluster as a worker. That usually means Prepare Kubernetes "
+                           "was run on it. Remove the standalone install first with "
+                           "/usr/local/bin/k3s-uninstall.sh, then join it again.";
         } else if (output.find("__STACKPILOT_SERVER_UNREACHABLE__") != std::string::npos) {
             result.error = "This worker cannot reach the control plane's API server on port 6443. "
                            "If the cluster's API address is a public IP, a security group rule that "
