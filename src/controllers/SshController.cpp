@@ -979,7 +979,13 @@ void SshController::joinKubernetesCluster(
         pqxx::work writeTxn(*conn);
         writeTxn.exec_params(
             "INSERT INTO kubernetes_cluster_nodes (cluster_id, connection_id, role, status, last_status, joined_at) "
-            "VALUES ($1, $2, $5, $3, $4, CASE WHEN $3 = 'ready' THEN NOW() ELSE NULL END) "
+            // Explicit casts: $3 is used both as the status column and inside
+            // the CASE comparison, and once $5 was added Postgres could no
+            // longer deduce a single type for it -- "inconsistent types
+            // deduced for parameter $3", which surfaced as a 500 on every
+            // worker join.
+            "VALUES ($1, $2, $5::varchar, $3::varchar, $4, "
+            "        CASE WHEN $3::varchar = 'ready' THEN NOW() ELSE NULL END) "
             "ON CONFLICT (cluster_id, connection_id) DO UPDATE SET "
             "role = EXCLUDED.role, status = EXCLUDED.status, last_status = EXCLUDED.last_status, "
             "joined_at = CASE WHEN EXCLUDED.status = 'ready' THEN NOW() ELSE kubernetes_cluster_nodes.joined_at END, updated_at = NOW()",

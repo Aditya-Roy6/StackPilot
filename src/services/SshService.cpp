@@ -876,19 +876,41 @@ SshOperationResult SshService::provisionDockerHost(const SshConnectionConfig& co
         "  echo __STACKPILOT_SUDO_REQUIRED__; exit 20; "
         "fi; "
         "SUDO=''; [ \"$(id -u)\" -eq 0 ] || SUDO='" + sudoCmd + "'; "
+        // Docker and Compose are installed as two separate steps on purpose.
+        //
+        // The original single `apt-get install docker.io docker-compose-plugin`
+        // failed on every Ubuntu host: docker-compose-plugin lives in Docker's
+        // own repository at download.docker.com, not in Ubuntu's. apt exits
+        // non-zero with "Unable to locate package", and under `set -e` that
+        // aborted the script *before Docker was installed at all* -- so the
+        // failure looked like a Docker problem when Docker was never attempted.
+        //
+        // Compose is also optional. A missing compose plugin should not stop a
+        // host from running containers.
         "if command -v apt-get >/dev/null 2>&1; then "
         "  echo package_manager=apt; "
-        "  $SUDO apt-get update -y; "
-        "  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker.io docker-compose-plugin; "
+        "  $SUDO apt-get update -y || true; "
+        "  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker.io "
+        "    || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
+        "  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker-compose-v2 2>/dev/null "
+        "    || DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker-compose-plugin 2>/dev/null "
+        "    || DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker-compose 2>/dev/null "
+        "    || echo compose_status=unavailable; "
         "elif command -v dnf >/dev/null 2>&1; then "
         "  echo package_manager=dnf; "
-        "  $SUDO dnf install -y docker docker-compose-plugin; "
+        "  $SUDO dnf install -y docker || $SUDO dnf install -y moby-engine "
+        "    || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
+        "  $SUDO dnf install -y docker-compose-plugin 2>/dev/null "
+        "    || $SUDO dnf install -y docker-compose 2>/dev/null || echo compose_status=unavailable; "
         "elif command -v yum >/dev/null 2>&1; then "
         "  echo package_manager=yum; "
-        "  $SUDO yum install -y docker docker-compose-plugin; "
+        "  $SUDO yum install -y docker || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
+        "  $SUDO yum install -y docker-compose-plugin 2>/dev/null "
+        "    || $SUDO yum install -y docker-compose 2>/dev/null || echo compose_status=unavailable; "
         "elif command -v pacman >/dev/null 2>&1; then "
         "  echo package_manager=pacman; "
-        "  $SUDO pacman -Sy --noconfirm docker docker-compose; "
+        "  $SUDO pacman -Sy --noconfirm docker || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
+        "  $SUDO pacman -Sy --noconfirm docker-compose 2>/dev/null || echo compose_status=unavailable; "
         "else "
         "  echo __STACKPILOT_UNSUPPORTED_PACKAGE_MANAGER__; exit 21; "
         "fi; "
@@ -919,6 +941,12 @@ SshOperationResult SshService::provisionDockerHost(const SshConnectionConfig& co
             result.error = "Docker provisioning requires root or passwordless sudo on the remote host";
         } else if (output.find("__STACKPILOT_UNSUPPORTED_PACKAGE_MANAGER__") != std::string::npos) {
             result.error = "Unsupported Linux package manager. Install Docker manually, then probe again.";
+        } else if (output.find("__STACKPILOT_DOCKER_PACKAGE_FAILED__") != std::string::npos) {
+            // Distinguished from a generic failure because the fix is
+            // different: this is the package manager refusing, usually a
+            // missing repository, no disk space, or a held dpkg lock.
+            result.error = "The package manager could not install Docker. Check the remote host has "
+                           "disk space and that no other apt/dnf process holds the lock.";
         } else if (output.find("__STACKPILOT_DOCKER_DAEMON_DOWN__") != std::string::npos) {
             result.error = "Docker was installed, but the daemon is not reachable";
         } else if (exitCode == 124) {
@@ -962,15 +990,80 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
         "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then "
         "  echo __STACKPILOT_SUDO_REQUIRED__; exit 20; "
         "fi; "
-        "command -v curl >/dev/null 2>&1 || { echo __STACKPILOT_CURL_MISSING__; exit 21; }; "
         "SUDO=''; [ \"$(id -u)\" -eq 0 ] || SUDO='" + sudoCmd + "'; "
-        "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--secrets-encryption --write-kubeconfig-mode=644' $SUDO sh - || { echo __STACKPILOT_K3S_INSTALL_FAILED__; exit 22; }; "
-        "sleep 4; "
-        "if command -v kubectl >/dev/null 2>&1; then K='kubectl'; "
-        "elif [ \"$(id -u)\" -eq 0 ]; then K='k3s kubectl'; "
-        "else K='" + sudoCmd + " k3s kubectl'; fi; "
-        "$K get nodes || { echo __STACKPILOT_K8S_VERIFY_FAILED__; exit 23; }; "
-        "$K get ingressclass >/dev/null 2>&1 || true; "
+        "DISTRO=unknown; "
+        "if [ -r /etc/os-release ]; then . /etc/os-release; DISTRO=\"${ID:-unknown}\"; fi; "
+        "echo distro=\"$DISTRO\"; "
+        "echo distro_version=\"${VERSION_ID:-unknown}\"; "
+        "DL=\"\"; "
+        "if command -v curl >/dev/null 2>&1; then DL=\"curl -sfL\"; "
+        "elif command -v wget >/dev/null 2>&1; then DL=\"wget -qO-\"; "
+        "fi; "
+        "if [ -z \"$DL\" ]; then "
+        "  echo installing_downloader=yes; "
+        "  if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -y >/dev/null 2>&1 || true; $SUDO apt-get install -y curl >/dev/null 2>&1 || true; "
+        "  elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y curl >/dev/null 2>&1 || true; "
+        "  elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y curl >/dev/null 2>&1 || true; "
+        "  elif command -v zypper >/dev/null 2>&1; then $SUDO zypper -n install curl >/dev/null 2>&1 || true; "
+        "  elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm curl >/dev/null 2>&1 || true; "
+        "  elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache curl >/dev/null 2>&1 || true; "
+        "  fi; "
+        "  command -v curl >/dev/null 2>&1 && DL=\"curl -sfL\"; "
+        "fi; "
+        "if [ -z \"$DL\" ]; then echo __STACKPILOT_NO_DOWNLOADER__; exit 21; fi; "
+        "case \"$DISTRO\" in "
+        "  fedora|rhel|centos|rocky|almalinux|ol) "
+        "    echo installing_selinux_deps=yes; "
+        "    ($SUDO dnf install -y container-selinux selinux-policy-base >/dev/null 2>&1 || "
+        "     $SUDO yum install -y container-selinux selinux-policy-base >/dev/null 2>&1 || true); "
+        "    ;; "
+        "  amzn) "
+        "    ($SUDO yum install -y container-selinux >/dev/null 2>&1 || true); "
+        "    ;; "
+        "esac; "
+        "if command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state >/dev/null 2>&1; then "
+        "  echo configuring_firewalld=yes; "
+        "  $SUDO firewall-cmd --permanent --add-port=6443/tcp >/dev/null 2>&1 || true; "
+        "  $SUDO firewall-cmd --permanent --add-port=10250/tcp >/dev/null 2>&1 || true; "
+        "  $SUDO firewall-cmd --permanent --add-port=8472/udp >/dev/null 2>&1 || true; "
+        "  $SUDO firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true; "
+        "  $SUDO firewall-cmd --reload >/dev/null 2>&1 || true; "
+        "fi; "
+        "if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi \"^Status: active\"; then "
+        "  echo configuring_ufw=yes; "
+        "  $SUDO ufw allow 6443/tcp >/dev/null 2>&1 || true; "
+        "  $SUDO ufw allow 10250/tcp >/dev/null 2>&1 || true; "
+        "  $SUDO ufw allow 8472/udp >/dev/null 2>&1 || true; "
+        "fi; "
+        "echo installing_k3s=yes; "
+        "INSTALL_OK=no; "
+        "for attempt in 1 2 3; do "
+        "  echo install_attempt=\"$attempt\"; "
+        "  if $DL https://get.k3s.io | INSTALL_K3S_EXEC=\"server --cluster-init --secrets-encryption --write-kubeconfig-mode=644\" $SUDO sh - >/dev/null 2>&1; then "
+        "    INSTALL_OK=yes; break; "
+        "  fi; "
+        "  echo install_retry_after_failure=yes; sleep 5; "
+        "done; "
+        "if [ \"$INSTALL_OK\" != \"yes\" ]; then echo __STACKPILOT_K3S_INSTALL_FAILED__; exit 22; fi; "
+        "if command -v kubectl >/dev/null 2>&1; then K=\"kubectl\"; "
+        "elif [ \"$(id -u)\" -eq 0 ]; then K=\"k3s kubectl\"; "
+        "else K=\"$SUDO k3s kubectl\"; fi; "
+        "READY=no; "
+        "for i in $(seq 1 30); do "
+        "  if $K get nodes >/dev/null 2>&1; then READY=yes; break; fi; "
+        "  sleep 4; "
+        "done; "
+        "if [ \"$READY\" != \"yes\" ]; then "
+        "  echo __STACKPILOT_K8S_VERIFY_FAILED__; "
+        "  echo \"--- k3s service log ---\"; "
+        "  ($SUDO journalctl -u k3s --no-pager -n 40 2>/dev/null || $SUDO tail -n 40 /var/log/k3s.log 2>/dev/null || true); "
+        "  exit 23; "
+        "fi; "
+        "for i in $(seq 1 20); do "
+        "  if $K get nodes 2>/dev/null | grep -qw Ready; then break; fi; "
+        "  sleep 3; "
+        "done; "
+        "$K get nodes -o wide 2>/dev/null || true; "
         "echo kubernetes_status=ready; "
         "echo __STACKPILOT_PROVISION_K8S_DONE__";
 
@@ -987,12 +1080,18 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
     if (exitCode != 0 || output.find("__STACKPILOT_PROVISION_K8S_DONE__") == std::string::npos) {
         if (output.find("__STACKPILOT_SUDO_REQUIRED__") != std::string::npos) {
             result.error = "Lightweight Kubernetes setup requires root or passwordless sudo on the remote host";
-        } else if (output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
-            result.error = "curl is required to install lightweight Kubernetes";
+        } else if (output.find("__STACKPILOT_NO_DOWNLOADER__") != std::string::npos ||
+                   output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
+            result.error = "Neither curl nor wget is available on the remote host, and installing "
+                           "curl failed. Install one of them, then try again.";
         } else if (output.find("__STACKPILOT_K3S_INSTALL_FAILED__") != std::string::npos) {
-            result.error = "k3s installation failed on the remote host";
+            result.error = "k3s installation failed after three attempts. Check the host has network "
+                           "access to get.k3s.io and enough disk space.";
         } else if (output.find("__STACKPILOT_K8S_VERIFY_FAILED__") != std::string::npos) {
-            result.error = "k3s installed, but the Kubernetes node did not become ready";
+            // The script appends the k3s service log on this path, so the
+            // detail the operator needs is already in the output.
+            result.error = "k3s installed, but the node did not become ready within two minutes. "
+                           "The k3s service log is included in the output below.";
         } else if (exitCode == 124) {
             result.error = "Lightweight Kubernetes provisioning timed out";
         } else {
