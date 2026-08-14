@@ -323,6 +323,13 @@ export function ClusterBuilder() {
               </div>
             ) : (
               <>
+                <div className="flex items-center gap-2">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
+                    1
+                  </span>
+                  <h3 className="text-sm font-semibold">Choose the control plane</h3>
+                </div>
+
                 <div className="grid gap-4 lg:grid-cols-2">
                   <div className="space-y-2">
                     <Label>Control-plane server</Label>
@@ -358,34 +365,61 @@ export function ClusterBuilder() {
                       placeholder="production-edge"
                     />
                   </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="advertiseAddress">Advertise address</Label>
-                    <Input
-                      id="advertiseAddress"
-                      value={advertiseAddress}
-                      onChange={(event) => setAdvertiseAddress(event.target.value)}
-                      placeholder="Optional node IP or private mesh IP"
-                    />
+                </div>
+
+                {/* Three optional fields were competing for attention with the
+                    two that are actually required. Folded away by default. */}
+                <details className="group rounded-xl border border-border bg-muted/10">
+                  <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm">
+                    <span className="font-medium">Advanced network options</span>
+                    <span className="text-xs text-muted-foreground">
+                      Advertise address, TLS SAN, sudo password
+                    </span>
+                  </summary>
+                  <div className="grid gap-4 border-t border-border p-4 lg:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="advertiseAddress">Advertise address</Label>
+                      <Input
+                        id="advertiseAddress"
+                        value={advertiseAddress}
+                        onChange={(event) => setAdvertiseAddress(event.target.value)}
+                        placeholder="Private IP workers will connect to"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        The address other nodes use to reach the API server. On AWS this is the
+                        private IP, not the public one.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="tlsSan">TLS SAN</Label>
+                      <Input
+                        id="tlsSan"
+                        value={tlsSan}
+                        onChange={(event) => setTlsSan(event.target.value)}
+                        placeholder="Optional domain or fixed IP"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Extra hostname to include in the API server certificate.
+                      </p>
+                    </div>
+                    <div className="space-y-2 lg:col-span-2">
+                      <Label htmlFor="controlPlaneSudo">Control-plane sudo password</Label>
+                      <Input
+                        id="controlPlaneSudo"
+                        type="password"
+                        value={controlPlaneSudo}
+                        onChange={(event) => setControlPlaneSudo(event.target.value)}
+                        placeholder="Leave blank when passwordless sudo works"
+                      />
+                    </div>
                   </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="tlsSan">TLS SAN</Label>
-                    <Input
-                      id="tlsSan"
-                      value={tlsSan}
-                      onChange={(event) => setTlsSan(event.target.value)}
-                      placeholder="Optional domain or fixed IP"
-                    />
-                  </div>
-                  <div className="space-y-2 lg:col-span-2">
-                    <Label htmlFor="controlPlaneSudo">Control-plane sudo password</Label>
-                    <Input
-                      id="controlPlaneSudo"
-                      type="password"
-                      value={controlPlaneSudo}
-                      onChange={(event) => setControlPlaneSudo(event.target.value)}
-                      placeholder="Optional. Used once if passwordless sudo is unavailable."
-                    />
-                  </div>
+                </details>
+
+                <div className="flex items-center gap-2 pt-2">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
+                    2
+                  </span>
+                  <h3 className="text-sm font-semibold">Install Kubernetes on it</h3>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/20 p-4">
@@ -426,7 +460,12 @@ export function ClusterBuilder() {
                 <div className="space-y-3 rounded-xl border border-border bg-card p-4">
                   <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
                     <div>
-                      <h3 className="font-semibold text-foreground">Join worker servers</h3>
+                      <h3 className="flex items-center gap-2 font-semibold text-foreground">
+                        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
+                          3
+                        </span>
+                        Join worker servers
+                      </h3>
                       <p className="text-sm text-muted-foreground">
                         Select one or more saved servers. They will join the selected control plane as k3s agents.
                       </p>
@@ -609,7 +648,12 @@ export function ClusterBuilder() {
                           Inspect
                         </Button>
                         <Link
-                          href="/dashboard/logging-monitoring/infrastructure"
+                          // Without the connection id the monitor opens on the
+                          // local host and reports "no cluster detected" for a
+                          // cluster that is running perfectly well.
+                          href={`/dashboard/logging-monitoring/infrastructure?connection_id=${encodeURIComponent(
+                            cluster.control_plane_connection_id
+                          )}`}
                           className={buttonVariants({ variant: "outline", size: "sm" })}
                         >
                             <ExternalLink className="mr-2 h-4 w-4" />

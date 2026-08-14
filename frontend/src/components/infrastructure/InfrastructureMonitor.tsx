@@ -395,6 +395,20 @@ export function InfrastructureMonitor() {
     ...payload,
     target_connection_id: targetConnectionId === "local" ? "" : targetConnectionId,
   });
+  const clustersQuery = useQuery({
+    queryKey: ["kubernetes-clusters", "monitor-targets"],
+    queryFn: async () => {
+      const res = await api.get<{ clusters?: Array<{
+        id: string;
+        name: string;
+        control_plane_connection_id: string;
+        status: string;
+        nodes?: unknown[];
+      }> }>("/ssh/clusters");
+      return res.data.clusters || [];
+    },
+  });
+
   const connectionsQuery = useQuery({
     queryKey: ["ssh-connections"],
     queryFn: async () => {
@@ -997,6 +1011,27 @@ export function InfrastructureMonitor() {
               <SelectItem value="local">
                 Local StackPilot host
               </SelectItem>
+
+              {/* Clusters first: after building one, that is what people are
+                  looking for, and picking it by name beats knowing which saved
+                  server happens to be its control plane. */}
+              {(clustersQuery.data || []).length > 0 && (
+                <>
+                  <div className="px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Kubernetes clusters
+                  </div>
+                  {(clustersQuery.data || []).map((cluster) => (
+                    <SelectItem key={cluster.id} value={cluster.control_plane_connection_id}>
+                      {cluster.name} ({(cluster.nodes || []).length} node
+                      {(cluster.nodes || []).length === 1 ? "" : "s"})
+                    </SelectItem>
+                  ))}
+                  <div className="px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Individual hosts
+                  </div>
+                </>
+              )}
+
               {sshConnections.map((connection) => (
                 <SelectItem key={connection.id} value={connection.id}>
                   {connection.name} - {connection.username}@{connection.host}:{connection.port}
