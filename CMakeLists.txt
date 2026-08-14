@@ -82,6 +82,7 @@ if(STACKPILOT_BUILD_TESTS)
         src/services/DriftDetector.cpp
         src/services/CostModel.cpp
         src/services/PreviewEnvironments.cpp
+        src/services/AiStreamProxy.cpp
         src/services/LocalDockerRuntime.cpp
         src/services/DeploymentJournal.cpp
         src/services/SshService.cpp

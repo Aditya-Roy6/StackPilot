@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import {
+  Brain,
   BrainCircuit,
   Check,
   ChevronDown,
@@ -35,6 +36,7 @@ import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { StatusVerb } from "@/components/ui/status-verb";
 import { ThinkingPanel } from "@/components/ui/thinking-panel";
+import { streamAgentReply } from "@/lib/stream-agent";
 
 // Must exceed the ai-service (90s) and backend (120s) timeouts, otherwise the
 // browser aborts while the backend completes the generation and bills for it.
@@ -1379,7 +1381,91 @@ export default function AiAgentPage() {
     },
   });
 
-  const isRunning = runAgentMutation.isPending || commandMutation.isPending || autonomousDeployMutation.isPending;
+  // Live stream state. Kept separate from `messages` so a partial reply is
+  // never mistaken for a finished one -- it is rendered as its own transient
+  // bubble and only committed on the done frame.
+  // On by default: watching the answer form is the whole point. Off is for
+  // when someone wants the single atomic reply the blocking path gives.
+  const [streamingEnabled, setStreamingEnabled] = useState(true);
+  const [streamReasoning, setStreamReasoning] = useState("");
+  const [streamContent, setStreamContent] = useState("");
+  const [isStreaming, setIsStreaming] = useState(false);
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  const sendStreaming = async (prompt: string) => {
+    setStreamReasoning("");
+    setStreamContent("");
+    setIsStreaming(true);
+
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+
+    let reasoning = "";
+    let content = "";
+    let stats: ChatMessage["stats"] = {};
+
+    try {
+      await streamAgentReply({
+        message: prompt,
+        modelMode: mode === "thinking" ? "thinking" : "fast",
+        model: activeModelId,
+        provider,
+        signal: controller.signal,
+        onEvent: (event) => {
+          if (event.type === "reasoning") {
+            reasoning += event.delta;
+            setStreamReasoning(reasoning);
+          } else if (event.type === "content") {
+            content += event.delta;
+            setStreamContent(content);
+          } else if (event.type === "error") {
+            content += `
+
+_${event.error}_`;
+            setStreamContent(content);
+          } else if (event.type === "done") {
+            // The done frame carries the authoritative assembled text; trust it
+            // over the accumulated deltas in case a frame was dropped.
+            content = event.content || content;
+            reasoning = event.reasoning || reasoning;
+            const usage = event.token_usage || {};
+            stats = {
+              latencyMs: event.latency_ms,
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              totalTokens: usage.total_tokens,
+              model: event.model || activeModelId,
+              provider: event.provider,
+              traceId: event.trace_id,
+            };
+          }
+        },
+      });
+
+      appendMessage({
+        role: "assistant",
+        content: content || "_The model returned nothing._",
+        meta: `${stats.model || activeModelId} | streamed`,
+        reasoning,
+        stats,
+      });
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        appendMessage({
+          role: "assistant",
+          content: errorMessage(error, "Streaming failed."),
+          meta: "Error",
+        });
+      }
+    } finally {
+      setIsStreaming(false);
+      setStreamReasoning("");
+      setStreamContent("");
+      streamAbortRef.current = null;
+    }
+  };
+
+  const isRunning = isStreaming || runAgentMutation.isPending || commandMutation.isPending || autonomousDeployMutation.isPending;
 
   // The verb is picked from what was actually asked, so the indicator keys off
   // the most recent user turn rather than the composer (which is cleared on
@@ -1402,6 +1488,8 @@ export default function AiAgentPage() {
       commandMutation.mutate(trimmed);
     } else if (isDeployIntent(trimmed)) {
       autonomousDeployMutation.mutate(trimmed);
+    } else if (streamingEnabled) {
+      void sendStreaming(trimmed);
     } else {
       runAgentMutation.mutate(trimmed);
     }
@@ -1572,7 +1660,40 @@ export default function AiAgentPage() {
                 </div>
               </div>
             ))}
-            {isRunning && (
+            {isStreaming && (streamReasoning || streamContent) && (
+              <div className="flex justify-start">
+                <div className="max-w-[min(56rem,88%)] rounded-2xl border border-border bg-background px-5 py-4">
+                  {streamReasoning && (
+                    <div className="mb-3 rounded-lg border border-border bg-muted/30 p-3">
+                      <div className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                        <Brain className="h-3 w-3" />
+                        <span className="status-verb-shine">Thinking</span>
+                      </div>
+                      {/* Pinned to the bottom as it grows, so the newest
+                          reasoning stays in view without yanking the page. */}
+                      <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground [overflow-anchor:auto]">
+                        {streamReasoning}
+                      </pre>
+                    </div>
+                  )}
+                  {streamContent && (
+                    <div className="prose-ai text-sm leading-relaxed">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                        {streamContent}
+                      </ReactMarkdown>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => streamAbortRef.current?.abort()}
+                    className="mt-3 text-xs text-muted-foreground underline-offset-2 hover:underline"
+                  >
+                    Stop
+                  </button>
+                </div>
+              </div>
+            )}
+            {isRunning && !(isStreaming && (streamReasoning || streamContent)) && (
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
                 <StatusVerb prompt={lastUserPrompt} />
@@ -1772,6 +1893,36 @@ export default function AiAgentPage() {
                     ? "Quick replies for chat and simple commands. Switching modes also picks a matching model."
                     : "Slower and more careful. Use for diagnosing failures, planning Dockerfiles, and deployment decisions."}
                 </p>
+              </div>
+
+              <div className="flex items-start justify-between gap-4 rounded-lg border border-border bg-muted/20 p-3">
+                <div className="min-w-0">
+                  <Label className="cursor-pointer" htmlFor="stream-toggle">
+                    Stream the reply
+                  </Label>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Show reasoning and text as the model produces them. Turn off to wait for
+                    one complete reply instead.
+                  </p>
+                </div>
+                <button
+                  id="stream-toggle"
+                  type="button"
+                  role="switch"
+                  aria-checked={streamingEnabled}
+                  onClick={() => setStreamingEnabled((value) => !value)}
+                  className={cn(
+                    "mt-0.5 inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+                    streamingEnabled ? "bg-primary" : "bg-muted-foreground/30"
+                  )}
+                >
+                  <span
+                    className={cn(
+                      "inline-block h-4 w-4 rounded-full bg-background transition-transform",
+                      streamingEnabled ? "translate-x-4" : "translate-x-0.5"
+                    )}
+                  />
+                </button>
               </div>
 
               <div className="space-y-2">

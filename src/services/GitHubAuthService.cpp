@@ -242,8 +242,39 @@ void GitHubAuthService::exchangeCode(const std::string& code,
                     drogon::ReqResult userResult,
                     const drogon::HttpResponsePtr& userResponse
                 ) {
-                    if (userResult != drogon::ReqResult::Ok || !userResponse || !userResponse->getJsonObject()) {
-                        onError("Failed to fetch GitHub profile");
+                    // These are three different failures and the operator needs
+                    // to know which. Collapsing them into one message meant a
+                    // dead network, an expired token and an unparseable body
+                    // all produced the same unactionable "Failed to fetch
+                    // GitHub profile".
+                    if (userResult != drogon::ReqResult::Ok) {
+                        spdlog::warn("GitHub profile fetch transport failure: result={} ({})",
+                                     static_cast<int>(userResult),
+                                     drogon::to_string_view(userResult));
+                        onError("Could not reach api.github.com to read your GitHub profile");
+                        return;
+                    }
+                    if (!userResponse) {
+                        spdlog::warn("GitHub profile fetch returned no response object");
+                        onError("GitHub returned an empty response for your profile");
+                        return;
+                    }
+                    if (userResponse->getStatusCode() != drogon::k200OK) {
+                        spdlog::warn("GitHub profile fetch rejected: status={} body={}",
+                                     static_cast<int>(userResponse->getStatusCode()),
+                                     std::string(userResponse->getBody()).substr(0, 300));
+                        onError("GitHub refused the profile request (HTTP " +
+                                std::to_string(static_cast<int>(userResponse->getStatusCode())) + ")");
+                        return;
+                    }
+                    if (!userResponse->getJsonObject()) {
+                        // Drogon only parses a body as JSON when the response
+                        // content type says so, so a correct 200 can still land
+                        // here if GitHub labels it differently.
+                        spdlog::warn("GitHub profile response was not parseable as JSON: content-type={} body={}",
+                                     userResponse->getHeader("content-type"),
+                                     std::string(userResponse->getBody()).substr(0, 300));
+                        onError("GitHub returned an unreadable profile response");
                         return;
                     }
 

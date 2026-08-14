@@ -12,10 +12,10 @@ import uuid
 import ipaddress
 import socket
 from urllib.parse import urlparse
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, TypedDict
 
 import httpx
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi import Depends, FastAPI, HTTPException, Request
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -1274,3 +1274,135 @@ async def chat_project(request: AgentRequest) -> AgentResponse:
 @app.post("/chat/agent", response_model=AgentResponse)
 async def chat_agent(request: AgentRequest) -> AgentResponse:
     return await run_workflow("agent_chat", request)
+
+
+# ── live streaming ────────────────────────────────────────────────
+# The non-streaming path runs the LangGraph workflow, which awaits the whole
+# reply before the graph ends -- there is nothing incremental to forward. This
+# path deliberately bypasses the graph and talks to the provider directly, so
+# reasoning and content reach the browser as the model produces them.
+#
+# The trade is that the graph's post-processing (JSON normalisation, structured
+# output, confidence) does not apply mid-stream. The final `done` frame carries
+# the assembled text so the caller can persist the same thing the blocking
+# endpoint would have returned.
+
+
+def _sse(event: Dict[str, Any]) -> str:
+    """One Server-Sent Event frame. The blank line terminator is required."""
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def stream_agent_reply(request: AgentRequest) -> AsyncIterator[str]:
+    request.workflow_type = request.workflow_type or "agent_chat"
+    trace_id = str(uuid.uuid4())
+    start = time.perf_counter()
+
+    provider, base_url, api_key, model = provider_config(
+        request.provider,
+        request.model,
+        request.model_mode,
+        request.provider_overrides,
+    )
+
+    if not base_url or not api_key:
+        yield _sse({"type": "error", "error": "AI provider is not configured."})
+        yield _sse({"type": "done", "trace_id": trace_id, "content": "", "reasoning": ""})
+        return
+
+    prompt = build_prompt(request.workflow_type, request)
+    payload = chat_payload(
+        model,
+        prompt,
+        json_mode=False,
+        temperature=0.1 if request.model_mode == "thinking" else 0.25,
+        model_mode=request.model_mode,
+        stream=True,
+        max_tokens=4096 if request.model_mode == "thinking" else 1536,
+    )
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    usage: Dict[str, Any] = {}
+
+    # Tell the client what it is waiting for before any token arrives, so the
+    # placeholder can name the model rather than guessing.
+    yield _sse({"type": "start", "trace_id": trace_id, "model": model, "provider": provider})
+
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            async with client.stream(
+                "POST", f"{base_url}/chat/completions", headers=headers, json=payload
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
+
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+
+                    reasoning = delta.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        reasoning_parts.append(reasoning)
+                        yield _sse({"type": "reasoning", "delta": reasoning})
+
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        content_parts.append(content)
+                        yield _sse({"type": "content", "delta": content})
+    except Exception as exc:  # noqa: BLE001 - surfaced to the client verbatim
+        yield _sse({"type": "error", "error": redact_text(str(exc)[:400])})
+
+    text = "".join(content_parts).strip()
+    reasoning_text = "".join(reasoning_parts).strip()
+    if not text and reasoning_text:
+        # Reasoning-only reply: the working *is* the answer, so promote it and
+        # do not also report it as thinking.
+        text = reasoning_text
+        reasoning_text = ""
+
+    yield _sse(
+        {
+            "type": "done",
+            "trace_id": trace_id,
+            "provider": provider,
+            "model": model,
+            "content": text,
+            "reasoning": reasoning_text,
+            "latency_ms": int((time.perf_counter() - start) * 1000),
+            "token_usage": usage,
+        }
+    )
+
+
+@app.post("/chat/agent/stream")
+async def chat_agent_stream(request: AgentRequest) -> StreamingResponse:
+    return StreamingResponse(
+        stream_agent_reply(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Without this an intermediate proxy will buffer the whole response
+            # and deliver it at once, which looks exactly like streaming being
+            # broken.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
