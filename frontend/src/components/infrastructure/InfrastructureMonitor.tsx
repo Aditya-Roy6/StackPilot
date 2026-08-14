@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
 import { Boxes, Database, Eye, FileCode2, History, Loader2, Play, RefreshCw, RotateCw, ScrollText, Server, ShieldCheck, SlidersHorizontal, Square, Trash2, Undo2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -26,7 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 interface InfrastructureInventory {
@@ -391,6 +391,7 @@ export function InfrastructureMonitor() {
     return new URLSearchParams(window.location.search).get("connection_id") || "local";
   });
   const targetQueryValue = targetConnectionId === "local" ? "" : `?connection_id=${encodeURIComponent(targetConnectionId)}`;
+
   const withTarget = <T extends Record<string, unknown>>(payload: T) => ({
     ...payload,
     target_connection_id: targetConnectionId === "local" ? "" : targetConnectionId,
@@ -419,16 +420,46 @@ export function InfrastructureMonitor() {
       return response.data;
     },
   });
-  const sshConnections = Array.isArray(connectionsQuery.data?.connections)
-    ? connectionsQuery.data.connections
-    : [];
+  // Memoised because the `? :` produced a fresh array every render, which
+  // made the targetLabel memo below recompute on every render -- exactly what
+  // the memo exists to avoid.
+  const sshConnections = useMemo(
+    () =>
+      Array.isArray(connectionsQuery.data?.connections) ? connectionsQuery.data.connections : [],
+    [connectionsQuery.data]
+  );
+
+  // Resolved explicitly rather than relying on SelectValue: the cluster group
+  // wraps its items in a fragment, so the trigger could not mirror their text
+  // and fell back to showing the raw connection UUID.
+  const targetLabel = useMemo(() => {
+    if (targetConnectionId === "local") return "Local StackPilot host";
+    const cluster = (clustersQuery.data || []).find(
+      (entry) => entry.control_plane_connection_id === targetConnectionId
+    );
+    if (cluster) {
+      const nodeCount = (cluster.nodes || []).length;
+      return `${cluster.name} (${nodeCount} node${nodeCount === 1 ? "" : "s"})`;
+    }
+    const connection = sshConnections.find((entry) => entry.id === targetConnectionId);
+    if (connection) return `${connection.name} — ${connection.username}@${connection.host}`;
+    return "Select infrastructure target";
+  }, [targetConnectionId, clustersQuery.data, sshConnections]);
   const inventoryQuery = useQuery({
     queryKey: ["infrastructure-inventory", targetConnectionId],
     queryFn: async () => {
       const response = await api.get<InfrastructureInventory>(`/infrastructure/inventory${targetQueryValue}`);
       return normalizeInventory(response.data);
     },
-    refetchInterval: 10000,
+    // Keep showing the previous target's data while the new one loads.
+    // Without this the whole page empties on every switch and every poll,
+    // which reads as "nothing here" rather than "still loading".
+    placeholderData: keepPreviousData,
+    // A remote target shells out over SSH and takes seconds. Polling that on
+    // the local cadence means each request starts about when the last
+    // finished, so it never stops loading.
+    refetchInterval: targetConnectionId === "local" ? 10000 : 45000,
+    staleTime: targetConnectionId === "local" ? 5000 : 20000,
   });
 
   const claimedCount = useMemo(() => {
@@ -1002,10 +1033,10 @@ export function InfrastructureMonitor() {
             Observe, claim, and control Docker and Kubernetes resources on the StackPilot host or a saved SSH server.
           </p>
         </div>
-        <div className="flex flex-col gap-2 sm:items-end">
+        <div className="flex flex-wrap items-center gap-2">
           <Select value={targetConnectionId} onValueChange={(value) => setTargetConnectionId(value || "local")}>
-            <SelectTrigger className="h-10 min-w-[280px] justify-between">
-              <SelectValue placeholder="Select infrastructure target" />
+            <SelectTrigger className="h-10 min-w-[300px] justify-between">
+              <span className="truncate">{targetLabel}</span>
             </SelectTrigger>
             <SelectContent align="end" className="min-w-[280px]">
               <SelectItem value="local">
@@ -1039,10 +1070,20 @@ export function InfrastructureMonitor() {
               ))}
             </SelectContent>
           </Select>
-          <Button variant="outline" onClick={() => inventoryQuery.refetch()} disabled={inventoryQuery.isFetching}>
+          <Button
+            variant="outline"
+            className="h-10 shrink-0"
+            onClick={() => inventoryQuery.refetch()}
+            disabled={inventoryQuery.isFetching}
+          >
             <RefreshCw className={inventoryQuery.isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
             Refresh
           </Button>
+          {inventoryQuery.isFetching && (
+            // Remote inventory takes seconds. Saying so beats a page that
+            // looks stuck.
+            <span className="text-xs text-muted-foreground">Reading target…</span>
+          )}
         </div>
       </section>
 
