@@ -1259,13 +1259,43 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
         "echo __STACKPILOT_K3S_WORKER_JOIN_START__; "
         "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; "
         "command -v curl >/dev/null 2>&1 || { echo __STACKPILOT_CURL_MISSING__; exit 21; }; "
+        // Check the worker can actually reach the API server before installing
+        // anything. Without this the agent installs, retries in a loop
+        // forever, and the join is reported as successful -- which is exactly
+        // what happened: three nodes recorded ready, one node in the cluster.
+        //
+        // The usual cause is a security group that allows 6443 from itself,
+        // which only matches private-IP traffic, while the agent is dialling
+        // the control plane's public address.
+        "if ! curl -sk --connect-timeout 10 --max-time 15 " + shellQuote(cleanedServerUrl + "/ping") + " >/dev/null 2>&1; then "
+        "  echo __STACKPILOT_SERVER_UNREACHABLE__; exit 25; "
+        "fi; "
+        "echo server_reachable=yes; "
         "if systemctl is-active --quiet k3s-agent 2>/dev/null || systemctl is-active --quiet k3s 2>/dev/null; then echo STACKPILOT_k3s_existing=yes; "
         "else tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
         "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_AGENT_INSTALL_FAILED__; exit 23; }; rm -f \"$tmp\"; fi; "
-        "sleep 5; "
-        "if systemctl is-active --quiet k3s-agent 2>/dev/null || systemctl is-active --quiet k3s 2>/dev/null; then "
-        "echo STACKPILOT_worker_status=ready; echo __STACKPILOT_K3S_WORKER_JOIN_DONE__; "
-        "else echo __STACKPILOT_K3S_AGENT_VERIFY_FAILED__; exit 24; fi";
+        // `systemctl is-active` only says systemd started the unit. A k3s agent
+        // that cannot reach or authenticate to the control plane stays active
+        // and retries indefinitely, so this check reported success for a node
+        // that never joined.
+        //
+        // kubelet.kubeconfig is written only after the server accepts the node,
+        // so its existence is real evidence of registration.
+        "JOINED=no; "
+        "for i in $(seq 1 24); do "
+        "  if [ -s /var/lib/rancher/k3s/agent/kubelet.kubeconfig ]; then JOINED=yes; break; fi; "
+        "  sleep 5; "
+        "done; "
+        "if [ \"$JOINED\" = yes ]; then "
+        "  echo STACKPILOT_worker_status=ready; echo __STACKPILOT_K3S_WORKER_JOIN_DONE__; "
+        "else "
+        "  echo __STACKPILOT_K3S_AGENT_VERIFY_FAILED__; "
+        "  echo \"--- k3s agent log ---\"; "
+        "  (" + std::string(hasSudoPass
+              ? "echo " + shellQuote(sudoPassword) + " | sudo -S journalctl -u k3s-agent --no-pager -n 40"
+              : "sudo -n journalctl -u k3s-agent --no-pager -n 40") + " 2>/dev/null || true); "
+        "  exit 24; "
+        "fi";
 
     const std::string command =
         "timeout 900s sh -lc " +
@@ -1287,8 +1317,14 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
             result.error = "Unable to download the k3s installer on the worker";
         } else if (output.find("__STACKPILOT_K3S_AGENT_INSTALL_FAILED__") != std::string::npos) {
             result.error = "k3s agent installation failed on the worker";
+        } else if (output.find("__STACKPILOT_SERVER_UNREACHABLE__") != std::string::npos) {
+            result.error = "This worker cannot reach the control plane's API server on port 6443. "
+                           "If the cluster's API address is a public IP, a security group rule that "
+                           "allows 6443 only from the security group itself will not match, because "
+                           "the worker connects from its public address.";
         } else if (output.find("__STACKPILOT_K3S_AGENT_VERIFY_FAILED__") != std::string::npos) {
-            result.error = "k3s agent installed, but the worker service did not become ready";
+            result.error = "The k3s agent started but never registered with the control plane within "
+                           "two minutes. The agent log is included below.";
         } else if (exitCode == 124) {
             result.error = "Worker join timed out";
         } else {
