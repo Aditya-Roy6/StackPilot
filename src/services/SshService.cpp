@@ -1026,7 +1026,10 @@ SshOperationResult SshService::initializeK3sControlPlane(const SshConnectionConf
         return result;
     }
 
-    std::string installExec = "server --secrets-encryption --write-kubeconfig-mode=644";
+    // --cluster-init starts embedded etcd. Without it a second control-plane
+    // node can never join, and the only fix is rebuilding the cluster. It is
+    // harmless on a single node, so it is always on.
+    std::string installExec = "server --cluster-init --secrets-encryption --write-kubeconfig-mode=644";
     if (!trim(advertiseAddress).empty()) {
         installExec += " --node-ip " + trim(advertiseAddress);
         installExec += " --advertise-address " + trim(advertiseAddress);
@@ -1072,6 +1075,21 @@ SshOperationResult SshService::initializeK3sControlPlane(const SshConnectionConf
         "echo STACKPILOT_cluster_server_url=" + shellQuote("https://" + apiHost + ":6443") + "; "
         "printf 'STACKPILOT_cluster_token='; if [ \"$(id -u)\" -eq 0 ]; then cat /var/lib/rancher/k3s/server/node-token; else " + tokenCommand + "; fi; "
         "echo __STACKPILOT_K3S_CLUSTER_NODES_BEGIN__; " + getNodesCommand + "; echo __STACKPILOT_K3S_CLUSTER_NODES_END__; "
+        // The admin kubeconfig. Without this the platform can provision a
+        // cluster it then has no way to talk to -- which is precisely the
+        // state the Cluster Builder was in.
+        //
+        // k3s writes `server: https://127.0.0.1:6443`, which is correct on the
+        // node and useless anywhere else, so the address is rewritten to one
+        // the backend can actually reach before the file leaves the host.
+        "echo __STACKPILOT_K3S_KUBECONFIG_BEGIN__; " +
+        std::string(hasSudoPass
+            ? "echo " + shellQuote(sudoPassword) + " | sudo -S cat /etc/rancher/k3s/k3s.yaml"
+            : "if [ \"$(id -u)\" -eq 0 ]; then cat /etc/rancher/k3s/k3s.yaml; "
+              "else sudo -n cat /etc/rancher/k3s/k3s.yaml; fi") +
+        " | sed " + shellQuote("s#https://127.0.0.1:6443#https://" + apiHost + ":6443#g") +
+        " | sed " + shellQuote("s#https://localhost:6443#https://" + apiHost + ":6443#g") + "; "
+        "echo __STACKPILOT_K3S_KUBECONFIG_END__; "
         "echo __STACKPILOT_K3S_CLUSTER_INIT_DONE__";
 
     const std::string command =
@@ -1181,6 +1199,141 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
     }
 
     result.success = true;
+    return result;
+}
+
+SshOperationResult SshService::joinK3sServer(const SshConnectionConfig& config,
+                                             const std::string& serverUrl,
+                                             const std::string& nodeToken,
+                                             const std::string& sudoPassword) const {
+    SshOperationResult result;
+    std::string error;
+    if (!isValidConnectionConfig(config, error)) {
+        result.error = error;
+        return result;
+    }
+    const std::string cleanedServerUrl = trim(serverUrl);
+    const std::string cleanedToken = trim(nodeToken);
+    if (!cleanedServerUrl.starts_with("https://") || cleanedToken.empty() ||
+        !isValidClusterTextValue(cleanedServerUrl, 512) || !isValidClusterTextValue(cleanedToken, 4096)) {
+        result.error = "A valid k3s server URL and node token are required";
+        return result;
+    }
+
+    const SessionFiles files = prepareSessionFiles(config);
+    const bool hasSudoPass = !sudoPassword.empty();
+    const std::string sudoCheck = hasSudoPass
+        ? "echo " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1"
+        : "sudo -n true >/dev/null 2>&1";
+
+    // `server` rather than `agent`, joined to the existing etcd.
+    const std::string env =
+        "K3S_URL=" + shellQuote(cleanedServerUrl) + " K3S_TOKEN=" + shellQuote(cleanedToken) +
+        " INSTALL_K3S_EXEC=" + shellQuote("server --server " + cleanedServerUrl + " --secrets-encryption --write-kubeconfig-mode=644");
+    const std::string installAsRoot = "env " + env + " sh \"$tmp\"";
+    const std::string installWithSudo = hasSudoPass
+        ? "echo " + shellQuote(sudoPassword) + " | sudo -S env " + env + " sh \"$tmp\""
+        : "sudo -n env " + env + " sh \"$tmp\"";
+
+    const std::string remoteCommand =
+        "set -e; "
+        "echo __STACKPILOT_K3S_SERVER_JOIN_START__; "
+        "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; "
+        "command -v curl >/dev/null 2>&1 || { echo __STACKPILOT_CURL_MISSING__; exit 21; }; "
+        "tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
+        "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_SERVER_JOIN_FAILED__; exit 23; }; rm -f \"$tmp\"; "
+        "sleep 8; "
+        "echo __STACKPILOT_K3S_SERVER_JOIN_DONE__";
+
+    const std::string command =
+        "timeout 900s sh -lc " +
+        shellQuote(files.sshpassPrefix + files.sshPrefix + " " + shellQuote(remoteCommand));
+
+    std::string output;
+    const int exitCode = runCommand(command, output);
+    cleanupSessionFiles(files);
+    capOutput(output, 160000);
+
+    result.exitCode = exitCode;
+    result.output = output;
+    if (exitCode == 0 && output.find("__STACKPILOT_K3S_SERVER_JOIN_DONE__") != std::string::npos) {
+        result.success = true;
+        return result;
+    }
+    if (output.find("__STACKPILOT_SUDO_REQUIRED__") != std::string::npos) {
+        result.error = "Passwordless sudo (or a sudo password) is required on the control-plane node";
+    } else if (output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
+        result.error = "curl is required to install k3s on this node";
+    } else if (output.find("__STACKPILOT_K3S_DOWNLOAD_FAILED__") != std::string::npos) {
+        result.error = "Unable to download the k3s installer";
+    } else if (exitCode == 124) {
+        result.error = "Control-plane join timed out";
+    } else {
+        result.error = "Control-plane node failed to join the cluster. "
+                       "The first server must have been started with --cluster-init for HA to work.";
+    }
+    return result;
+}
+
+SshOperationResult SshService::removeK3sNode(const SshConnectionConfig& controlPlane,
+                                             const std::string& nodeName,
+                                             const std::string& sudoPassword) const {
+    SshOperationResult result;
+    std::string error;
+    if (!isValidConnectionConfig(controlPlane, error)) {
+        result.error = error;
+        return result;
+    }
+    const std::string cleanedName = trim(nodeName);
+    if (cleanedName.empty() || !isValidClusterTextValue(cleanedName, 253)) {
+        result.error = "A valid node name is required";
+        return result;
+    }
+
+    const SessionFiles files = prepareSessionFiles(controlPlane);
+    const bool hasSudoPass = !sudoPassword.empty();
+    const std::string kubectl = hasSudoPass
+        ? "echo " + shellQuote(sudoPassword) + " | sudo -S k3s kubectl"
+        : "if [ \"$(id -u)\" -eq 0 ]; then k3s kubectl; else sudo -n k3s kubectl; fi";
+    const std::string k = hasSudoPass ? kubectl : "$KUBECTL";
+
+    const std::string remoteCommand =
+        "set -e; "
+        "echo __STACKPILOT_K3S_NODE_REMOVE_START__; " +
+        std::string(hasSudoPass ? "" :
+            "if [ \"$(id -u)\" -eq 0 ]; then KUBECTL='k3s kubectl'; else KUBECTL='sudo -n k3s kubectl'; fi; ") +
+        // Cordon then drain then delete. Deleting without draining strands
+        // every pod that was running on the node.
+        k + " cordon " + shellQuote(cleanedName) + " || { echo __STACKPILOT_NODE_NOT_FOUND__; exit 24; }; "
+        "echo __STACKPILOT_NODE_CORDONED__; " +
+        k + " drain " + shellQuote(cleanedName) +
+        " --ignore-daemonsets --delete-emptydir-data --force --timeout=120s || echo __STACKPILOT_DRAIN_INCOMPLETE__; "
+        "echo __STACKPILOT_NODE_DRAINED__; " +
+        k + " delete node " + shellQuote(cleanedName) + " || { echo __STACKPILOT_NODE_DELETE_FAILED__; exit 25; }; "
+        "echo __STACKPILOT_K3S_NODE_REMOVE_DONE__";
+
+    const std::string command =
+        "timeout 300s sh -lc " +
+        shellQuote(files.sshpassPrefix + files.sshPrefix + " " + shellQuote(remoteCommand));
+
+    std::string output;
+    const int exitCode = runCommand(command, output);
+    cleanupSessionFiles(files);
+    capOutput(output, 160000);
+
+    result.exitCode = exitCode;
+    result.output = output;
+    if (exitCode == 0 && output.find("__STACKPILOT_K3S_NODE_REMOVE_DONE__") != std::string::npos) {
+        result.success = true;
+        return result;
+    }
+    if (output.find("__STACKPILOT_NODE_NOT_FOUND__") != std::string::npos) {
+        result.error = "That node is not part of the cluster";
+    } else if (exitCode == 124) {
+        result.error = "Node removal timed out while draining";
+    } else {
+        result.error = "Failed to remove the node from the cluster";
+    }
     return result;
 }
 

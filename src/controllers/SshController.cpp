@@ -3,6 +3,9 @@
 // ============================================================
 
 #include "SshController.h"
+#include <cctype>
+#include <algorithm>
+#include "../utils/StringUtils.h"
 #include "../db/Database.h"
 #include "../services/SshService.h"
 #include "../utils/JwtHelper.h"
@@ -64,6 +67,19 @@ std::string outputValue(const std::string& output, const std::string& key) {
     return "";
 }
 
+/// Pulls the kubeconfig out from between its markers.
+std::string extractBlock(const std::string& output,
+                         const std::string& beginMarker,
+                         const std::string& endMarker) {
+    const size_t begin = output.find(beginMarker);
+    if (begin == std::string::npos) return "";
+    const size_t start = output.find('\n', begin);
+    if (start == std::string::npos) return "";
+    const size_t end = output.find(endMarker, start);
+    if (end == std::string::npos) return "";
+    return strings::trim(output.substr(start + 1, end - start - 1));
+}
+
 std::string redactClusterToken(std::string output) {
     const std::string key = "STACKPILOT_cluster_token=";
     size_t pos = 0;
@@ -76,7 +92,24 @@ std::string redactClusterToken(std::string output) {
         output.replace(valueStart, valueEnd - valueStart, "[redacted]");
         pos = valueStart + 10;
     }
+
+    // The kubeconfig block is a full cluster-admin credential. It is stored
+    // encrypted, and must not survive in last_status or the response body that
+    // the browser renders.
+    const std::string begin = "__STACKPILOT_K3S_KUBECONFIG_BEGIN__";
+    const std::string end = "__STACKPILOT_K3S_KUBECONFIG_END__";
+    const size_t from = output.find(begin);
+    const size_t to = output.find(end);
+    if (from != std::string::npos && to != std::string::npos && to > from) {
+        output.replace(from, to + end.size() - from, "[kubeconfig captured and stored encrypted]");
+    }
     return output;
+}
+
+std::string toLowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
 }
 
 std::string safeClusterName(const std::string& requested, const std::string& fallback) {
@@ -804,21 +837,32 @@ void SshController::initializeKubernetesCluster(
 
         const std::string clusterName = safeClusterName(requestedClusterName, connectionName);
         const std::string encryptedToken = TokenCrypto::encrypt(nodeToken);
+        // This is what makes a built cluster usable as a deploy target. Without
+        // it the platform provisions a cluster it can never talk to again.
+        const std::string kubeconfig = extractBlock(initResult.output,
+                                                    "__STACKPILOT_K3S_KUBECONFIG_BEGIN__",
+                                                    "__STACKPILOT_K3S_KUBECONFIG_END__");
+        const std::string encryptedKubeconfig =
+            kubeconfig.empty() ? std::string() : TokenCrypto::encrypt(kubeconfig);
         pqxx::work writeTxn(*conn);
         auto clusterRows = writeTxn.exec_params(
-            "INSERT INTO kubernetes_clusters (user_id, name, provider, control_plane_connection_id, server_url, join_token_encrypted, status, last_status) "
-            "VALUES ($1, $2, 'k3s', $3, $4, $5, 'ready', $6) "
+            "INSERT INTO kubernetes_clusters (user_id, name, provider, control_plane_connection_id, server_url, join_token_encrypted, status, last_status, kubeconfig_encrypted) "
+            "VALUES ($1, $2, 'k3s', $3, $4, $5, 'ready', $6, NULLIF($7, '')) "
             "ON CONFLICT (user_id, name) DO UPDATE SET "
             "control_plane_connection_id = EXCLUDED.control_plane_connection_id, "
             "server_url = EXCLUDED.server_url, join_token_encrypted = EXCLUDED.join_token_encrypted, "
-            "status = 'ready', last_status = EXCLUDED.last_status, updated_at = NOW() "
+            "status = 'ready', last_status = EXCLUDED.last_status, updated_at = NOW(), "
+            // Keep the existing kubeconfig if this run could not read one,
+            // rather than blanking a working target.
+            "kubeconfig_encrypted = COALESCE(NULLIF(EXCLUDED.kubeconfig_encrypted, ''), kubernetes_clusters.kubeconfig_encrypted) "
             "RETURNING id, name, provider, server_url, status, created_at, updated_at",
             userId,
             clusterName,
             id,
             serverUrl,
             encryptedToken,
-            redactedDetails
+            redactedDetails,
+            encryptedKubeconfig
         );
         const std::string clusterId = clusterRows[0]["id"].as<std::string>();
         writeTxn.exec_params(
@@ -920,22 +964,35 @@ void SshController::joinKubernetesCluster(
         const SshConnectionConfig workerConfig = rowToConfig(workerRows[0]);
         readTxn.commit();
 
+        // "server" adds another control plane so the cluster survives losing
+        // the first node; anything else joins as a worker, which stays the
+        // default so existing callers are unaffected.
+        const std::string requestedRole = toLowerAscii(jsonString(*body, "role", "agent"));
+        const bool joinAsServer = requestedRole == "server" || requestedRole == "control-plane";
+
         SshService sshService;
-        auto joinResult = sshService.joinK3sWorker(workerConfig, serverUrl, nodeToken, sudoPassword);
+        auto joinResult = joinAsServer
+            ? sshService.joinK3sServer(workerConfig, serverUrl, nodeToken, sudoPassword)
+            : sshService.joinK3sWorker(workerConfig, serverUrl, nodeToken, sudoPassword);
         const std::string redactedDetails = redactClusterToken(joinResult.output);
 
         pqxx::work writeTxn(*conn);
         writeTxn.exec_params(
             "INSERT INTO kubernetes_cluster_nodes (cluster_id, connection_id, role, status, last_status, joined_at) "
-            "VALUES ($1, $2, 'agent', $3, $4, CASE WHEN $3 = 'ready' THEN NOW() ELSE NULL END) "
+            "VALUES ($1, $2, $5, $3, $4, CASE WHEN $3 = 'ready' THEN NOW() ELSE NULL END) "
             "ON CONFLICT (cluster_id, connection_id) DO UPDATE SET "
-            "role = 'agent', status = EXCLUDED.status, last_status = EXCLUDED.last_status, "
+            "role = EXCLUDED.role, status = EXCLUDED.status, last_status = EXCLUDED.last_status, "
             "joined_at = CASE WHEN EXCLUDED.status = 'ready' THEN NOW() ELSE kubernetes_cluster_nodes.joined_at END, updated_at = NOW()",
             clusterId,
             workerConnectionId,
             joinResult.success ? "ready" : "failed",
-            redactedDetails
+            redactedDetails,
+            joinAsServer ? "server" : "agent"
         );
+        if (joinAsServer && joinResult.success) {
+            writeTxn.exec_params(
+                "UPDATE kubernetes_clusters SET ha_enabled = TRUE WHERE id = $1", clusterId);
+        }
         writeTxn.exec_params(
             "UPDATE kubernetes_clusters SET status = $1, updated_at = NOW() WHERE id = $2",
             joinResult.success ? "ready" : "degraded",
@@ -965,6 +1022,96 @@ void SshController::joinKubernetesCluster(
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
         spdlog::error("Join Kubernetes cluster error: {}", e.what());
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Internal server error"));
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
+    }
+}
+
+void SshController::removeKubernetesNode(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& id,
+    const std::string& nodeName
+) {
+    const std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Unauthorized"));
+        resp->setStatusCode(drogon::k401Unauthorized);
+        callback(resp);
+        return;
+    }
+
+    const auto body = req->getJsonObject();
+    const std::string sudoPassword = body ? jsonString(*body, "sudo_password") : "";
+
+    try {
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work readTxn(*conn);
+
+        // The removal runs from the control plane, so `id` is the control
+        // plane's saved connection and the node is identified by its
+        // Kubernetes name.
+        auto rows = readTxn.exec_params(
+            "SELECT c.id AS cluster_id, s.id AS connection_id, s.name, "
+            "COALESCE(s.connection_type, 'ssh') AS connection_type, s.host, s.port, s.username, s.auth_type, "
+            "s.password_encrypted, s.private_key_encrypted, s.known_hosts_entry "
+            "FROM kubernetes_clusters c "
+            "JOIN ssh_connections s ON s.id = c.control_plane_connection_id "
+            "WHERE c.user_id = $1 AND c.control_plane_connection_id = $2 "
+            "ORDER BY c.updated_at DESC LIMIT 1",
+            userId,
+            id
+        );
+        if (rows.empty()) {
+            readTxn.commit();
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(
+                makeErrorPayload("No cluster is managed from this connection"));
+            resp->setStatusCode(drogon::k404NotFound);
+            callback(resp);
+            return;
+        }
+
+        const std::string clusterId = rows[0]["cluster_id"].as<std::string>();
+        const SshConnectionConfig controlPlane = rowToConfig(rows[0]);
+        readTxn.commit();
+
+        SshService sshService;
+        const auto removal = sshService.removeK3sNode(controlPlane, nodeName, sudoPassword);
+
+        pqxx::work writeTxn(*conn);
+        if (removal.success) {
+            // Marked removed rather than deleted: the cluster keeps a record of
+            // what was once part of it, which matters when working out why a
+            // workload moved.
+            writeTxn.exec_params(
+                "UPDATE kubernetes_cluster_nodes SET status = 'removed', removed_at = NOW(), "
+                "last_status = $3, updated_at = NOW() "
+                "WHERE cluster_id = $1 AND connection_id IN ("
+                "  SELECT id FROM ssh_connections WHERE user_id = $4 AND (name = $2 OR host = $2)"
+                ")",
+                clusterId, nodeName, redactClusterToken(removal.output), userId);
+        }
+        writeTxn.commit();
+
+        Json::Value payload;
+        payload["success"] = removal.success;
+        payload["message"] = removal.success
+            ? "Node drained and removed from the cluster"
+            : "Node removal failed";
+        payload["cluster_id"] = clusterId;
+        payload["node"] = nodeName;
+        payload["details"] = redactClusterToken(removal.output);
+        if (!removal.success) {
+            payload["error"] = removal.error;
+        }
+
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+        resp->setStatusCode(removal.success ? drogon::k200OK : drogon::k400BadRequest);
+        callback(resp);
+    } catch (const std::exception& e) {
+        spdlog::error("Remove Kubernetes node error: {}", e.what());
         auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Internal server error"));
         resp->setStatusCode(drogon::k500InternalServerError);
         callback(resp);

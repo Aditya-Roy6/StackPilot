@@ -224,7 +224,10 @@ InfrastructureTarget resolveInfrastructureTarget(const std::string& userId,
     const auto rows = txn.exec_params(
         "SELECT id, name, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, "
         "password_encrypted, private_key_encrypted, known_hosts_entry "
-        "FROM ssh_connections WHERE id = $1 AND user_id = $2",
+        "FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
+        "  SELECT 1 FROM organization_members m1 "
+        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
         connectionId,
         userId
     );

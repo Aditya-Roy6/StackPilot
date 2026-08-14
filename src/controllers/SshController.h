@@ -21,6 +21,7 @@ public:
     ADD_METHOD_TO(SshController::initializeKubernetesCluster, "/api/v1/ssh/connections/{id}/cluster/init", drogon::Post);
     ADD_METHOD_TO(SshController::joinKubernetesCluster, "/api/v1/ssh/connections/{id}/cluster/join", drogon::Post);
     ADD_METHOD_TO(SshController::inspectKubernetesCluster, "/api/v1/ssh/connections/{id}/cluster/status", drogon::Get);
+    ADD_METHOD_TO(SshController::removeKubernetesNode, "/api/v1/ssh/connections/{id}/cluster/nodes/{node}", drogon::Delete);
     ADD_METHOD_TO(SshController::browseConnection, "/api/v1/ssh/connections/{id}/browse", drogon::Post);
     ADD_METHOD_TO(SshController::executeCommand, "/api/v1/ssh/connections/{id}/command", drogon::Post);
     ADD_METHOD_TO(SshController::cloneRepository, "/api/v1/ssh/connections/{id}/git/clone", drogon::Post);
@@ -51,6 +52,13 @@ public:
     void joinKubernetesCluster(const drogon::HttpRequestPtr& req,
                                std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                const std::string& id);
+    /// Cordons, drains and removes one node from the cluster. Draining first
+    /// is what makes it safe; deleting a node outright strands its pods.
+    void removeKubernetesNode(const drogon::HttpRequestPtr& req,
+                              std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                              const std::string& id,
+                              const std::string& nodeName);
+
     void inspectKubernetesCluster(const drogon::HttpRequestPtr& req,
                                   std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                   const std::string& id);

@@ -1374,7 +1374,14 @@ void ProjectController::createProject(
                 callback(resp); return;
             }
             auto sshRows = txn.exec_params(
-                "SELECT id FROM ssh_connections WHERE id = $1 AND user_id = $2",
+                // Org-visible, not owner-only. The deploy path already resolves this
+                // connection with no user gate, so refusing a teammate here
+                // produced a project they could deploy but not edit.
+                "SELECT s.id FROM ssh_connections s "
+                "WHERE s.id = $1 AND (s.user_id = $2 OR EXISTS ("
+                "  SELECT 1 FROM organization_members m1 "
+                "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+                "  WHERE m1.user_id = s.user_id AND m2.user_id = $2))",
                 sshConnectionId,
                 userId
             );
@@ -1498,7 +1505,14 @@ void ProjectController::createProject(
                 callback(resp); return;
             }
             auto remoteRows = txn.exec_params(
-                "SELECT id FROM ssh_connections WHERE id = $1 AND user_id = $2",
+                // Org-visible, not owner-only. The deploy path already resolves this
+                // connection with no user gate, so refusing a teammate here
+                // produced a project they could deploy but not edit.
+                "SELECT s.id FROM ssh_connections s "
+                "WHERE s.id = $1 AND (s.user_id = $2 OR EXISTS ("
+                "  SELECT 1 FROM organization_members m1 "
+                "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+                "  WHERE m1.user_id = s.user_id AND m2.user_id = $2))",
                 remoteConnectionId,
                 userId
             );
@@ -1545,7 +1559,14 @@ void ProjectController::createProject(
             }
             if (!envConfig.remoteConnectionId.empty()) {
                 auto envRemoteRows = txn.exec_params(
-                    "SELECT id FROM ssh_connections WHERE id = $1 AND user_id = $2",
+                    // Org-visible, not owner-only. The deploy path already resolves this
+                // connection with no user gate, so refusing a teammate here
+                // produced a project they could deploy but not edit.
+                "SELECT s.id FROM ssh_connections s "
+                "WHERE s.id = $1 AND (s.user_id = $2 OR EXISTS ("
+                "  SELECT 1 FROM organization_members m1 "
+                "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+                "  WHERE m1.user_id = s.user_id AND m2.user_id = $2))",
                     envConfig.remoteConnectionId,
                     userId
                 );
@@ -1898,7 +1919,10 @@ void ProjectController::updateProject(
 
             auto sshRows = txn.exec_params(
                 "SELECT id, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
-                "FROM ssh_connections WHERE id = $1 AND user_id = $2",
+                "FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
+        "  SELECT 1 FROM organization_members m1 "
+        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
                 sshConnectionId,
                 userId
             );
@@ -2017,7 +2041,10 @@ void ProjectController::updateProject(
             }
             auto remoteRows = txn.exec_params(
                 "SELECT id, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
-                "FROM ssh_connections WHERE id = $1 AND user_id = $2",
+                "FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
+        "  SELECT 1 FROM organization_members m1 "
+        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
                 remoteConnectionId,
                 userId
             );

@@ -119,7 +119,13 @@ bool remoteConnectionBelongsToUser(pqxx::transaction_base& txn,
         return true;
     }
     auto rows = txn.exec_params(
-        "SELECT id FROM ssh_connections WHERE id = $1 AND user_id = $2",
+        // Same reasoning as ProjectController: an environment may point at a
+        // connection owned by a teammate, because the deploy path resolves it
+        // without a user gate anyway.
+        "SELECT id FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
+        "  SELECT 1 FROM organization_members m1 "
+        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
+        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
         remoteConnectionId,
         userId
     );

@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import api from "@/lib/api";
+import { readPrivateKeyFile } from "@/lib/private-key";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -37,6 +38,7 @@ import {
   Unplug,
   Wrench,
   X,
+  Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 import { GitHubAuthButton } from "@/components/auth/GitHubAuthButton";
@@ -151,6 +153,11 @@ export default function SettingsPage() {
   const [sshPassword, setSshPassword] = useState("");
   const [showSshPassword, setShowSshPassword] = useState(false);
   const [sshPrivateKey, setSshPrivateKey] = useState("");
+  // Shown next to the field so it is obvious which file was loaded;
+  // cleared if the textarea is edited by hand, because it would then be
+  // claiming a provenance that is no longer true.
+  const [sshKeyFileName, setSshKeyFileName] = useState("");
+  const sshKeyFileRef = useRef<HTMLInputElement>(null);
   const [probesByConnection, setProbesByConnection] = useState<Record<string, ProbeResponse>>({});
   const [terminalConnection, setTerminalConnection] = useState<SshConnection | null>(null);
   const [loginHistoryOpen, setLoginHistoryOpen] = useState(false);
@@ -746,14 +753,69 @@ export default function SettingsPage() {
                   </div>
                 ) : sshConnectionType === "ssh" ? (
                   <div className="grid gap-2 md:col-span-2">
-                    <Label htmlFor="ssh-private-key">Private Key</Label>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <Label htmlFor="ssh-private-key">Private Key</Label>
+                      <div className="flex items-center gap-2">
+                        {sshKeyFileName && (
+                          <span className="text-xs text-muted-foreground">{sshKeyFileName}</span>
+                        )}
+                        <input
+                          ref={sshKeyFileRef}
+                          type="file"
+                          // .pem/.key are conventional; many keys have no
+                          // extension at all, so the picker must not exclude them.
+                          accept=".pem,.key,.txt,application/x-pem-file"
+                          className="hidden"
+                          onChange={async (event) => {
+                            const file = event.target.files?.[0];
+                            // Reset immediately so picking the same file twice
+                            // still fires a change event.
+                            event.target.value = "";
+                            if (!file) return;
+
+                            const parsed = await readPrivateKeyFile(file);
+                            if (!parsed.ok) {
+                              setSshKeyFileName("");
+                              toast.error(parsed.error || "Could not read that key file.");
+                              return;
+                            }
+                            setSshPrivateKey(parsed.key);
+                            setSshKeyFileName(file.name);
+                            // The file never leaves the browser except through
+                            // this field, so say what was accepted rather than
+                            // leaving the user to eyeball 40 lines of base64.
+                            toast.success(
+                              `Loaded ${parsed.format} key from ${file.name}` +
+                                (parsed.notes.length ? ` (${parsed.notes.join("; ")})` : "")
+                            );
+                          }}
+                        />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => sshKeyFileRef.current?.click()}
+                        >
+                          <Upload className="h-4 w-4" />
+                          Upload .pem
+                        </Button>
+                      </div>
+                    </div>
                     <textarea
                       id="ssh-private-key"
                       value={sshPrivateKey}
-                      onChange={(e) => setSshPrivateKey(e.target.value)}
+                      onChange={(e) => {
+                        setSshPrivateKey(e.target.value);
+                        setSshKeyFileName("");
+                      }}
                       placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-                      className="min-h-[160px] rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm outline-none transition-colors"
+                      className="min-h-[160px] rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground shadow-sm outline-none transition-colors"
                     />
+                    <p className="text-xs text-muted-foreground">
+                      The file is read in your browser and never uploaded separately. Line endings
+                      are normalised, and public keys, PuTTY .ppk files and passphrase-protected
+                      keys are rejected with an explanation.
+                    </p>
                   </div>
                 ) : null}
               </div>

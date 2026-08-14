@@ -3,6 +3,9 @@
 // ============================================================
 
 #include "KubernetesService.h"
+#include <spdlog/spdlog.h>
+#include <cstdint>
+#include <unistd.h>
 #include "../utils/StringUtils.h"
 
 #include "ComposeKubernetesPlanner.h"
@@ -258,20 +261,75 @@ KubernetesService::KubernetesService()
     }
 }
 
+KubernetesService::KubernetesService(const std::string& kubeconfig) : KubernetesService() {
+    if (strings::trim(kubeconfig).empty()) {
+        // No cluster kubeconfig recorded: fall back to KUBECONFIG_PATH, which
+        // is exactly the pre-existing behaviour.
+        return;
+    }
+
+    // kubectl only accepts a path, and this content lives encrypted in the
+    // database. Write it to a private file for the life of this object.
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("stackpilot-kubeconfig-" + std::to_string(::getpid()) + "-" +
+                       std::to_string(reinterpret_cast<std::uintptr_t>(this)) + ".yaml");
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        spdlog::error("Could not write a temporary kubeconfig to {}", path.string());
+        return;
+    }
+    out << kubeconfig;
+    out.close();
+
+    // Cluster-admin credentials must not be world-readable, even briefly on a
+    // shared host.
+    std::error_code ec;
+    std::filesystem::permissions(path,
+                                 std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace,
+                                 ec);
+    if (ec) {
+        spdlog::warn("Could not restrict permissions on the temporary kubeconfig: {}", ec.message());
+    }
+
+    kubeconfigPath_ = path.string();
+    ownedKubeconfigPath_ = kubeconfigPath_;
+}
+
+KubernetesService::~KubernetesService() {
+    if (ownedKubeconfigPath_.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::remove(ownedKubeconfigPath_, ec);
+    if (ec) {
+        spdlog::warn("Could not remove the temporary kubeconfig {}: {}", ownedKubeconfigPath_, ec.message());
+    }
+}
+
 KubernetesRuntimeInfo KubernetesService::deploy(const KubernetesDeployOptions& options) const {
     KubernetesRuntimeInfo result;
     result.nameSpace = options.nameSpace.empty() ? defaultNamespace_ : options.nameSpace;
     result.exposureMode = normalizeExposureMode(options.exposureMode);
     result.runtimeScheme = normalizeRuntimeScheme(options.runtimeScheme.empty() ? runtimeScheme_ : options.runtimeScheme);
     result.desiredReplicas = std::max(1, options.replicas);
-    if (enableHorizontalPodAutoscaler_) {
-        result.desiredReplicas = std::max(result.desiredReplicas, hpaMinReplicas_);
+
+    // Per-deployment autoscaling overrides the environment default. Resolved
+    // once here so the guards below and the emitted manifest agree.
+    const bool hpaOn = options.autoscalingEnabled || enableHorizontalPodAutoscaler_;
+    const int hpaMin = options.autoscalingEnabled ? std::max(1, options.autoscalingMinReplicas) : hpaMinReplicas_;
+    const int hpaMax = options.autoscalingEnabled ? std::max(hpaMin, options.autoscalingMaxReplicas) : hpaMaxReplicas_;
+    const int hpaCpu = options.autoscalingEnabled ? std::clamp(options.autoscalingCpuTarget, 1, 100) : hpaCpuUtilizationTarget_;
+
+    if (hpaOn) {
+        result.desiredReplicas = std::max(result.desiredReplicas, hpaMin);
     }
     if (result.desiredReplicas > maxReplicas_) {
         result.error = "Replica count exceeds configured platform maximum";
         return result;
     }
-    if (enableHorizontalPodAutoscaler_ && result.desiredReplicas > hpaMaxReplicas_) {
+    if (hpaOn && result.desiredReplicas > hpaMax) {
         result.error = "Replica count exceeds configured autoscaling maximum";
         return result;
     }
@@ -504,7 +562,7 @@ KubernetesRuntimeInfo KubernetesService::deploy(const KubernetesDeployOptions& o
                 << "      app: " << result.deploymentName << "\n";
         }
 
-        if (enableHorizontalPodAutoscaler_) {
+        if (hpaOn) {
             manifest
                 << "---\n"
                 << "apiVersion: autoscaling/v2\n"
@@ -517,15 +575,15 @@ KubernetesRuntimeInfo KubernetesService::deploy(const KubernetesDeployOptions& o
                 << "    apiVersion: apps/v1\n"
                 << "    kind: Deployment\n"
                 << "    name: " << result.deploymentName << "\n"
-                << "  minReplicas: " << hpaMinReplicas_ << "\n"
-                << "  maxReplicas: " << hpaMaxReplicas_ << "\n"
+                << "  minReplicas: " << hpaMin << "\n"
+                << "  maxReplicas: " << hpaMax << "\n"
                 << "  metrics:\n"
                 << "    - type: Resource\n"
                 << "      resource:\n"
                 << "        name: cpu\n"
                 << "        target:\n"
                 << "          type: Utilization\n"
-                << "          averageUtilization: " << hpaCpuUtilizationTarget_ << "\n";
+                << "          averageUtilization: " << hpaCpu << "\n";
         }
 
         if (useIngress) {
@@ -728,6 +786,16 @@ KubernetesRuntimeInfo KubernetesService::deployComposeStack(const KubernetesDepl
     planOptions.imagePullSecretName = imagePullSecretName_;
     planOptions.serviceAccountName = serviceAccountName_;
     planOptions.resourcePreset = options.resourcePreset;
+    // A per-deployment request wins over the environment default; otherwise
+    // fall back to how the platform is configured.
+    planOptions.enableHorizontalPodAutoscaler =
+        options.autoscalingEnabled || enableHorizontalPodAutoscaler_;
+    planOptions.hpaMinReplicas =
+        options.autoscalingEnabled ? options.autoscalingMinReplicas : hpaMinReplicas_;
+    planOptions.hpaMaxReplicas =
+        options.autoscalingEnabled ? options.autoscalingMaxReplicas : hpaMaxReplicas_;
+    planOptions.hpaCpuUtilizationTarget =
+        options.autoscalingEnabled ? options.autoscalingCpuTarget : hpaCpuUtilizationTarget_;
     planOptions.cpuRequest = cpuRequest_;
     planOptions.memoryRequest = memoryRequest_;
     planOptions.cpuLimit = cpuLimit_;

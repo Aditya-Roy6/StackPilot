@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  Building2,
   LayoutDashboard,
   Server,
   Settings,
@@ -42,6 +43,7 @@ const navigation = [
   { name: "Cluster Builder", href: "/dashboard/logging-monitoring/clusters", icon: Boxes, nested: true },
   { name: "AI Agent", href: "/dashboard/ai", icon: Star, filled: true },
   { name: "Secrets", href: "/dashboard/secrets", icon: KeyRound },
+  { name: "Organization", href: "/dashboard/organization", icon: Building2 },
   { name: "Settings", href: "/dashboard/settings", icon: Settings },
 ];
 

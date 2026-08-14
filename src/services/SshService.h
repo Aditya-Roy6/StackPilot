@@ -63,6 +63,27 @@ public:
                                      const std::string& nodeToken,
                                      const std::string& sudoPassword = "") const;
     SshOperationResult inspectK3sCluster(const SshConnectionConfig& config) const;
+
+    /**
+     * Joins an additional *control plane* node, so the cluster survives losing
+     * the first one. A single control plane means one VM failure destroys the
+     * cluster, which is not a cluster in any useful sense.
+     *
+     * k3s needs `--cluster-init` on the first server to start embedded etcd.
+     * Existing single-server clusters were created without it, so this reports
+     * a clear error rather than joining a node that cannot participate.
+     */
+    SshOperationResult joinK3sServer(const SshConnectionConfig& config,
+                                     const std::string& serverUrl,
+                                     const std::string& nodeToken,
+                                     const std::string& sudoPassword) const;
+
+    /// Cordons, drains and deletes a node from the cluster, run from the
+    /// control plane. Draining first is what makes this safe: pods are
+    /// rescheduled before the node disappears.
+    SshOperationResult removeK3sNode(const SshConnectionConfig& controlPlane,
+                                     const std::string& nodeName,
+                                     const std::string& sudoPassword) const;
     SshOperationResult runRemoteCommand(const SshConnectionConfig& config,
                                         const std::string& workingDirectory,
                                         const std::string& command,

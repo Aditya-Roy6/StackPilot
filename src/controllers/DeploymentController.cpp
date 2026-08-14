@@ -6,6 +6,7 @@
 #include "../utils/StringUtils.h"
 #include "../utils/RuntimeRateLimiter.h"
 #include "../services/DeploymentJournal.h"
+#include "../services/ClusterTargets.h"
 #include "../services/LocalDockerRuntime.h"
 #include "LogWebSocketController.h"
 #include "../db/Database.h"
@@ -1981,7 +1982,7 @@ void DeploymentController::deployToKubernetes(
         LogWebSocketController::broadcastStatus(deploymentId, "deploying");
         DeploymentJournal::broadcastSummary(deploymentId);
 
-        KubernetesService service;
+        KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
         KubernetesDeployOptions options;
         options.deploymentId = deploymentId;
         options.projectName = row["project_name"].as<std::string>();
@@ -2005,6 +2006,50 @@ void DeploymentController::deployToKubernetes(
         options.resourcePreset = resourcePreset;
         options.healthPath = healthPath;
         options.envVars = deploymentEnvVars;
+
+        // Autoscaling, read from the deployment row and overridable per
+        // request. Until now the HPA manifest existed but nothing could switch
+        // it on, so every deployment ran at a fixed replica count.
+        {
+            auto autoConn = Database::getInstance().getConnection();
+            pqxx::work autoTxn(*autoConn);
+            const auto autoRows = autoTxn.exec_params(
+                "SELECT autoscaling_enabled, autoscaling_min_replicas, autoscaling_max_replicas, "
+                "autoscaling_cpu_target FROM deployments WHERE id = $1",
+                deploymentId);
+            autoTxn.commit();
+            if (!autoRows.empty()) {
+                options.autoscalingEnabled = autoRows[0]["autoscaling_enabled"].as<bool>();
+                options.autoscalingMinReplicas = autoRows[0]["autoscaling_min_replicas"].as<int>();
+                options.autoscalingMaxReplicas = autoRows[0]["autoscaling_max_replicas"].as<int>();
+                options.autoscalingCpuTarget = autoRows[0]["autoscaling_cpu_target"].as<int>();
+            }
+        }
+        if (body && body->isMember("autoscaling")) {
+            const Json::Value& autoscaling = (*body)["autoscaling"];
+            if (autoscaling.isObject()) {
+                options.autoscalingEnabled = autoscaling.get("enabled", options.autoscalingEnabled).asBool();
+                options.autoscalingMinReplicas =
+                    std::max(1, autoscaling.get("min_replicas", options.autoscalingMinReplicas).asInt());
+                options.autoscalingMaxReplicas =
+                    std::max(options.autoscalingMinReplicas,
+                             autoscaling.get("max_replicas", options.autoscalingMaxReplicas).asInt());
+                options.autoscalingCpuTarget =
+                    std::clamp(autoscaling.get("cpu_target", options.autoscalingCpuTarget).asInt(), 1, 100);
+
+                // Persist so a redeploy keeps autoscaling on without the
+                // caller having to send it again.
+                auto saveConn = Database::getInstance().getConnection();
+                pqxx::work saveTxn(*saveConn);
+                saveTxn.exec_params(
+                    "UPDATE deployments SET autoscaling_enabled = $2, autoscaling_min_replicas = $3, "
+                    "autoscaling_max_replicas = $4, autoscaling_cpu_target = $5, updated_at = NOW() "
+                    "WHERE id = $1",
+                    deploymentId, options.autoscalingEnabled, options.autoscalingMinReplicas,
+                    options.autoscalingMaxReplicas, options.autoscalingCpuTarget);
+                saveTxn.commit();
+            }
+        }
 
         KubernetesRuntimeInfo runtime = service.deploy(options);
         DeploymentJournal::appendBlock(deploymentId, runtime.logs);
@@ -2191,7 +2236,7 @@ void DeploymentController::scaleKubernetesDeployment(
             runtime = sshService.scaleKubernetesRuntime(remoteConfig, nameSpace, deploymentName, serviceName, exposureMode, replicas, runtimeScheme);
             runtime.runtimeScheme = runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme;
         } else {
-            KubernetesService service;
+            KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
             runtime = service.scale(nameSpace, deploymentName, serviceName, exposureMode, replicas, runtimeScheme);
             runtime.runtimeScheme = runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme;
         }
@@ -2482,7 +2527,7 @@ void DeploymentController::setRuntimePausedState(
                     runtimeScheme
                 );
             } else {
-                KubernetesService service;
+                KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
                 runtime = service.scale(
                     nameSpace,
                     deploymentName,
@@ -3226,7 +3271,7 @@ void DeploymentController::getKubernetesStatus(
             return;
         }
 
-        KubernetesService service;
+        KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
         KubernetesRuntimeInfo runtime = service.inspect(nameSpace, deploymentName, serviceName, runtimeExposure, runtimeScheme);
         if (!runtime.success) {
             payload["runtime"]["deployed"] = false;
@@ -3360,7 +3405,7 @@ void DeploymentController::getKubernetesEvents(
             events = remoteEvents.output + (remoteEvents.error.empty() ? "" : "\n" + remoteEvents.error);
         } else {
             txn.commit();
-            KubernetesService service;
+            KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
             events = service.collectEvents(nameSpace, deploymentName, ingressName, exposureMode);
         }
 
@@ -3513,7 +3558,7 @@ void DeploymentController::rollbackKubernetesDeployment(
             SshService sshService;
             runtime = sshService.deployKubernetesRuntime(remoteConfig, options);
         } else {
-            KubernetesService service;
+            KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
             runtime = service.deploy(options);
         }
         DeploymentJournal::appendBlock(deploymentId, runtime.logs);
@@ -3865,7 +3910,7 @@ void DeploymentController::removeKubernetesDeployment(
             callback(resp); return;
         }
 
-        KubernetesService service;
+        KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
         KubernetesRuntimeInfo removal = service.remove(nameSpace, deploymentName, serviceName, exposureMode);
         DeploymentJournal::appendBlock(deploymentId, removal.logs);
 

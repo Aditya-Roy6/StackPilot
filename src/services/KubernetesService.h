@@ -23,6 +23,15 @@ struct KubernetesDeployOptions {
     std::vector<std::pair<std::string, std::string>> envVars;
     int replicas = 1;
     int containerPort = 3000;
+
+    // Per-deployment autoscaling. The planner has emitted a valid
+    // autoscaling/v2 HorizontalPodAutoscaler for a long time, but nothing ever
+    // set the flag, so the manifest was unreachable code. These override the
+    // K8S_ENABLE_HPA environment defaults for one deployment.
+    bool autoscalingEnabled = false;
+    int autoscalingMinReplicas = 1;
+    int autoscalingMaxReplicas = 3;
+    int autoscalingCpuTarget = 70;
 };
 
 struct KubernetesRuntimeInfo {
@@ -46,6 +55,22 @@ struct KubernetesRuntimeInfo {
 class KubernetesService {
 public:
     KubernetesService();
+
+    /**
+     * Targets a specific cluster instead of KUBECONFIG_PATH.
+     *
+     * `kubeconfig` is the file's contents, not a path -- it is stored
+     * encrypted in the database, so it never exists on disk until now. It is
+     * written to a private temporary file for the life of this object and
+     * removed in the destructor, because kubectl only takes a path and this is
+     * a cluster-admin credential.
+     */
+    explicit KubernetesService(const std::string& kubeconfig);
+
+    ~KubernetesService();
+
+    KubernetesService(const KubernetesService&) = delete;
+    KubernetesService& operator=(const KubernetesService&) = delete;
 
     KubernetesRuntimeInfo deploy(const KubernetesDeployOptions& options) const;
     KubernetesRuntimeInfo deployComposeStack(const KubernetesDeployOptions& options,
@@ -83,6 +108,8 @@ public:
 
 private:
     std::string kubeconfigPath_;
+    /// Set when this instance owns a temporary kubeconfig it must clean up.
+    std::string ownedKubeconfigPath_;
     std::string defaultNamespace_;
     std::string serviceType_;
     std::string exposureMode_;
