@@ -1199,6 +1199,302 @@ registerTool("trigger_redeploy", "Alias for STACKPILOT_trigger_redeploy.", {
   return jsonResult("Redeploy queued.", data);
 });
 
+// ── Platform capability tools ─────────────────────────────────────
+// Everything below wraps an endpoint that already exists and is already
+// access-gated server-side by has_project_access(). The MCP token's scope
+// (read / deploy / admin) is enforced by the backend on top of that, so a
+// read-scoped token physically cannot reach the mutating tools even though
+// they are registered here.
+//
+// Destructive tools say so in their description. That text is the only thing
+// the model sees when deciding whether to call one, so it is load-bearing
+// rather than documentation.
+
+async function handleGetCostReport(args) {
+  const days = args.days || 30;
+  const report = await api("GET", `/cost?days=${encodeURIComponent(days)}`);
+  const lines = [
+    `Cost over the last ${report.window_days} day(s): ${report.total_formatted}`,
+    `Of which preview environments: ${report.preview_formatted}`,
+    "",
+    ...(report.projects || [])
+      .filter((p) => p.millicents > 0)
+      .map((p) => `  ${p.project_name}: ${p.formatted} (${p.deployments} deployment(s))`),
+  ];
+  if (!(report.projects || []).some((p) => p.millicents > 0)) {
+    lines.push("  No spend recorded yet. Cost accrues once a deployment is running.");
+  }
+  lines.push("", report.note || "");
+  return textResult(lines.join("\n"));
+}
+
+async function handleCheckDrift(args) {
+  const report = await api("GET", `/deployments/${encodeURIComponent(args.deployment_id)}/drift`);
+  if (report.status === "unreachable") {
+    return textResult(
+      "Could not read live state from the runtime, so drift is unknown.\n" +
+        "This is an operational problem, not a clean result -- do not report the deployment as healthy."
+    );
+  }
+  if (!report.drifted) {
+    return textResult("No drift. Live state matches what StackPilot recorded.");
+  }
+  const findings = (report.findings || [])
+    .map((f) => `  [${f.severity}] ${f.field}: recorded "${f.desired}", live "${f.actual}"\n      ${f.detail}`)
+    .join("\n");
+  return textResult(`${report.summary}\n\n${findings}`);
+}
+
+async function handleListSecrets(args) {
+  const path = args.project_id
+    ? `/projects/${encodeURIComponent(args.project_id)}/secrets`
+    : "/secrets";
+  const data = await api("GET", path);
+  const secrets = data.secrets || data || [];
+  if (!secrets.length) return textResult("No secrets stored.");
+  return textResult(
+    "Secret metadata only -- values are never returned by a list.\n\n" +
+      secrets
+        .map((s) => `  ${s.key}  (project ${s.project_id || "?"}, version ${s.version || 1})`)
+        .join("\n")
+  );
+}
+
+async function handleSetSecret(args) {
+  await api("POST", `/projects/${encodeURIComponent(args.project_id)}/secrets`, {
+    key: args.key,
+    value: args.value,
+    description: args.description || "Set via MCP agent",
+    environment_id: args.environment_id || null,
+  });
+  // Never echo the value back, even on success. A tool result is transcript
+  // text and often lands in an IDE's conversation history.
+  return textResult(`Secret ${args.key} stored (value withheld from output).`);
+}
+
+async function handleRevealSecret(args) {
+  const data = await api(
+    "POST",
+    `/projects/${encodeURIComponent(args.project_id)}/secrets/${encodeURIComponent(args.secret_id)}/reveal`,
+    {}
+  );
+  return textResult(
+    `Value for ${data.key || args.secret_id}:\n${data.value}\n\n` +
+      "This reveal was recorded in the audit log."
+  );
+}
+
+async function handleListOrganizations() {
+  const data = await api("GET", "/organizations");
+  const orgs = data.organizations || [];
+  if (!orgs.length) return textResult("No organizations.");
+  return textResult(
+    orgs
+      .map(
+        (o) =>
+          `  ${o.name} (${o.slug}) -- your role: ${o.role}, ${o.member_count} member(s)` +
+          (o.is_personal ? " [personal workspace]" : "")
+      )
+      .join("\n")
+  );
+}
+
+async function handleListMembers(args) {
+  const data = await api("GET", `/organizations/${encodeURIComponent(args.organization_id)}/members`);
+  const members = data.members || [];
+  if (!members.length) return textResult("No members found.");
+  return textResult(members.map((m) => `  ${m.email} -- ${m.role}`).join("\n"));
+}
+
+async function handleListEnvironments(args) {
+  const data = await api("GET", `/projects/${encodeURIComponent(args.project_id)}/environments`);
+  const envs = data.environments || data || [];
+  if (!envs.length) return textResult("No environments configured for this project.");
+  return textResult(
+    envs
+      .map(
+        (e) =>
+          `  ${e.name} -- branch ${e.branch || "(none)"}, auto_deploy ${e.auto_deploy ? "on" : "off"}` +
+          `, requires CI ${e.require_ci ? "yes" : "no"}`
+      )
+      .join("\n")
+  );
+}
+
+async function handleGetMetrics(args) {
+  const data = await api("GET", `/deployments/${encodeURIComponent(args.deployment_id)}/metrics`);
+  return jsonResult("Deployment metrics", data);
+}
+
+async function handleGetKubernetesEvents(args) {
+  const data = await api("GET", `/deployments/${encodeURIComponent(args.deployment_id)}/kubernetes/events`);
+  return textResult(data.events || data.logs || JSON.stringify(data, null, 2));
+}
+
+async function handleGetKubernetesStatus(args) {
+  const data = await api("GET", `/deployments/${encodeURIComponent(args.deployment_id)}/kubernetes/status`);
+  return jsonResult("Kubernetes status", data);
+}
+
+async function handleScaleDeployment(args) {
+  const data = await api(
+    "POST",
+    `/deployments/${encodeURIComponent(args.deployment_id)}/kubernetes/scale`,
+    { replicas: args.replicas }
+  );
+  return jsonResult(`Scaled to ${args.replicas} replica(s)`, data);
+}
+
+async function handleRollbackDeployment(args) {
+  const data = await api(
+    "POST",
+    `/deployments/${encodeURIComponent(args.deployment_id)}/kubernetes/rollback`,
+    {}
+  );
+  return jsonResult("Rollback requested", data);
+}
+
+async function handlePauseRuntime(args) {
+  const data = await api("POST", `/deployments/${encodeURIComponent(args.deployment_id)}/runtime/pause`, {});
+  return jsonResult("Runtime paused", data);
+}
+
+async function handleResumeRuntime(args) {
+  const data = await api("POST", `/deployments/${encodeURIComponent(args.deployment_id)}/runtime/resume`, {});
+  return jsonResult("Runtime resumed", data);
+}
+
+async function handleGetRuntimeHealth(args) {
+  const data = await api("GET", `/deployments/${encodeURIComponent(args.deployment_id)}/runtime/health`);
+  return jsonResult("Runtime health", data);
+}
+
+// ── registrations ─────────────────────────────────────────────────
+
+registerTool(
+  "get_cost_report",
+  "Show what deployments have cost over a window, grouped by project, with preview-environment spend broken out separately. Attribution is from requested resources, not observed usage. Read-only.",
+  { days: z.number().int().min(1).max(365).optional().describe("Window in days. Default 30.") },
+  handleGetCostReport
+);
+
+registerTool(
+  "check_drift",
+  "Compare a deployment's recorded desired state against what the cluster actually has, and record the check. Reports 'unreachable' separately from 'no drift' -- do not treat an unreachable runtime as healthy. Read-only with respect to the runtime.",
+  { deployment_id: z.string().describe("Deployment id to check.") },
+  handleCheckDrift
+);
+
+registerTool(
+  "list_secrets",
+  "List stored secret keys and metadata. Never returns values -- use reveal_secret for that, which is audited. Read-only.",
+  { project_id: z.string().optional().describe("Limit to one project. Omit for everything you can see.") },
+  handleListSecrets
+);
+
+registerTool(
+  "set_secret",
+  "Store or update an encrypted secret for a project. The value is never echoed back. Requires member access. WRITE: this changes what a deployment will receive at its next build.",
+  {
+    project_id: z.string().describe("Project id."),
+    key: z.string().describe("Environment-variable style key, e.g. DATABASE_URL."),
+    value: z.string().describe("Secret value. Stored encrypted; never returned by a list."),
+    description: z.string().optional().describe("Why this secret exists."),
+    environment_id: z.string().optional().describe("Scope to one environment. Omit for project-wide."),
+  },
+  handleSetSecret
+);
+
+registerTool(
+  "reveal_secret",
+  "Return the plaintext of one secret. Requires member access and is written to the audit log. SENSITIVE: the value enters the conversation transcript -- only call this when the user has explicitly asked for the value itself.",
+  {
+    project_id: z.string().describe("Project id."),
+    secret_id: z.string().describe("Secret id from list_secrets."),
+  },
+  handleRevealSecret
+);
+
+registerTool(
+  "list_organizations",
+  "List the organizations you belong to and your role in each. Read-only.",
+  {},
+  handleListOrganizations
+);
+
+registerTool(
+  "list_organization_members",
+  "List who is in an organization and what role they hold. Useful for 'who can deploy X'. Read-only.",
+  { organization_id: z.string().describe("Organization id from list_organizations.") },
+  handleListMembers
+);
+
+registerTool(
+  "list_environments",
+  "List a project's environments, their branches, and whether they auto-deploy. Read-only.",
+  { project_id: z.string().describe("Project id.") },
+  handleListEnvironments
+);
+
+registerTool(
+  "get_deployment_metrics",
+  "CPU, memory and runtime metrics for a deployment. Read-only.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handleGetMetrics
+);
+
+registerTool(
+  "get_kubernetes_events",
+  "Recent Kubernetes events for a deployment. Often explains a crash loop or a pending pod better than container logs do. Read-only.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handleGetKubernetesEvents
+);
+
+registerTool(
+  "get_kubernetes_status",
+  "Live Kubernetes status for a deployment: replicas, conditions, service and ingress. Read-only.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handleGetKubernetesStatus
+);
+
+registerTool(
+  "get_runtime_health",
+  "Probe whether a deployment's runtime URL is actually answering. Read-only.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handleGetRuntimeHealth
+);
+
+registerTool(
+  "scale_deployment",
+  "Change the replica count of a running Kubernetes deployment. Requires member access. WRITE: takes effect immediately and changes capacity and cost.",
+  {
+    deployment_id: z.string().describe("Deployment id."),
+    replicas: z.number().int().min(0).max(50).describe("Desired replica count. 0 stops serving traffic."),
+  },
+  handleScaleDeployment
+);
+
+registerTool(
+  "rollback_deployment",
+  "Roll a Kubernetes deployment back to its previous revision. Requires member access. WRITE AND DISRUPTIVE: this replaces what is currently serving traffic. Confirm with the user before calling unless they explicitly asked to roll back.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handleRollbackDeployment
+);
+
+registerTool(
+  "pause_runtime",
+  "Pause a running runtime. Requires member access. WRITE: the deployment stops serving traffic until resumed.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handlePauseRuntime
+);
+
+registerTool(
+  "resume_runtime",
+  "Resume a paused runtime. Requires member access. WRITE.",
+  { deployment_id: z.string().describe("Deployment id.") },
+  handleResumeRuntime
+);
+
 if (!TOKEN) {
   console.error("[stackpilot-mcp] STACKPILOT_MCP_TOKEN is not set. The server will start, but authenticated tools will return a setup error.");
 }

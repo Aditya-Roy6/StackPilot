@@ -77,6 +77,9 @@ class AgentResponse(BaseModel):
     model: str
     latency_ms: int = 0
     token_usage: Dict[str, Any] = Field(default_factory=dict)
+    # The model's working, when the model exposes it. Empty for models that do
+    # not emit reasoning_content, which is most of the fast ones.
+    reasoning: str = ""
     error: str = ""
 
 
@@ -596,9 +599,20 @@ async def post_chat_completion_stream(
                 content_parts.append(content)
 
     content = "".join(content_parts).strip()
-    if not content and reasoning_parts:
-        content = "".join(reasoning_parts).strip()
-    return {"choices": [{"message": {"content": content}}], "usage": usage}
+    reasoning = "".join(reasoning_parts).strip()
+    if not content and reasoning:
+        # A reasoning-only reply is better than a blank one, but note that the
+        # visible answer *is* the reasoning so the UI does not show it twice.
+        content = reasoning
+        reasoning = ""
+    # Reasoning used to be dropped on the floor here whenever content existed,
+    # which is exactly the case where it is worth showing: it is the model's
+    # working, and hiding it makes a considered answer indistinguishable from
+    # a guess.
+    return {
+        "choices": [{"message": {"content": content, "reasoning_content": reasoning}}],
+        "usage": usage,
+    }
 
 
 def schema_instruction(result_type: str) -> str:
@@ -781,7 +795,9 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
                 prefer_json=req.workflow_type not in {"agent_chat", "chat_project"},
                 max_tokens=700 if fast_explanation else (4096 if req.model_mode == "thinking" else 1536),
             )
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        message = payload.get("choices", [{}])[0].get("message", {}) or {}
+        content = message.get("content", "{}")
+        reasoning = str(message.get("reasoning_content", "") or "")
         try:
             parsed = parse_model_json(
                 content,
@@ -805,6 +821,7 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
             model=model,
             latency_ms=latency_ms,
             token_usage=usage,
+            reasoning=reasoning,
         )
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
@@ -830,7 +847,9 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
                         prefer_json=req.workflow_type not in {"agent_chat", "chat_project"},
                         max_tokens=700 if fast_explanation else (4096 if req.model_mode == "thinking" else 1536),
                     )
-                content = payload.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                message = payload.get("choices", [{}])[0].get("message", {}) or {}
+                content = message.get("content", "{}")
+                reasoning = str(message.get("reasoning_content", "") or "")
                 try:
                     parsed = parse_model_json(
                         content,
@@ -861,6 +880,7 @@ async def call_model(req: AgentRequest, prompt: str) -> AgentResponse:
                     model=fallback_model,
                     latency_ms=latency_ms,
                     token_usage=usage,
+                    reasoning=reasoning,
                 )
             except Exception as retry_exc:
                 retry_detail = redact_text(str(retry_exc)[:800])

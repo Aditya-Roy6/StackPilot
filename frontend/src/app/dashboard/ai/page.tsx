@@ -34,6 +34,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { StatusVerb } from "@/components/ui/status-verb";
+import { ThinkingPanel } from "@/components/ui/thinking-panel";
 
 // Must exceed the ai-service (90s) and backend (120s) timeouts, otherwise the
 // browser aborts while the backend completes the generation and bills for it.
@@ -79,6 +80,11 @@ interface AiResponse {
   run_id?: string;
   session_id?: string;
   session_title?: string;
+  /** Present only for models that emit reasoning_content. */
+  reasoning?: string;
+  latency_ms?: number;
+  token_usage?: Record<string, number>;
+  trace_id?: string;
 }
 
 interface Project {
@@ -105,6 +111,18 @@ interface ChatMessage {
   role: Role;
   content: string;
   meta?: string;
+  /** The model's working, when it exposes reasoning_content. */
+  reasoning?: string;
+  stats?: {
+    latencyMs?: number;
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+    confidence?: number;
+    model?: string;
+    provider?: string;
+    traceId?: string;
+  };
 }
 
 interface AiChatSession {
@@ -138,6 +156,72 @@ interface AgentApplicationTemplate {
 }
 
 const commands = [
+  {
+    name: "/cost",
+    icon: Star,
+    usage: "/cost [days]",
+    description: "What deployments have cost, by project, with preview spend broken out.",
+  },
+  {
+    name: "/drift",
+    icon: Star,
+    usage: "/drift <deployment-id>",
+    description: "Compare recorded desired state against what the cluster actually has.",
+  },
+  {
+    name: "/secrets",
+    icon: Star,
+    usage: "/secrets [project-id]",
+    description: "List stored secret keys. Values are never shown here.",
+  },
+  {
+    name: "/scale",
+    icon: Star,
+    usage: "/scale <deployment-id> <replicas>",
+    description: "Change replica count on a running Kubernetes deployment.",
+  },
+  {
+    name: "/rollback",
+    icon: Star,
+    usage: "/rollback <deployment-id>",
+    description: "Roll a Kubernetes deployment back to its previous revision.",
+  },
+  {
+    name: "/pause",
+    icon: Star,
+    usage: "/pause <deployment-id>",
+    description: "Pause a running runtime so it stops serving traffic.",
+  },
+  {
+    name: "/resume",
+    icon: Star,
+    usage: "/resume <deployment-id>",
+    description: "Resume a paused runtime.",
+  },
+  {
+    name: "/events",
+    icon: Star,
+    usage: "/events <deployment-id>",
+    description: "Kubernetes events — often explains a crash loop better than logs.",
+  },
+  {
+    name: "/metrics",
+    icon: Star,
+    usage: "/metrics <deployment-id>",
+    description: "CPU, memory and runtime metrics for a deployment.",
+  },
+  {
+    name: "/org",
+    icon: Star,
+    usage: "/org",
+    description: "Organizations you belong to and your role in each.",
+  },
+  {
+    name: "/environments",
+    icon: Star,
+    usage: "/environments <project-id>",
+    description: "A project's environments, branches and auto-deploy settings.",
+  },
   {
     name: "/diagnose",
     icon: Star,
@@ -881,10 +965,22 @@ export default function AiAgentPage() {
           window.history.replaceState(null, "", `/dashboard/ai?session_id=${result.session_id}`);
         }
       }
+      const usage = (result.token_usage || {}) as Record<string, number>;
       appendMessage({
         role: "assistant",
         content: formatAiOutput(result),
         meta: `${result.model || activeModelId} | ${Math.round((result.confidence || 0) * 100)}%`,
+        reasoning: typeof result.reasoning === "string" ? result.reasoning : "",
+        stats: {
+          latencyMs: result.latency_ms,
+          promptTokens: usage.prompt_tokens,
+          completionTokens: usage.completion_tokens,
+          totalTokens: usage.total_tokens,
+          confidence: result.confidence,
+          model: result.model || activeModelId,
+          provider: result.provider,
+          traceId: result.trace_id,
+        },
       });
       queryClient.invalidateQueries({ queryKey: ["ai-chat-sessions"] });
       sessionsQuery.refetch();
@@ -899,6 +995,145 @@ export default function AiAgentPage() {
       const [command, firstArg, secondArg] = raw.trim().split(/\s+/);
       const targetDeploymentId = firstArg || selectedDeploymentId;
       const targetProjectId = firstArg || selectedProjectId;
+
+      // ── platform capability commands ───────────────────────────
+      // Each wraps an endpoint the backend already access-gates via
+      // has_project_access(), so an unauthorised caller gets a 404/403 from
+      // the server rather than being filtered here.
+
+      if (command === "/cost") {
+        const days = Number.parseInt(firstArg || "30", 10) || 30;
+        const res = await api.get(`/cost?days=${days}`);
+        const report = res.data;
+        const rows = (report.projects || [])
+          .filter((p: { millicents: number }) => p.millicents > 0)
+          .map(
+            (p: { project_name: string; formatted: string; deployments: number }) =>
+              `  ${p.project_name}: ${p.formatted} (${p.deployments} deployment${p.deployments === 1 ? "" : "s"})`
+          );
+        return {
+          title: `Cost, last ${report.window_days} day${report.window_days === 1 ? "" : "s"}`,
+          body:
+            `Total: ${report.total_formatted}\nPreview environments: ${report.preview_formatted}\n\n` +
+            (rows.length ? rows.join("\n") : "  Nothing has accrued yet — cost starts once a deployment runs.") +
+            `\n\n${report.note || ""}`,
+        };
+      }
+
+      if (command === "/drift") {
+        if (!targetDeploymentId) throw new Error("Usage: /drift <deployment-id>");
+        const res = await api.get(`/deployments/${targetDeploymentId}/drift`);
+        const report = res.data;
+        if (report.status === "unreachable") {
+          return {
+            title: "Drift unknown",
+            body: "Could not read live state from the runtime. This is not the same as 'no drift' — the deployment has not been confirmed healthy.",
+          };
+        }
+        if (!report.drifted) {
+          return { title: "No drift", body: "Live state matches what StackPilot recorded." };
+        }
+        const findings = (report.findings || [])
+          .map(
+            (f: { severity: string; field: string; desired: string; actual: string; detail: string }) =>
+              `  [${f.severity}] ${f.field}\n      recorded: ${f.desired}\n      live:     ${f.actual}\n      ${f.detail}`
+          )
+          .join("\n\n");
+        return { title: report.summary, body: findings };
+      }
+
+      if (command === "/secrets") {
+        const path = targetProjectId ? `/projects/${targetProjectId}/secrets` : "/secrets";
+        const res = await api.get(path);
+        const secrets = res.data.secrets || res.data || [];
+        return {
+          title: `${secrets.length} secret${secrets.length === 1 ? "" : "s"}`,
+          body: secrets.length
+            ? "Keys only — values are never returned by a list.\n\n" +
+              secrets
+                .map((s: { key: string; version?: number }) => `  ${s.key} (v${s.version || 1})`)
+                .join("\n")
+            : "No secrets stored.",
+        };
+      }
+
+      if (command === "/scale") {
+        if (!targetDeploymentId) throw new Error("Usage: /scale <deployment-id> <replicas>");
+        const replicas = Number.parseInt(secondArg || "", 10);
+        if (Number.isNaN(replicas) || replicas < 0 || replicas > 50) {
+          throw new Error("Usage: /scale <deployment-id> <replicas>  (0-50)");
+        }
+        const res = await api.post(`/deployments/${targetDeploymentId}/kubernetes/scale`, { replicas });
+        return {
+          title: `Scaled to ${replicas}`,
+          body: `${shortId(targetDeploymentId)} now targets ${replicas} replica${replicas === 1 ? "" : "s"}.\n${res.data.message || ""}`,
+        };
+      }
+
+      if (command === "/rollback") {
+        if (!targetDeploymentId) throw new Error("Usage: /rollback <deployment-id>");
+        const res = await api.post(`/deployments/${targetDeploymentId}/kubernetes/rollback`, {});
+        return {
+          title: "Rollback requested",
+          body: `${shortId(targetDeploymentId)} is rolling back to its previous revision.\n${res.data.message || ""}`,
+        };
+      }
+
+      if (command === "/pause" || command === "/resume") {
+        if (!targetDeploymentId) throw new Error(`Usage: ${command} <deployment-id>`);
+        const action = command === "/pause" ? "pause" : "resume";
+        const res = await api.post(`/deployments/${targetDeploymentId}/runtime/${action}`, {});
+        return {
+          title: action === "pause" ? "Runtime paused" : "Runtime resumed",
+          body: `${shortId(targetDeploymentId)}: ${res.data.message || `${action}d`}.`,
+        };
+      }
+
+      if (command === "/events") {
+        if (!targetDeploymentId) throw new Error("Usage: /events <deployment-id>");
+        const res = await api.get(`/deployments/${targetDeploymentId}/kubernetes/events`);
+        return {
+          title: "Kubernetes events",
+          body: res.data.events || res.data.logs || "No events returned.",
+        };
+      }
+
+      if (command === "/metrics") {
+        if (!targetDeploymentId) throw new Error("Usage: /metrics <deployment-id>");
+        const res = await api.get(`/deployments/${targetDeploymentId}/metrics`);
+        return { title: "Deployment metrics", body: JSON.stringify(res.data, null, 2) };
+      }
+
+      if (command === "/org") {
+        const res = await api.get("/organizations");
+        const orgs = res.data.organizations || [];
+        return {
+          title: `${orgs.length} organization${orgs.length === 1 ? "" : "s"}`,
+          body: orgs
+            .map(
+              (o: { name: string; slug: string; role: string; member_count: number; is_personal: boolean }) =>
+                `  ${o.name} (${o.slug}) — you are ${o.role}, ${o.member_count} member${o.member_count === 1 ? "" : "s"}${o.is_personal ? " [personal]" : ""}`
+            )
+            .join("\n"),
+        };
+      }
+
+      if (command === "/environments") {
+        if (!targetProjectId) throw new Error("Usage: /environments <project-id>");
+        const res = await api.get(`/projects/${targetProjectId}/environments`);
+        const envs = res.data.environments || res.data || [];
+        return {
+          title: `${envs.length} environment${envs.length === 1 ? "" : "s"}`,
+          body: envs.length
+            ? envs
+                .map(
+                  (e: { name: string; branch?: string; auto_deploy?: boolean; require_ci?: boolean }) =>
+                    `  ${e.name} — branch ${e.branch || "(none)"}, auto-deploy ${e.auto_deploy ? "on" : "off"}, CI required ${e.require_ci ? "yes" : "no"}`
+                )
+                .join("\n")
+            : "No environments configured.",
+        };
+      }
 
       if (command === "/build") {
         if (!targetDeploymentId) throw new Error("Usage: /build <deployment-id>");
@@ -1330,6 +1565,9 @@ export default function AiAgentPage() {
                         {message.content}
                       </ReactMarkdown>
                     </div>
+                  )}
+                  {message.role === "assistant" && (
+                    <ThinkingPanel reasoning={message.reasoning} stats={message.stats} />
                   )}
                 </div>
               </div>
