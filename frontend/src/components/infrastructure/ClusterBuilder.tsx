@@ -22,6 +22,14 @@ import api from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -195,15 +203,22 @@ export function ClusterBuilder() {
     },
   });
 
+  // Names of nodes that refused to join because they run their own standalone
+  // Kubernetes. Non-empty means the confirmation dialog is open.
+  const [replaceCandidates, setReplaceCandidates] = useState<string[]>([]);
+
   const joinWorkersMutation = useMutation({
     mutationKey: ["kubernetes-cluster-join-workers"],
-    mutationFn: async () => {
+    mutationFn: async (options?: { replaceExisting?: boolean }) => {
       const results: ClusterActionResponse[] = [];
       for (const workerId of effectiveSelectedWorkerIds) {
         try {
           const response = await api.post<ClusterActionResponse>(`/ssh/connections/${effectiveControlPlaneId}/cluster/join`, {
             worker_connection_id: workerId,
             sudo_password: workerSudo,
+            // Only ever set after the user confirms in the dialog below.
+            // Converting a standalone node destroys what it was running.
+            replace_existing: options?.replaceExisting === true,
           });
           results.push(response.data);
         } catch (error) {
@@ -230,6 +245,21 @@ export function ClusterBuilder() {
         message: failed.length === 0 ? "Selected workers joined the cluster" : `${failed.length} worker join operation failed`,
         details: combinedDetails,
       });
+      // A node already running its own standalone Kubernetes is the one
+      // failure the user can resolve without understanding k3s internals, so
+      // offer to do it for them instead of explaining server-versus-agent.
+      const alreadyServers = failed.filter((result) =>
+        (result.error || "").includes("already running k3s as its own control plane")
+      );
+      if (alreadyServers.length > 0) {
+        setReplaceCandidates(
+          alreadyServers
+            .map((result) => connections.find((c) => c.id === result.worker_connection_id)?.name)
+            .filter((name): name is string => Boolean(name))
+        );
+        return;
+      }
+
       if (failed.length === 0) {
         toast.success("Selected workers joined the cluster");
         setWorkerSudo("");
@@ -513,7 +543,7 @@ export function ClusterBuilder() {
                       />
                     </div>
                     <Button
-                      onClick={() => joinWorkersMutation.mutate()}
+                      onClick={() => joinWorkersMutation.mutate({})}
                       disabled={!selectedCluster || effectiveSelectedWorkerIds.length === 0 || joinWorkersMutation.isPending}
                     >
                       {joinWorkersMutation.isPending ? (
@@ -668,6 +698,43 @@ export function ClusterBuilder() {
           )}
         </CardContent>
       </Card>
+      <Dialog open={replaceCandidates.length > 0} onOpenChange={(open) => !open && setReplaceCandidates([])}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Replace the standalone Kubernetes on these servers?</DialogTitle>
+            <DialogDescription>
+              {replaceCandidates.join(", ")}{" "}
+              {replaceCandidates.length === 1 ? "is" : "are"} already running Kubernetes as a
+              single-server cluster, which is why the join was refused.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 text-sm">
+            <p>
+              To join the cluster, that standalone install has to be removed first. StackPilot can
+              do it now and then join the server as a worker.
+            </p>
+            <p className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-destructive">
+              Anything currently running on those servers&apos; own clusters will be destroyed. Only
+              their standalone Kubernetes is affected — the cluster you are joining them to is not
+              touched.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setReplaceCandidates([])}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setReplaceCandidates([]);
+                joinWorkersMutation.mutate({ replaceExisting: true });
+              }}
+            >
+              Replace and join
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

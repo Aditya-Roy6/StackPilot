@@ -847,6 +847,9 @@ export default function SettingsPage() {
                   <h3 className="text-sm font-semibold text-foreground">Saved Connections</h3>
                   <p className="text-xs text-muted-foreground">
                     Test a VPS connection here before using it in the project creation flow.
+                    &ldquo;Single-node Kubernetes&rdquo; makes one server its own small cluster. To
+                    build a cluster across several servers, use Cluster Builder instead — it
+                    installs Kubernetes on every node for you.
                   </p>
                 </div>
                 {sshConnectionsQuery.isFetching && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
@@ -999,7 +1002,7 @@ export default function SettingsPage() {
                               ) : (
                                 <Wrench className="mr-2 h-4 w-4" />
                               )}
-                              Prepare Kubernetes
+                              Single-node Kubernetes
                             </Button>
                             <Button
                               variant="outline"

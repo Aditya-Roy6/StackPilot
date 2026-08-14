@@ -1228,7 +1228,8 @@ SshOperationResult SshService::initializeK3sControlPlane(const SshConnectionConf
 SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
                                              const std::string& serverUrl,
                                              const std::string& nodeToken,
-                                             const std::string& sudoPassword) const {
+                                             const std::string& sudoPassword,
+                                             bool replaceExisting) const {
     SshOperationResult result;
     std::string error;
     if (!isValidConnectionConfig(config, error)) {
@@ -1279,8 +1280,14 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
         // and reported the node as joined. Two workers ended up running
         // separate single-node clusters while the UI showed a three-node one.
         "if systemctl is-active --quiet k3s 2>/dev/null && ! systemctl is-active --quiet k3s-agent 2>/dev/null; then "
-        "  echo __STACKPILOT_NODE_IS_SERVER__; exit 26; "
-        "fi; "
+        + std::string(replaceExisting
+            ? "  echo removing_standalone_server=yes; "
+              "  (" + std::string(hasSudoPass
+                    ? "echo " + shellQuote(sudoPassword) + " | sudo -S /usr/local/bin/k3s-uninstall.sh"
+                    : "sudo -n /usr/local/bin/k3s-uninstall.sh") + " >/dev/null 2>&1 || true); "
+              "  sleep 3; "
+            : "  echo __STACKPILOT_NODE_IS_SERVER__; exit 26; ")
+        + "fi; "
         "if systemctl is-active --quiet k3s-agent 2>/dev/null; then echo STACKPILOT_k3s_existing=yes; "
         "else tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
         "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_AGENT_INSTALL_FAILED__; exit 23; }; rm -f \"$tmp\"; fi; "

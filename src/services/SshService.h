@@ -58,10 +58,18 @@ public:
                                                  const std::string& sudoPassword = "",
                                                  const std::string& advertiseAddress = "",
                                                  const std::string& tlsSan = "") const;
+    /// Joins a node as a k3s agent.
+    ///
+    /// `replaceExisting` handles the node that is already running its own
+    /// standalone k3s server, usually because Prepare Kubernetes was used on
+    /// it. Without it the join refuses, because converting is destructive: the
+    /// standalone cluster and everything running on it is removed. With it,
+    /// the caller has confirmed that is what they want.
     SshOperationResult joinK3sWorker(const SshConnectionConfig& config,
                                      const std::string& serverUrl,
                                      const std::string& nodeToken,
-                                     const std::string& sudoPassword = "") const;
+                                     const std::string& sudoPassword = "",
+                                     bool replaceExisting = false) const;
     SshOperationResult inspectK3sCluster(const SshConnectionConfig& config) const;
 
     /**

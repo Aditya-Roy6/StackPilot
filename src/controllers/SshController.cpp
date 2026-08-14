@@ -973,7 +973,11 @@ void SshController::joinKubernetesCluster(
         SshService sshService;
         auto joinResult = joinAsServer
             ? sshService.joinK3sServer(workerConfig, serverUrl, nodeToken, sudoPassword)
-            : sshService.joinK3sWorker(workerConfig, serverUrl, nodeToken, sudoPassword);
+            : sshService.joinK3sWorker(workerConfig, serverUrl, nodeToken, sudoPassword,
+                                       // The UI asks before setting this: converting a
+                                       // standalone node destroys whatever it was running.
+                                       body->isMember("replace_existing") &&
+                                           (*body)["replace_existing"].asBool());
         const std::string redactedDetails = redactClusterToken(joinResult.output);
 
         pqxx::work writeTxn(*conn);
