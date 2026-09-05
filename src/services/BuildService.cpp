@@ -1524,6 +1524,11 @@ BuildResult BuildService::buildFromPreparedSource(const std::string& deploymentI
                                                   LogCallback onLogLine) const {
     BuildResult result;
 
+    const RepositoryArchetype archetype = classifyRepositoryArchetype(sourceDir);
+    result.archetype = archetype.type;
+    result.archetypeDetails = archetype.details;
+    result.detectedSubServices = archetype.subServices;
+
     if (isBuildCanceled(deploymentId)) {
         result.error = "Deployment was canceled by user";
         appendLogLine(logFile, result.error, onLogLine);
@@ -2201,6 +2206,197 @@ bool BuildService::tryGenerateDockerfileWithAi(const std::filesystem::path& sour
     return true;
 }
 
+RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesystem::path& sourceDir) const {
+    RepositoryArchetype arch;
+    arch.type = "standard_web";
+    arch.displayName = "Web Application";
+    arch.isDeployable = true;
+
+    std::error_code ec;
+
+    // 1. Scan for monorepo sub-services
+    static const std::vector<std::string> subSearchDirs = {
+        "backend", "server", "api", "web", "frontend", "client", "service", "app"
+    };
+    for (const auto& candidate : subSearchDirs) {
+        const auto p = sourceDir / candidate;
+        if (std::filesystem::exists(p, ec) && std::filesystem::is_directory(p, ec)) {
+            if (hasFile(p, "package.json") || hasFile(p, "requirements.txt") ||
+                hasFile(p, "go.mod") || hasFile(p, "Cargo.toml") || hasFile(p, "Dockerfile") ||
+                findComposeFile(p) != std::filesystem::path()) {
+                arch.subServices.push_back(candidate);
+            }
+        }
+    }
+    for (const auto& monoFolder : {"apps", "packages", "services"}) {
+        const auto p = sourceDir / monoFolder;
+        if (std::filesystem::exists(p, ec) && std::filesystem::is_directory(p, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
+                if (entry.is_directory(ec)) {
+                    if (hasFile(entry.path(), "package.json") || hasFile(entry.path(), "requirements.txt") ||
+                        hasFile(entry.path(), "go.mod") || hasFile(entry.path(), "Cargo.toml") || hasFile(entry.path(), "Dockerfile")) {
+                        arch.subServices.push_back(std::string(monoFolder) + "/" + entry.path().filename().string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check for iOS Native (Xcode / Swift UIKit)
+    bool hasXcodeProj = false;
+    for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(".xcodeproj") != std::string::npos || name.rfind(".xcworkspace") != std::string::npos) {
+            hasXcodeProj = true;
+            break;
+        }
+    }
+    if (!hasXcodeProj) {
+        const auto iosDir = sourceDir / "ios";
+        if (std::filesystem::exists(iosDir, ec) && std::filesystem::is_directory(iosDir, ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator(iosDir, ec)) {
+                if (ec) break;
+                const std::string name = entry.path().filename().string();
+                if (name.rfind(".xcodeproj") != std::string::npos || name.rfind(".xcworkspace") != std::string::npos) {
+                    hasXcodeProj = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Check for Android Native
+    bool hasAndroidRoot = hasFile(sourceDir, "AndroidManifest.xml") ||
+                          hasFile(sourceDir / "app" / "src" / "main", "AndroidManifest.xml");
+
+    // 4. Check for React Native / Expo
+    if (hasFile(sourceDir, "package.json")) {
+        std::ifstream in(sourceDir / "package.json");
+        Json::CharReaderBuilder builder;
+        Json::Value pkg;
+        std::string errs;
+        if (Json::parseFromStream(builder, in, &pkg, &errs) && pkg.isObject()) {
+            auto hasDep = [](const Json::Value& deps, const std::string& name) {
+                return deps.isObject() && deps.isMember(name);
+            };
+            const bool isExpo = hasDep(pkg["dependencies"], "expo") || hasDep(pkg["devDependencies"], "expo") || hasFile(sourceDir, "app.json");
+            const bool isReactNative = hasDep(pkg["dependencies"], "react-native") || hasDep(pkg["devDependencies"], "react-native");
+
+            if (isExpo || isReactNative) {
+                arch.type = "expo_react_native";
+                arch.displayName = isExpo ? "React Native (Expo Mobile)" : "React Native Mobile";
+                arch.requiresDiversion = true;
+                arch.suggestedStrategy = "expo_web_preview";
+                arch.details = "Detected a React Native / Expo mobile application. StackPilot is diverting the build to an Expo Web PWA container (port 3000) with interactive mobile phone simulation.";
+                return arch;
+            }
+
+            // Check if pure library
+            const Json::Value& scripts = pkg["scripts"];
+            bool hasRunnableScript = false;
+            if (scripts.isObject()) {
+                for (const auto& key : scripts.getMemberNames()) {
+                    if (key == "start" || key == "dev" || key == "serve" || key == "server" || key == "preview") {
+                        hasRunnableScript = true;
+                        break;
+                    }
+                }
+            }
+            bool hasWebDep = hasDep(pkg["dependencies"], "express") || hasDep(pkg["dependencies"], "next") ||
+                             hasDep(pkg["dependencies"], "nuxt") || hasDep(pkg["dependencies"], "react-scripts") ||
+                             hasDep(pkg["dependencies"], "vite") || hasDep(pkg["dependencies"], "koa") ||
+                             hasDep(pkg["dependencies"], "fastify") || hasDep(pkg["dependencies"], "nest") ||
+                             hasDep(pkg["dependencies"], "@nestjs/core") || hasDep(pkg["dependencies"], "hono") ||
+                             hasDep(pkg["dependencies"], "remix") || hasDep(pkg["dependencies"], "astro");
+
+            if (!hasRunnableScript && !hasWebDep && pkg.isMember("main") && !hasFile(sourceDir, "server.js") && !hasFile(sourceDir, "app.js")) {
+                arch.type = "library";
+                arch.displayName = "JavaScript/TypeScript Library";
+                arch.isDeployable = false;
+                arch.details = "This repository appears to be a pure JavaScript/TypeScript library or package without a runnable HTTP server. To deploy on StackPilot, add a web server entrypoint (e.g. Express, Fastify, Next.js) or a demonstration dashboard.";
+                return arch;
+            }
+        }
+    }
+
+    // 5. Check Flutter
+    if (hasFile(sourceDir, "pubspec.yaml")) {
+        std::ifstream in(sourceDir / "pubspec.yaml");
+        std::string line;
+        bool isFlutter = false;
+        while (std::getline(in, line)) {
+            if (line.find("flutter:") != std::string::npos || line.find("sdk: flutter") != std::string::npos) {
+                isFlutter = true;
+                break;
+            }
+        }
+        if (isFlutter) {
+            arch.type = "flutter_mobile";
+            arch.displayName = "Flutter Mobile Application";
+            arch.requiresDiversion = true;
+            arch.suggestedStrategy = "flutter_web_preview";
+            arch.details = "Detected a Flutter mobile application. StackPilot is diverting the build to a Flutter Web preview container on port 3000.";
+            return arch;
+        }
+    }
+
+    // 6. If pure iOS Xcode project without web or monorepo root server:
+    if (hasXcodeProj && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
+        arch.type = "native_ios";
+        arch.displayName = "Native iOS (Xcode)";
+        arch.isDeployable = false;
+        arch.details = "Native iOS applications (.xcodeproj / .xcworkspace) require macOS and the iOS simulator SDK and cannot be deployed directly as Linux web containers. If this repository contains a companion backend API, configure the deployment root directory to point to the server subfolder.";
+        return arch;
+    }
+
+    // 7. If pure Android native project without web:
+    if (hasAndroidRoot && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
+        arch.type = "native_android";
+        arch.displayName = "Native Android";
+        arch.isDeployable = false;
+        arch.details = "Native Android applications require the Android SDK runtime and cannot be deployed directly as Linux web containers. If this repository contains an API or backend service, configure the deployment root directory to point to the server subfolder.";
+        return arch;
+    }
+
+    // 8. Pure Python library check
+    if ((hasFile(sourceDir, "setup.py") || hasFile(sourceDir, "pyproject.toml")) &&
+        !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "app.py") &&
+        !hasFile(sourceDir, "main.py") && !hasFile(sourceDir, "server.py") && !hasFile(sourceDir, "wsgi.py") && !hasFile(sourceDir, "asgi.py") && !hasFile(sourceDir, "manage.py")) {
+        bool hasWebFramework = false;
+        for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
+            if (ec) break;
+            if (entry.is_regular_file(ec) && entry.path().extension() == ".py") {
+                std::ifstream pyIn(entry.path());
+                std::string pyLine;
+                while (std::getline(pyIn, pyLine)) {
+                    if (pyLine.find("flask") != std::string::npos || pyLine.find("fastapi") != std::string::npos ||
+                        pyLine.find("django") != std::string::npos || pyLine.find("streamlit") != std::string::npos ||
+                        pyLine.find("uvicorn") != std::string::npos) {
+                        hasWebFramework = true;
+                        break;
+                    }
+                }
+                if (hasWebFramework) break;
+            }
+        }
+        if (!hasWebFramework) {
+            arch.type = "library";
+            arch.displayName = "Python Library / SDK";
+            arch.isDeployable = false;
+            arch.details = "This repository appears to be a pure Python library or SDK without a runnable web application entrypoint (e.g. FastAPI, Flask, Streamlit). To deploy on StackPilot, add a web server entrypoint script.";
+            return arch;
+        }
+    }
+
+    if (!arch.subServices.empty()) {
+        arch.type = "monorepo";
+        arch.displayName = "Monorepo / Multi-Service";
+    }
+
+    return arch;
+}
+
 bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
                                     const std::filesystem::path& logFile,
                                     std::string& reason,
@@ -2210,10 +2406,60 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
         return true;
     }
 
-    appendLogLine(logFile, "Using deterministic Dockerfile generator.", onLogLine);
+    // Run Archetype Pre-Flight Classification
+    const RepositoryArchetype archetype = classifyRepositoryArchetype(sourceDir);
+    if (!archetype.isDeployable) {
+        appendLogLine(logFile, "============================================================", onLogLine);
+        appendLogLine(logFile, "❌ [Archetype Pre-Flight Check] " + archetype.displayName + " detected.", onLogLine);
+        appendLogLine(logFile, archetype.details, onLogLine);
+        if (!archetype.subServices.empty()) {
+            std::string subMsg = "Detected runnable sub-services in repository:";
+            for (const auto& svc : archetype.subServices) {
+                subMsg += " " + svc;
+            }
+            appendLogLine(logFile, subMsg, onLogLine);
+        }
+        appendLogLine(logFile, "============================================================", onLogLine);
+        reason = archetype.details;
+        return false;
+    }
+
     std::string generated;
 
-    if (hasFile(sourceDir, "package.json")) {
+    if (archetype.type == "expo_react_native") {
+        appendLogLine(logFile, "📱 [Archetype Pre-Flight Check] " + archetype.displayName + " detected.", onLogLine);
+        appendLogLine(logFile, "⚡ [Smart Diversion] Auto-generating Expo Web PWA container preview on port 3000...", onLogLine);
+        generated =
+            "FROM node:20-alpine AS builder\n"
+            "WORKDIR /app\n"
+            "COPY package*.json ./\n"
+            "RUN npm install --legacy-peer-deps || npm install\n"
+            "COPY . .\n"
+            "RUN npx expo export --platform web || npx expo export:web || npm run build || true\n\n"
+            "FROM nginx:alpine\n"
+            "COPY --from=builder /app/dist /usr/share/nginx/html\n"
+            "RUN if [ ! -d /usr/share/nginx/html ] || [ -z \"$(ls -A /usr/share/nginx/html 2>/dev/null)\" ]; then \\\n"
+            "      cp -r /app/web-build/* /usr/share/nginx/html/ 2>/dev/null || true; \\\n"
+            "    fi\n"
+            "RUN printf 'server {\\n    listen 3000;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html;\\n    location / {\\n        try_files $uri $uri/ /index.html;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf\n"
+            "RUN mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp /var/cache/nginx/scgi_temp && chmod -R 777 /var/cache/nginx /var/run /var/log/nginx /etc/nginx\n"
+            "EXPOSE 3000\n"
+            "CMD [\"nginx\", \"-g\", \"daemon off;\"]\n";
+    } else if (archetype.type == "flutter_mobile") {
+        appendLogLine(logFile, "📱 [Archetype Pre-Flight Check] " + archetype.displayName + " detected.", onLogLine);
+        appendLogLine(logFile, "⚡ [Smart Diversion] Auto-generating Flutter Web preview container on port 3000...", onLogLine);
+        generated =
+            "FROM ghcr.io/cirruslabs/flutter:stable AS build\n"
+            "WORKDIR /app\n"
+            "COPY . .\n"
+            "RUN flutter config --enable-web && flutter pub get && flutter build web --release\n\n"
+            "FROM nginx:alpine\n"
+            "COPY --from=build /app/build/web /usr/share/nginx/html\n"
+            "RUN printf 'server {\\n    listen 3000;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html;\\n    location / {\\n        try_files $uri $uri/ /index.html;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf\n"
+            "RUN mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp /var/cache/nginx/scgi_temp && chmod -R 777 /var/cache/nginx /var/run /var/log/nginx /etc/nginx\n"
+            "EXPOSE 3000\n"
+            "CMD [\"nginx\", \"-g\", \"daemon off;\"]\n";
+    } else if (hasFile(sourceDir, "package.json")) {
         const std::filesystem::path packageJsonPath = sourceDir / "package.json";
         Json::Value packageJson;
         bool parsedPackage = false;

@@ -171,7 +171,8 @@ Json::Value runtimeSnapshot(const std::string& provider,
                             int containerPort,
                             const std::string& resourcePreset,
                             const std::string& healthPath,
-                            const std::string& runtimeScheme) {
+                            const std::string& runtimeScheme,
+                            const BuildResult* buildResult = nullptr) {
     const std::string scheme = normalizeRuntimeScheme(runtimeScheme);
     Json::Value snapshot(Json::objectValue);
     snapshot["provider"] = provider;
@@ -184,6 +185,15 @@ Json::Value runtimeSnapshot(const std::string& provider,
     snapshot["health_path"] = healthPath.empty() ? "/" : healthPath;
     snapshot["runtime_scheme"] = scheme;
     snapshot["tls_enabled"] = scheme == "https";
+    if (buildResult && !buildResult->archetype.empty()) {
+        snapshot["archetype"] = buildResult->archetype;
+        snapshot["archetype_details"] = buildResult->archetypeDetails;
+        Json::Value subservices(Json::arrayValue);
+        for (const auto& s : buildResult->detectedSubServices) {
+            subservices.append(s);
+        }
+        snapshot["detected_subservices"] = subservices;
+    }
     return snapshot;
 }
 
@@ -199,7 +209,8 @@ Json::Value composeRuntimeSnapshot(const BuildResult& buildResult,
         0,
         "compose",
         "/",
-        runtimeScheme
+        runtimeScheme,
+        &buildResult
     );
     snapshot["multi_service"] = true;
     snapshot["compose_project"] = buildResult.composeProjectName;
@@ -225,7 +236,8 @@ Json::Value composeKubernetesRuntimeSnapshot(const BuildResult& buildResult,
         containerPort,
         resourcePreset,
         healthPath,
-        runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme
+        runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme,
+        &buildResult
     );
     snapshot["multi_service"] = true;
     snapshot["compose_kubernetes"] = true;
@@ -1612,7 +1624,8 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                             3000,
                             "small",
                             "/",
-                            remoteK8sRuntime.runtimeScheme.empty() ? runtimeScheme : remoteK8sRuntime.runtimeScheme
+                            remoteK8sRuntime.runtimeScheme.empty() ? runtimeScheme : remoteK8sRuntime.runtimeScheme,
+                            &buildResult
                         )),
                     job.deploymentId
                 );
@@ -1647,7 +1660,8 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                             3000,
                             "small",
                             "/",
-                            localK8sRuntime.runtimeScheme.empty() ? runtimeScheme : localK8sRuntime.runtimeScheme
+                            localK8sRuntime.runtimeScheme.empty() ? runtimeScheme : localK8sRuntime.runtimeScheme,
+                            &buildResult
                         )),
                     job.deploymentId
                 );
@@ -1681,7 +1695,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     buildResult.imageName,
                     buildResult.runtimeUrl,
                     buildResult.remoteContainerName,
-                    compactJson(runtimeSnapshot("remote_docker", buildResult.imageName, buildResult.runtimeUrl, "remote_docker", 1, 3000, "small", "/", "http")),
+                    compactJson(runtimeSnapshot("remote_docker", buildResult.imageName, buildResult.runtimeUrl, "remote_docker", 1, 3000, "small", "/", "http", &buildResult)),
                     job.deploymentId
                 );
                 LogWebSocketController::broadcastStatus(job.deploymentId, "running");
@@ -1715,7 +1729,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     buildResult.imageName,
                     buildResult.runtimeUrl,
                     buildResult.remoteContainerName,
-                    compactJson(runtimeSnapshot("local_docker", buildResult.imageName, buildResult.runtimeUrl, "local_docker", 1, containerPort, "small", "/", "http")),
+                    compactJson(runtimeSnapshot("local_docker", buildResult.imageName, buildResult.runtimeUrl, "local_docker", 1, containerPort, "small", "/", "http", &buildResult)),
                     job.deploymentId
                 );
                 LogWebSocketController::broadcastStatus(job.deploymentId, "running");
@@ -1727,7 +1741,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     "WHERE id = $4",
                     buildResult.logs,
                     buildResult.imageName,
-                    compactJson(runtimeSnapshot("local_docker", buildResult.imageName, "", "docker", 0, 3000, "small", "/", "http")),
+                    compactJson(runtimeSnapshot("local_docker", buildResult.imageName, "", "docker", 0, 3000, "small", "/", "http", &buildResult)),
                     job.deploymentId
                 );
                 LogWebSocketController::broadcastStatus(job.deploymentId, "built");
@@ -1799,12 +1813,25 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
             if (!buildResult.error.empty() && failureLogs.find(buildResult.error) == std::string::npos) {
                 failureLogs += "\nFailure reason: " + buildResult.error + "\n";
             }
+            Json::Value failSnapshot(Json::objectValue);
+            if (!buildResult.archetype.empty()) {
+                failSnapshot["archetype"] = buildResult.archetype;
+                failSnapshot["archetype_details"] = buildResult.archetypeDetails;
+                Json::Value subservices(Json::arrayValue);
+                for (const auto& s : buildResult.detectedSubServices) {
+                    subservices.append(s);
+                }
+                failSnapshot["detected_subservices"] = subservices;
+            }
             updateTxn.exec_params(
                 "UPDATE deployments "
-                "SET status = 'failed', logs = $1, remote_container_name = COALESCE(NULLIF($2, ''), remote_container_name), artifact_available = FALSE, updated_at = NOW() "
-                "WHERE id = $3 AND status <> 'canceled'",
+                "SET status = 'failed', logs = $1, remote_container_name = COALESCE(NULLIF($2, ''), remote_container_name), "
+                "runtime_snapshot = CASE WHEN $3::text = '{}' THEN runtime_snapshot ELSE $3::jsonb END, "
+                "artifact_available = FALSE, updated_at = NOW() "
+                "WHERE id = $4 AND status <> 'canceled'",
                 failureLogs,
                 buildResult.remoteContainerName,
+                compactJson(failSnapshot),
                 job.deploymentId
             );
             auto statusCheck = updateTxn.exec_params("SELECT status FROM deployments WHERE id = $1", job.deploymentId);

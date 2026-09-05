@@ -17,10 +17,15 @@
 #include "../utils/JwtHelper.h"
 #include "../utils/StringUtils.h"
 
+#include "LogWebSocketController.h"
+#include "../services/DeploymentJournal.h"
+
 #include <algorithm>
 #include <json/json.h>
 #include <pqxx/pqxx>
+#include <regex>
 #include <spdlog/spdlog.h>
+#include <sstream>
 
 namespace stackpilot {
 namespace {
@@ -231,6 +236,368 @@ void DeploymentController::getCostReport(
         spdlog::error("getCostReport failed: {}", e.what());
         callback(errorResponse(drogon::k500InternalServerError, "Failed to build cost report"));
     }
+}
+
+void DeploymentController::getRootCauseAnalysis(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& deploymentId
+) {
+    const std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        callback(errorResponse(drogon::k401Unauthorized, "Unauthorized"));
+        return;
+    }
+
+    BlockingTaskRunner::run([deploymentId, userId, callback = std::move(callback)]() mutable {
+        try {
+            auto conn = Database::getInstance().getConnection();
+            pqxx::work txn(*conn);
+            auto rows = txn.exec_params(
+                "SELECT d.id, d.project_id, d.status, COALESCE(d.logs, '') AS logs, "
+                "COALESCE(d.runtime_snapshot::text, '{}') AS runtime_snapshot, "
+                "COALESCE(d.image_name, '') AS image_name, p.name AS project_name "
+                "FROM deployments d JOIN projects p ON p.id = d.project_id "
+                "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+                deploymentId, userId
+            );
+            if (rows.empty()) {
+                txn.commit();
+                callback(errorResponse(drogon::k404NotFound, "Deployment not found"));
+                return;
+            }
+            txn.commit();
+
+            const auto& row = rows[0];
+            const std::string status = row["status"].as<std::string>();
+            const std::string logs = row["logs"].as<std::string>();
+            const std::string snapshotStr = row["runtime_snapshot"].as<std::string>();
+
+            Json::Value snapshot;
+            Json::CharReaderBuilder readerBuilder;
+            std::string errs;
+            std::istringstream sStream(snapshotStr);
+            Json::parseFromStream(readerBuilder, sStream, &snapshot, &errs);
+
+            std::string archetype = snapshot.isMember("archetype") ? snapshot["archetype"].asString() : "";
+            std::string archetypeDetails = snapshot.isMember("archetype_details") ? snapshot["archetype_details"].asString() : "";
+            Json::Value detectedSubservices = snapshot.isMember("detected_subservices") ? snapshot["detected_subservices"] : Json::Value(Json::arrayValue);
+
+            Json::Value rca(Json::objectValue);
+            rca["deployment_id"] = deploymentId;
+            rca["status"] = status;
+            rca["archetype"] = archetype;
+            rca["detected_subservices"] = detectedSubservices;
+
+            Json::Value analysis(Json::objectValue);
+
+            // 1. Check Archetype first
+            if (archetype == "native_ios") {
+                analysis["category"] = "UNSUPPORTED_ARCHETYPE";
+                analysis["confidence"] = 99;
+                analysis["title"] = "Native iOS Xcode Project Detected";
+                analysis["summary"] = archetypeDetails.empty()
+                    ? "StackPilot Linux build nodes cannot build native macOS/iOS Xcode projects (.xcodeproj / .xcworkspace)."
+                    : archetypeDetails;
+                analysis["culprit_file"] = "Xcode Project";
+                analysis["can_auto_repair"] = false;
+                analysis["repair_action"] = "divert_subservice";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Deploy the backend API sub-directory if this is a mobile client/server repository.");
+                steps.append("Build the iOS native IPA using GitHub Actions macOS runner or Xcode Cloud.");
+                analysis["remediation_steps"] = steps;
+            } else if (archetype == "native_android") {
+                analysis["category"] = "UNSUPPORTED_ARCHETYPE";
+                analysis["confidence"] = 99;
+                analysis["title"] = "Native Android Gradle Project Detected";
+                analysis["summary"] = archetypeDetails.empty()
+                    ? "StackPilot Linux build nodes cannot run Android application APKs as web services."
+                    : archetypeDetails;
+                analysis["culprit_file"] = "build.gradle / AndroidManifest.xml";
+                analysis["can_auto_repair"] = false;
+                analysis["repair_action"] = "divert_subservice";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Deploy the backend API sub-directory if this repository includes a server component.");
+                steps.append("Build the Android APK via an Android SDK CI workflow.");
+                analysis["remediation_steps"] = steps;
+            } else if (archetype == "library") {
+                analysis["category"] = "UNSUPPORTED_ARCHETYPE";
+                analysis["confidence"] = 95;
+                analysis["title"] = "Non-Runnable Library / SDK Detected";
+                analysis["summary"] = archetypeDetails.empty()
+                    ? "This repository is a library or SDK without a runnable web application entrypoint (e.g. Express, FastAPI)."
+                    : archetypeDetails;
+                analysis["culprit_file"] = "package.json / setup.py";
+                analysis["can_auto_repair"] = false;
+                analysis["repair_action"] = "add_web_entrypoint";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Add a web server entrypoint script (e.g. index.js with express, or app.py with fastapi).");
+                steps.append("Specify a 'start' script in package.json that starts an HTTP server.");
+                analysis["remediation_steps"] = steps;
+            } else if (archetype == "expo_react_native") {
+                analysis["category"] = "MOBILE_DIVERSION";
+                analysis["confidence"] = 95;
+                analysis["title"] = "Expo / React Native Mobile App";
+                analysis["summary"] = "Expo application detected. Can be previewed directly on the web using StackPilot's Smart Mobile Simulator.";
+                analysis["culprit_file"] = "app.json";
+                analysis["can_auto_repair"] = true;
+                analysis["repair_action"] = "expo_web_preview";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Run web preview container via 'npx expo export --platform web'.");
+                steps.append("Preview in the StackPilot Mobile Device Frame or scan QR code on physical device.");
+                analysis["remediation_steps"] = steps;
+            } else if (archetype == "flutter_mobile") {
+                analysis["category"] = "MOBILE_DIVERSION";
+                analysis["confidence"] = 95;
+                analysis["title"] = "Flutter Mobile App";
+                analysis["summary"] = "Flutter application detected. Can be compiled to web preview container.";
+                analysis["culprit_file"] = "pubspec.yaml";
+                analysis["can_auto_repair"] = true;
+                analysis["repair_action"] = "flutter_web_preview";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Build Flutter Web preview container.");
+                steps.append("Preview in the StackPilot Mobile Device Frame.");
+                analysis["remediation_steps"] = steps;
+            } else {
+                // 2. Scan log patterns for Root Cause
+                std::smatch match;
+                if (std::regex_search(logs, match, std::regex(R"(Cannot find module ['"]([^'"]+)['"])"))) {
+                    std::string pkg = match[1].str();
+                    analysis["category"] = "MISSING_DEPENDENCY";
+                    analysis["confidence"] = 96;
+                    analysis["title"] = "Missing NPM Dependency: " + pkg;
+                    analysis["summary"] = "The application build failed because module '" + pkg + "' was imported but is missing from package.json.";
+                    analysis["culprit_file"] = "package.json";
+                    analysis["culprit_item"] = pkg;
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "auto_patch";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Add \"" + pkg + "\" to dependencies in package.json.");
+                    steps.append("Run 'npm install' or trigger autonomous AI SRE repair.");
+                    analysis["remediation_steps"] = steps;
+                } else if (std::regex_search(logs, match, std::regex(R"(ModuleNotFoundError: No module named ['"]([^'"]+)['"])"))) {
+                    std::string pkg = match[1].str();
+                    analysis["category"] = "MISSING_DEPENDENCY";
+                    analysis["confidence"] = 96;
+                    analysis["title"] = "Missing Python Package: " + pkg;
+                    analysis["summary"] = "The Python application failed to start because module '" + pkg + "' is not installed in the environment.";
+                    analysis["culprit_file"] = "requirements.txt";
+                    analysis["culprit_item"] = pkg;
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "auto_patch";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Add \"" + pkg + "\" to requirements.txt.");
+                    steps.append("Rebuild container with the missing requirement.");
+                    analysis["remediation_steps"] = steps;
+                } else if (logs.find("npm ERR! ERESOLVE") != std::string::npos || logs.find("Could not resolve dependency") != std::string::npos) {
+                    analysis["category"] = "LOCKFILE_CONFLICT";
+                    analysis["confidence"] = 94;
+                    analysis["title"] = "NPM Peer Dependency Conflict";
+                    analysis["summary"] = "npm failed with ERESOLVE peer dependency resolution conflict.";
+                    analysis["culprit_file"] = "package.json";
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "auto_patch";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Use 'npm install --legacy-peer-deps' in the Dockerfile build step.");
+                    steps.append("Or update package versions to satisfy mutual peer dependencies.");
+                    analysis["remediation_steps"] = steps;
+                } else if (logs.find("address already in use") != std::string::npos || logs.find("EADDRINUSE") != std::string::npos || logs.find("port is already allocated") != std::string::npos) {
+                    analysis["category"] = "PORT_BIND_CONFLICT";
+                    analysis["confidence"] = 96;
+                    analysis["title"] = "Port Binding Conflict";
+                    analysis["summary"] = "The target listening port is already bound by another container or process.";
+                    analysis["culprit_file"] = "PORT / Dockerfile";
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "reallocate_port";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Change container port in Deployment configuration or release the conflicting host port.");
+                    analysis["remediation_steps"] = steps;
+                } else if (logs.find("exit code 137") != std::string::npos || logs.find("OOMKilled") != std::string::npos || logs.find("Out of memory: Kill process") != std::string::npos) {
+                    analysis["category"] = "OOM_KILL";
+                    analysis["confidence"] = 95;
+                    analysis["title"] = "Out of Memory (OOM Killer Invoked)";
+                    analysis["summary"] = "The process exceeded container memory limits and was killed with SIGKILL (Exit code 137).";
+                    analysis["culprit_file"] = "Resource Preset / Memory Limit";
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "increase_memory";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Increase deployment resource preset (e.g. from 'small' 512MB to 'medium' 2GB).");
+                    steps.append("Optimize application memory usage and node options (e.g. --max-old-space-size).");
+                    analysis["remediation_steps"] = steps;
+                } else if (logs.find("docker build timed out") != std::string::npos || logs.find("exit code 124") != std::string::npos) {
+                    analysis["category"] = "BUILD_TIMEOUT";
+                    analysis["confidence"] = 95;
+                    analysis["title"] = "Build Timed Out";
+                    analysis["summary"] = "The container build step exceeded the maximum allowable execution timeout.";
+                    analysis["culprit_file"] = "Dockerfile";
+                    analysis["can_auto_repair"] = false;
+                    analysis["repair_action"] = "optimize_build";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Separate dependency caching (COPY package*.json before COPY .).");
+                    steps.append("Increase STACKPILOT_BACKEND_BUILD_TIMEOUT if compiling large assets.");
+                    analysis["remediation_steps"] = steps;
+                } else if (logs.find("dockerfile parse error") != std::string::npos || logs.find("unknown instruction") != std::string::npos) {
+                    analysis["category"] = "DOCKERFILE_SYNTAX_ERROR";
+                    analysis["confidence"] = 92;
+                    analysis["title"] = "Dockerfile Syntax Error";
+                    analysis["summary"] = "Docker daemon failed parsing instructions in Dockerfile.";
+                    analysis["culprit_file"] = "Dockerfile";
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "auto_patch";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Validate Dockerfile syntax and instruction arguments.");
+                    analysis["remediation_steps"] = steps;
+                } else if (logs.find("Connection refused") != std::string::npos || logs.find("ECONNREFUSED") != std::string::npos) {
+                    analysis["category"] = "DATABASE_CONNECTION_REFUSED";
+                    analysis["confidence"] = 90;
+                    analysis["title"] = "Database Connection Refused";
+                    analysis["summary"] = "The application failed connecting to an external service or database.";
+                    analysis["culprit_file"] = "Environment Variables (.env)";
+                    analysis["can_auto_repair"] = false;
+                    analysis["repair_action"] = "check_env";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Verify DATABASE_URL, DB_HOST, and DB_PORT in environment variables.");
+                    steps.append("Ensure the database server is running and accessible over the network.");
+                    analysis["remediation_steps"] = steps;
+                } else if (status == "failed") {
+                    analysis["category"] = "GENERAL_BUILD_FAILURE";
+                    analysis["confidence"] = 75;
+                    analysis["title"] = "Build or Compilation Error";
+                    analysis["summary"] = "The deployment build command exited with a non-zero status.";
+                    analysis["culprit_file"] = "Build Log";
+                    analysis["can_auto_repair"] = true;
+                    analysis["repair_action"] = "ai_repair";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Check the latest build logs for stack traces.");
+                    steps.append("Click 'Fix with AI' to trigger autonomous code & config repair.");
+                    analysis["remediation_steps"] = steps;
+                } else {
+                    analysis["category"] = "HEALTHY_OR_RUNNING";
+                    analysis["confidence"] = 100;
+                    analysis["title"] = "Deployment Healthy";
+                    analysis["summary"] = "No critical build or runtime failure patterns detected.";
+                    analysis["culprit_file"] = "";
+                    analysis["can_auto_repair"] = false;
+                    analysis["repair_action"] = "none";
+                    Json::Value steps(Json::arrayValue);
+                    steps.append("Deployment is running as expected.");
+                    analysis["remediation_steps"] = steps;
+                }
+            }
+
+            rca["rca"] = analysis;
+            callback(drogon::HttpResponse::newHttpJsonResponse(rca));
+        } catch (const std::exception& e) {
+            spdlog::error("getRootCauseAnalysis failed for {}: {}", deploymentId, e.what());
+            callback(errorResponse(drogon::k500InternalServerError, "Failed to analyze root cause"));
+        }
+    });
+}
+
+void DeploymentController::rollbackDeployment(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& deploymentId
+) {
+    const std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        callback(errorResponse(drogon::k401Unauthorized, "Unauthorized"));
+        return;
+    }
+
+    BlockingTaskRunner::run([deploymentId, userId, req, callback = std::move(callback), this]() mutable {
+        try {
+            auto conn = Database::getInstance().getConnection();
+            pqxx::work txn(*conn);
+
+            // 1. Fetch current deployment info
+            auto currentRows = txn.exec_params(
+                "SELECT d.id, d.project_id, d.environment_id, d.runtime_provider, d.runtime_exposure, "
+                "COALESCE(d.runtime_snapshot::text, '{}') AS runtime_snapshot "
+                "FROM deployments d JOIN projects p ON p.id = d.project_id "
+                "WHERE d.id = $1 AND has_project_access(p.id, $2, 'admin')",
+                deploymentId, userId
+            );
+            if (currentRows.empty()) {
+                txn.commit();
+                callback(errorResponse(drogon::k404NotFound, "Deployment not found or insufficient admin permissions"));
+                return;
+            }
+
+            const auto& curRow = currentRows[0];
+            const std::string projectId = curRow["project_id"].as<std::string>();
+            const std::string envId = curRow["environment_id"].is_null() ? "" : curRow["environment_id"].as<std::string>();
+            const std::string provider = curRow["runtime_provider"].is_null() ? "" : curRow["runtime_provider"].as<std::string>();
+
+            // If it's Kubernetes, delegate directly to the k8s rollback engine
+            if (provider == "kubernetes" || provider == "remote_kubernetes") {
+                txn.commit();
+                rollbackKubernetesDeployment(req, std::move(callback), deploymentId);
+                return;
+            }
+
+            // 2. Find previous healthy deployment in the same project & environment
+            auto prevRows = txn.exec_params(
+                "SELECT d.id, d.image_name, d.runtime_url, d.remote_container_name, "
+                "d.runtime_snapshot::text AS runtime_snapshot, d.status "
+                "FROM deployments d "
+                "WHERE d.project_id = $1 "
+                "AND ($2 = '' OR d.environment_id = NULLIF($2, '')::uuid) "
+                "AND d.id <> $3 "
+                "AND d.status IN ('running', 'built') "
+                "AND d.artifact_available = TRUE "
+                "ORDER BY d.created_at DESC LIMIT 1",
+                projectId, envId, deploymentId
+            );
+
+            if (prevRows.empty()) {
+                txn.commit();
+                callback(errorResponse(drogon::k400BadRequest, "No previous healthy deployment checkpoint found to roll back to"));
+                return;
+            }
+
+            const auto& prev = prevRows[0];
+            const std::string prevId = prev["id"].as<std::string>();
+            const std::string prevImage = prev["image_name"].is_null() ? "" : prev["image_name"].as<std::string>();
+            const std::string prevUrl = prev["runtime_url"].is_null() ? "" : prev["runtime_url"].as<std::string>();
+            const std::string prevContainer = prev["remote_container_name"].is_null() ? "" : prev["remote_container_name"].as<std::string>();
+            const std::string prevSnapshot = prev["runtime_snapshot"].is_null() ? "{}" : prev["runtime_snapshot"].as<std::string>();
+
+            // 3. Atomically restore runtime and point active environment to previous healthy checkpoint
+            txn.exec_params(
+                "UPDATE deployments "
+                "SET status = 'running', image_name = $1, runtime_url = $2, remote_container_name = $3, "
+                "runtime_snapshot = $4::jsonb, runtime_paused = FALSE, "
+                "logs = COALESCE(logs, '') || E'\\n[AI SRE Watchdog] Atomic rollback performed: restored healthy checkpoint " + prevId + "\\n', "
+                "updated_at = NOW() "
+                "WHERE id = $5",
+                prevImage, prevUrl, prevContainer, prevSnapshot, deploymentId
+            );
+
+            if (!envId.empty()) {
+                txn.exec_params(
+                    "UPDATE project_environments SET current_deployment_id = $1, updated_at = NOW() WHERE id = $2",
+                    deploymentId, envId
+                );
+            }
+
+            txn.commit();
+
+            LogWebSocketController::broadcastStatus(deploymentId, "running");
+            DeploymentJournal::broadcastSummary(deploymentId);
+
+            Json::Value res;
+            res["success"] = true;
+            res["message"] = "Successfully rolled back to healthy checkpoint from deployment " + prevId;
+            res["restored_deployment_id"] = prevId;
+            res["restored_image"] = prevImage;
+            res["runtime_url"] = prevUrl;
+            callback(drogon::HttpResponse::newHttpJsonResponse(res));
+        } catch (const std::exception& e) {
+            spdlog::error("rollbackDeployment failed for {}: {}", deploymentId, e.what());
+            callback(errorResponse(drogon::k500InternalServerError, "Failed to perform rollback"));
+        }
+    });
 }
 
 }  // namespace stackpilot

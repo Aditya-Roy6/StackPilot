@@ -96,3 +96,6 @@ uploads/
 
 # TypeScript incremental build caches — machine-specific, regenerated on build
 *.tsbuildinfo
+
+# Scratch scripts and verification tools
+scratch/

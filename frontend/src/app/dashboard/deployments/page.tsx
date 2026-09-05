@@ -5,10 +5,12 @@ import api from "@/lib/api";
 import { AxiosError } from "axios";
 import { Card, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Activity, Bot, Cpu, HardDrive, Loader2, Terminal, RefreshCw, CheckCircle, XCircle, Server, Maximize2, Minimize2, Pause, Play, Trash2, AlertTriangle, RotateCcw, Globe, Thermometer, Gauge, Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ExternalLink, Copy, Wand2, ArrowDown } from "lucide-react";
+import { Activity, Bot, Cpu, HardDrive, Loader2, Terminal, RefreshCw, CheckCircle, XCircle, Server, Maximize2, Minimize2, Pause, Play, Trash2, AlertTriangle, RotateCcw, Globe, Thermometer, Gauge, Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ExternalLink, Copy, Wand2, ArrowDown, Smartphone, Zap, Sparkles } from "lucide-react";
 import { AppIcon } from "@/lib/custom-icons";
 import { Button } from "@/components/ui/button";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { MobileSimulatorDialog } from "@/components/deployments/MobileSimulatorDialog";
+import { AiSreSelfHealingDialog } from "@/components/deployments/AiSreSelfHealingDialog";
 import {
   Area,
   AreaChart,
@@ -79,6 +81,10 @@ interface Deployment {
     exposure_mode?: string;
     container_port?: number;
     runtime_url?: string;
+    archetype?: string;
+    archetype_details?: string;
+    detected_subservices?: string[];
+    [key: string]: any;
   };
   created_at: string;
 }
@@ -547,6 +553,8 @@ export default function DeploymentsPage() {
   const [runtimeDeployment, setRuntimeDeployment] = useState<Deployment | null>(null);
   const [metricsDeployment, setMetricsDeployment] = useState<Deployment | null>(null);
   const [deleteDeployment, setDeleteDeployment] = useState<Deployment | null>(null);
+  const [mobileSimulatorDeployment, setMobileSimulatorDeployment] = useState<Deployment | null>(null);
+  const [sreRepairDeployment, setSreRepairDeployment] = useState<Deployment | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isFilterDialogOpen, setIsFilterDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -671,6 +679,21 @@ export default function DeploymentsPage() {
     onError: (error: unknown) => {
       const maybeError = error as { response?: { data?: { error?: string } } };
       toast.error(maybeError.response?.data?.error || "AI project repair failed");
+    },
+  });
+
+  const rollbackMutation = useMutation({
+    mutationFn: async (deploymentId: string) => {
+      const res = await api.post(`/api/v1/deployments/${deploymentId}/rollback`);
+      return res.data;
+    },
+    onSuccess: (data: any) => {
+      toast.success(data?.message || "Successfully rolled back to healthy checkpoint!");
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
+    },
+    onError: (error: unknown) => {
+      const message = (error as { response?: { data?: { error?: string } } })?.response?.data?.error || "Rollback failed";
+      toast.error(message);
     },
   });
 
@@ -983,22 +1006,42 @@ export default function DeploymentsPage() {
                   return (
                   <TableRow key={dep.id} className="hover:bg-muted/30 transition-colors group">
                     <TableCell className="px-6 py-4">
-                      {liveUrl ? (
-                        <a
-                          href={liveUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex min-w-0 max-w-[28rem] items-center gap-1 font-medium text-foreground hover:text-primary hover:underline"
-                          title={`Open runtime: ${liveUrl}`}
-                        >
-                          <span className="min-w-0 truncate">{displayName}</span>
-                          <AppIcon name="external-link" fallback={ExternalLink} className="h-3.5 w-3.5 shrink-0"  />
-                        </a>
-                      ) : (
-                        <div className="max-w-[28rem] truncate font-medium text-foreground" title={displayName}>
-                          {displayName}
-                        </div>
-                      )}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {liveUrl ? (
+                          <a
+                            href={liveUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex min-w-0 max-w-[24rem] items-center gap-1 font-medium text-foreground hover:text-primary hover:underline"
+                            title={`Open runtime: ${liveUrl}`}
+                          >
+                            <span className="min-w-0 truncate">{displayName}</span>
+                            <AppIcon name="external-link" fallback={ExternalLink} className="h-3.5 w-3.5 shrink-0"  />
+                          </a>
+                        ) : (
+                          <div className="max-w-[24rem] truncate font-medium text-foreground" title={displayName}>
+                            {displayName}
+                          </div>
+                        )}
+                        {dep.runtime_snapshot?.archetype === "native_ios" && (
+                          <Badge variant="outline" className="border-rose-500/40 bg-rose-500/10 text-rose-400 text-[10px] px-1.5 py-0">iOS Xcode</Badge>
+                        )}
+                        {dep.runtime_snapshot?.archetype === "native_android" && (
+                          <Badge variant="outline" className="border-amber-500/40 bg-amber-500/10 text-amber-400 text-[10px] px-1.5 py-0">Android</Badge>
+                        )}
+                        {dep.runtime_snapshot?.archetype === "expo_react_native" && (
+                          <Badge variant="outline" className="border-sky-500/40 bg-sky-500/10 text-sky-400 text-[10px] px-1.5 py-0">Expo PWA</Badge>
+                        )}
+                        {dep.runtime_snapshot?.archetype === "flutter_mobile" && (
+                          <Badge variant="outline" className="border-cyan-500/40 bg-cyan-500/10 text-cyan-400 text-[10px] px-1.5 py-0">Flutter Web</Badge>
+                        )}
+                        {dep.runtime_snapshot?.archetype === "library" && (
+                          <Badge variant="outline" className="border-violet-500/40 bg-violet-500/10 text-violet-400 text-[10px] px-1.5 py-0">Library</Badge>
+                        )}
+                        {dep.runtime_snapshot?.archetype === "monorepo" && (
+                          <Badge variant="outline" className="border-blue-500/40 bg-blue-500/10 text-blue-400 text-[10px] px-1.5 py-0">Monorepo</Badge>
+                        )}
+                      </div>
                       {dep.environment_name && (
                         <div className="mt-0.5 text-xs text-muted-foreground">
                           {dep.environment_name}
@@ -1040,11 +1083,24 @@ export default function DeploymentsPage() {
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() => router.push(`/dashboard/ai?deploymentId=${dep.id}&command=repair`)}
+                            onClick={() => setSreRepairDeployment(dep)}
                             className="shrink-0 gap-1.5 border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
+                            title="Open AI SRE Root Cause Diagnosis & Self-Healing"
                           >
                             <AppIcon name="wand2" fallback={Wand2} className="h-4 w-4"  />
-                            Fix with AI
+                            AI SRE Heal
+                          </Button>
+                        )}
+                        {liveUrl && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setMobileSimulatorDeployment(dep)}
+                            className="shrink-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+                            title="Interactive Smartphone Frame & QR Simulator"
+                          >
+                            <AppIcon name="smartphone" fallback={Smartphone} className="w-4 h-4 mr-1.5"  />
+                            Mobile
                           </Button>
                         )}
                         {(dep.status === "pending" || dep.status === "failed") && (
@@ -1110,6 +1166,17 @@ export default function DeploymentsPage() {
                             Metrics
                           </Button>
                         )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => rollbackMutation.mutate(dep.id)}
+                          disabled={rollbackMutation.isPending}
+                          className="shrink-0 text-muted-foreground hover:text-foreground hover:bg-muted"
+                          title="Rollback to previous healthy deployment checkpoint"
+                        >
+                          <AppIcon name="rotate-ccw" fallback={RotateCcw} className="w-4 h-4 mr-1.5"  />
+                          Rollback
+                        </Button>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1219,6 +1286,20 @@ export default function DeploymentsPage() {
           isDeleting={deleteDeploymentMutation.isPending}
         />
       )}
+
+      <MobileSimulatorDialog
+        open={!!mobileSimulatorDeployment}
+        onClose={() => setMobileSimulatorDeployment(null)}
+        deploymentTitle={mobileSimulatorDeployment ? deploymentDisplayName(mobileSimulatorDeployment) : ""}
+        runtimeUrl={mobileSimulatorDeployment ? deploymentRuntimeUrl(mobileSimulatorDeployment) : ""}
+        archetype={mobileSimulatorDeployment?.runtime_snapshot?.archetype}
+      />
+
+      <AiSreSelfHealingDialog
+        open={!!sreRepairDeployment}
+        onClose={() => setSreRepairDeployment(null)}
+        deployment={sreRepairDeployment}
+      />
     </div>
   );
 }
