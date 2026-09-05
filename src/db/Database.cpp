@@ -112,6 +112,36 @@ Database::ConnectionHandle Database::getConnection() {
     });
 }
 
+bool Database::ping() {
+    if (!m_initialized) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_pingMutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (m_lastPingTime.time_since_epoch().count() > 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastPingTime).count() < 2000) {
+        return m_lastPingResult;
+    }
+
+    try {
+        auto conn = getConnection();
+        pqxx::work txn(*conn);
+        txn.exec("SELECT 1");
+        txn.commit();
+        m_lastPingResult = true;
+    } catch (const std::exception& e) {
+        spdlog::warn("Database ping failed: {}", e.what());
+        m_lastPingResult = false;
+    } catch (...) {
+        spdlog::warn("Database ping failed with unknown exception");
+        m_lastPingResult = false;
+    }
+
+    m_lastPingTime = std::chrono::steady_clock::now();
+    return m_lastPingResult;
+}
+
 void Database::runMigrations(const std::string& migrationsPath) {
     // Lexicographic filename order is the dependency order; the zero-padded
     // numeric prefix is what makes that true, so never renumber a shipped file.

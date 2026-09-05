@@ -1,6 +1,7 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
+import api from "@/lib/api";
 
 // The theme *family* is a separate axis from light/dark (which next-themes owns
 // via the `class` attribute). It lives on <html data-ui-theme="...">, and the
@@ -93,8 +94,35 @@ function emit() {
   listeners.forEach((listener) => listener());
 }
 
+let hasSyncedWithDatabase = false;
+
+export function syncUiThemeWithDatabase() {
+  if (hasSyncedWithDatabase || typeof window === "undefined") return;
+  hasSyncedWithDatabase = true;
+
+  api
+    .get("/auth/preferences")
+    .then((res) => {
+      const themeFromDb = res.data?.ui_theme;
+      if (themeFromDb && isUiTheme(themeFromDb)) {
+        const stored = window.localStorage.getItem(UI_THEME_STORAGE_KEY);
+        if (stored !== themeFromDb) {
+          try {
+            window.localStorage.setItem(UI_THEME_STORAGE_KEY, themeFromDb);
+          } catch {}
+          applyUiTheme(themeFromDb);
+          emit();
+        }
+      }
+    })
+    .catch(() => {
+      // Offline or guest
+    });
+}
+
 function subscribe(listener: () => void) {
   listeners.add(listener);
+  syncUiThemeWithDatabase();
   // Keep other tabs in sync.
   const onStorage = (event: StorageEvent) => {
     if (event.key === UI_THEME_STORAGE_KEY) listener();
@@ -129,6 +157,9 @@ export function setUiTheme(theme: UiTheme) {
   }
   applyUiTheme(theme);
   emit();
+
+  // Persist permanently to PostgreSQL Database so theme follows user across devices
+  api.put("/auth/preferences", { ui_theme: theme }).catch(() => {});
 }
 
 export function useUiTheme(): [UiTheme, (theme: UiTheme) => void] {

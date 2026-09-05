@@ -12,7 +12,13 @@ class HealthController : public drogon::HttpController<HealthController> {
 public:
     METHOD_LIST_BEGIN
     ADD_METHOD_TO(HealthController::health, "/healthz", drogon::Get);
+    ADD_METHOD_TO(HealthController::health, "/health", drogon::Get);
     ADD_METHOD_TO(HealthController::health, "/api/v1/health", drogon::Get);
+    ADD_METHOD_TO(HealthController::healthDetailed, "/health/detailed", drogon::Get);
+    ADD_METHOD_TO(HealthController::healthDetailed, "/api/v1/health/detailed", drogon::Get);
+    ADD_METHOD_TO(HealthController::healthReady, "/health/ready", drogon::Get);
+    ADD_METHOD_TO(HealthController::healthReady, "/readyz", drogon::Get);
+    ADD_METHOD_TO(HealthController::healthReady, "/api/v1/health/ready", drogon::Get);
     ADD_METHOD_TO(HealthController::metrics, "/metrics", drogon::Get);
     ADD_METHOD_TO(HealthController::loggingMonitoringSummary, "/api/v1/observability/summary", drogon::Get);
     ADD_METHOD_TO(HealthController::loggingMonitoringSummary, "/api/v1/logging-monitoring/summary", drogon::Get);
@@ -32,6 +38,12 @@ public:
 
     void health(const drogon::HttpRequestPtr& req,
                 std::function<void(const drogon::HttpResponsePtr&)>&& callback);
+
+    void healthDetailed(const drogon::HttpRequestPtr& req,
+                        std::function<void(const drogon::HttpResponsePtr&)>&& callback);
+
+    void healthReady(const drogon::HttpRequestPtr& req,
+                     std::function<void(const drogon::HttpResponsePtr&)>&& callback);
 
     void metrics(const drogon::HttpRequestPtr& req,
                  std::function<void(const drogon::HttpResponsePtr&)>&& callback);

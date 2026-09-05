@@ -33,30 +33,35 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { cn } from "@/lib/utils";
 import { useTheme } from "next-themes";
 import api from "@/lib/api";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
+import { AppIcon } from "@/lib/custom-icons";
+import { setUiTheme, UI_THEME_STORAGE_KEY } from "@/lib/ui-theme";
 
 const navigation = [
-  { name: "Projects", href: "/dashboard", icon: LayoutDashboard },
-  { name: "Deployments", href: "/dashboard/deployments", icon: Server },
-  { name: "Logs & Monitoring", href: "/dashboard/logging-monitoring", icon: Activity },
-  { name: "Visualization", href: "/dashboard/logging-monitoring/visualization", icon: Gauge, nested: true },
-  { name: "Infrastructure", href: "/dashboard/logging-monitoring/infrastructure", icon: Network, nested: true },
-  { name: "Cluster Builder", href: "/dashboard/logging-monitoring/clusters", icon: Boxes, nested: true },
-  { name: "AI Agent", href: "/dashboard/ai", icon: Star, filled: true },
-  { name: "Secrets", href: "/dashboard/secrets", icon: KeyRound },
-  { name: "Organization", href: "/dashboard/organization", icon: Building2 },
-  { name: "Settings", href: "/dashboard/settings", icon: Settings },
+  { name: "Projects", href: "/dashboard", icon: LayoutDashboard, iconName: "layout-dashboard" },
+  { name: "Deployments", href: "/dashboard/deployments", icon: Server, iconName: "server" },
+  { name: "Logs & Monitoring", href: "/dashboard/logging-monitoring", icon: Activity, iconName: "activity" },
+  { name: "Visualization", href: "/dashboard/logging-monitoring/visualization", icon: Gauge, iconName: "gauge", nested: true },
+  { name: "Infrastructure", href: "/dashboard/logging-monitoring/infrastructure", icon: Network, iconName: "network", nested: true },
+  { name: "Cluster Builder", href: "/dashboard/logging-monitoring/clusters", icon: Boxes, iconName: "boxes", nested: true },
+  { name: "AI Agent", href: "/dashboard/ai", icon: Star, iconName: "star", filled: true },
+  { name: "Secrets", href: "/dashboard/secrets", icon: KeyRound, iconName: "key-round" },
+  { name: "Organization", href: "/dashboard/organization", icon: Building2, iconName: "building-2" },
+  { name: "Settings", href: "/dashboard/settings", icon: Settings, iconName: "settings" },
 ];
 
 // Routes that own their entire viewport (no shell padding, no page scroll).
 const FULL_BLEED_ROUTES = ["/dashboard/ai"];
 
 const themeOptions = [
-  { value: "light", label: "Light", icon: Sun },
-  { value: "dark", label: "Dark", icon: Moon },
-  { value: "system", label: "System", icon: Laptop },
+  { value: "light", label: "Light", icon: Sun, iconName: "sun" },
+  { value: "dark", label: "Dark", icon: Moon, iconName: "moon" },
+  { value: "system", label: "System", icon: Laptop, iconName: "laptop" },
 ] as const;
 
 const SIDEBAR_STORAGE_KEY = "sidebar-collapsed";
+
+const subscribeNever = () => () => {};
 
 // localStorage is external state, so it is read through useSyncExternalStore
 // rather than mirrored into an effect. This keeps server and client markup in
@@ -79,20 +84,22 @@ const sidebarStore = {
   set(collapsed: boolean) {
     window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(collapsed));
     for (const listener of sidebarListeners) listener();
+    api.put("/auth/preferences", { sidebar_collapsed: collapsed }).catch(() => {});
   },
 };
 
 export default function DashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const asideRef = useRef<HTMLElement | null>(null);
+  const [themeDialogOpen, setThemeDialogOpen] = useState(false);
   const isCollapsed = useSyncExternalStore(
     sidebarStore.subscribe,
     sidebarStore.getSnapshot,
     sidebarStore.getServerSnapshot
   );
-  const asideRef = useRef<HTMLElement | null>(null);
-  const [themeDialogOpen, setThemeDialogOpen] = useState(false);
+  const mounted = useSyncExternalStore(subscribeNever, () => true, () => false);
   const { theme, setTheme } = useTheme();
-  const activeThemeValue = theme === "light" || theme === "dark" || theme === "system" ? theme : "system";
+  const activeThemeValue = mounted && (theme === "light" || theme === "dark" || theme === "system") ? theme : "system";
   const activeTheme = themeOptions.find((option) => option.value === activeThemeValue) ?? themeOptions[2];
   const ActiveThemeIcon = activeTheme.icon;
   const isFullBleed = FULL_BLEED_ROUTES.includes(pathname);
@@ -113,9 +120,27 @@ export default function DashboardShell({ children }: { children: React.ReactNode
 
     const checkSession = async () => {
       try {
-        await api.get("/auth/me");
-      } catch {
-        if (!cancelled) {
+        const res = await api.get("/auth/me");
+        const prefs = res.data?.user?.preferences;
+        if (prefs && !cancelled) {
+          if (prefs.sidebar_collapsed !== undefined && prefs.sidebar_collapsed !== sidebarStore.getSnapshot()) {
+            window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(prefs.sidebar_collapsed));
+            for (const listener of sidebarListeners) listener();
+          }
+          if (prefs.ui_theme) {
+            const currentTheme = window.localStorage.getItem(UI_THEME_STORAGE_KEY);
+            if (currentTheme !== prefs.ui_theme) {
+              setUiTheme(prefs.ui_theme as any);
+            }
+          }
+          if (prefs.color_mode && ["light", "dark", "system"].includes(prefs.color_mode)) {
+            if (theme !== prefs.color_mode) {
+              setTheme(prefs.color_mode);
+            }
+          }
+        }
+      } catch (error: any) {
+        if (!cancelled && error.response?.status === 401) {
           window.location.href = "/auth/login";
         }
       }
@@ -127,7 +152,7 @@ export default function DashboardShell({ children }: { children: React.ReactNode
       cancelled = true;
       clearInterval(interval);
     };
-  }, []);
+  }, [theme, setTheme]);
 
   const toggleSidebar = () => {
     sidebarStore.set(!isCollapsed);
@@ -171,10 +196,11 @@ export default function DashboardShell({ children }: { children: React.ReactNode
       )}
     >
       <span className="flex h-9 w-9 items-center justify-center">
-        <item.icon
+        <AppIcon
+          name={item.iconName}
+          fallback={item.icon}
+          size={18}
           className={cn("h-[18px] w-[18px]", isActive ? "text-primary" : "text-current")}
-          fill={item.filled ? "currentColor" : "none"}
-          strokeWidth={item.filled ? 2.2 : 1.9}
         />
       </span>
       <span className={labelClass}>{item.name}</span>
@@ -200,8 +226,8 @@ export default function DashboardShell({ children }: { children: React.ReactNode
           >
             {!isCollapsed && (
               <span className="flex min-w-0 items-center gap-2">
-                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
-                  <Star className="h-4 w-4" fill="currentColor" strokeWidth={0} />
+                <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground shadow-sm">
+                  <AppIcon name="star" size={16} />
                 </span>
                 <span className="truncate text-sm font-semibold tracking-tight">StackPilot</span>
               </span>
@@ -218,15 +244,19 @@ export default function DashboardShell({ children }: { children: React.ReactNode
                     className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
                   >
                     {isCollapsed ? (
-                      <PanelLeftOpen className="h-[18px] w-[18px]" />
+                      <AppIcon name="panel-left-open" fallback={PanelLeftOpen} size={18} className="h-[18px] w-[18px]" />
                     ) : (
-                      <PanelLeftClose className="h-[18px] w-[18px]" />
+                      <AppIcon name="panel-left-close" fallback={PanelLeftClose} size={18} className="h-[18px] w-[18px]" />
                     )}
                   </Button>
                 }
               />
               <TooltipContent side="right">{isCollapsed ? "Expand sidebar" : "Collapse sidebar"}</TooltipContent>
             </Tooltip>
+          </div>
+
+          <div className={cn("shrink-0 py-1.5", isCollapsed ? "flex justify-center px-1" : "px-2")}>
+            <WorkspaceSwitcher isCollapsed={isCollapsed} />
           </div>
 
           <nav
@@ -236,7 +266,10 @@ export default function DashboardShell({ children }: { children: React.ReactNode
             )}
           >
             {navigation.map((item) => {
-              const isActive = pathname === item.href;
+              const isActive =
+                item.name === "Projects"
+                  ? pathname === "/dashboard" || pathname.startsWith("/dashboard/projects")
+                  : pathname === item.href;
               if (!isCollapsed) {
                 return renderSidebarLink(item, isActive);
               }
@@ -268,7 +301,7 @@ export default function DashboardShell({ children }: { children: React.ReactNode
                     )}
                   >
                     <span className="flex h-9 w-9 items-center justify-center">
-                      <ActiveThemeIcon className="h-[18px] w-[18px]" />
+                      <AppIcon name={activeTheme.iconName} fallback={ActiveThemeIcon} size={18} className="h-[18px] w-[18px]" />
                     </span>
                     <span className={labelClass}>{activeTheme.label}</span>
                   </Button>
@@ -290,7 +323,7 @@ export default function DashboardShell({ children }: { children: React.ReactNode
                     )}
                   >
                     <span className="flex h-9 w-9 items-center justify-center">
-                      <LogOut className="h-[18px] w-[18px]" />
+                      <AppIcon name="log-out" fallback={LogOut} size={18} className="h-[18px] w-[18px]" />
                     </span>
                     <span className={labelClass}>Logout</span>
                   </Button>
@@ -316,14 +349,15 @@ export default function DashboardShell({ children }: { children: React.ReactNode
                       key={option.value}
                       type="button"
                       variant={isSelected ? "default" : "outline"}
-                      className="justify-start"
+                      className="justify-start gap-2"
                       onClick={() => {
                         setTheme(option.value);
+                        api.put("/auth/preferences", { color_mode: option.value }).catch(() => {});
                         setThemeDialogOpen(false);
                       }}
                     >
-                      <ThemeIcon className="mr-2 h-4 w-4" />
-                      {option.label}
+                      <AppIcon name={option.iconName} fallback={ThemeIcon} size={16} className="h-4 w-4 shrink-0" />
+                      <span>{option.label}</span>
                     </Button>
                   );
                 })}

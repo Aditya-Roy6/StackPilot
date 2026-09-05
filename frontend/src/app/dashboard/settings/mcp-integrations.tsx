@@ -14,6 +14,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Loader2, Key, KeyRound, TerminalSquare, Copy, Trash2, ExternalLink } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 interface McpToken {
@@ -163,7 +164,7 @@ export function McpIntegrations() {
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1 text-primary hover:underline"
           >
-            Roo Code <ExternalLink className="h-3 w-3" />
+            Roo Code <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
           </a>{" "}
           extension.
         </>,
@@ -255,7 +256,7 @@ export function McpIntegrations() {
     <Card>
       <CardHeader>
         <div className="flex items-center gap-2 text-foreground">
-          <TerminalSquare className="h-5 w-5 text-primary" />
+          <AppIcon name="terminal-square" fallback={TerminalSquare} className="h-5 w-5 text-primary"  />
           <CardTitle>MCP Integrations</CardTitle>
         </div>
         <CardDescription>
@@ -268,14 +269,14 @@ export function McpIntegrations() {
             You have {tokens.length} / 10 active tokens.
           </p>
           <Button onClick={() => setIsDialogOpen(true)} disabled={tokens.length >= 10}>
-            <Key className="mr-2 h-4 w-4" />
+            <AppIcon name="key" fallback={Key} className="mr-2 h-4 w-4"  />
             Generate New Token
           </Button>
         </div>
 
         {query.isLoading ? (
           <div className="flex items-center text-sm text-muted-foreground">
-            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
             Loading MCP tokens...
           </div>
         ) : tokens.length === 0 ? (
@@ -306,9 +307,9 @@ export function McpIntegrations() {
                   disabled={revokeMutation.isPending}
                 >
                   {revokeMutation.isPending && revokeMutation.variables === token.id ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                   ) : (
-                    <Trash2 className="mr-2 h-4 w-4" />
+                    <AppIcon name="trash2" fallback={Trash2} className="mr-2 h-4 w-4"  />
                   )}
                   Revoke
                 </Button>
@@ -321,7 +322,7 @@ export function McpIntegrations() {
           <DialogContent className="sm:max-w-md">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
-                <KeyRound className="h-5 w-5 text-primary" />
+                <AppIcon name="key-round" fallback={KeyRound} className="h-5 w-5 text-primary"  />
                 Generate MCP Token
               </DialogTitle>
               <DialogDescription>
@@ -348,7 +349,7 @@ export function McpIntegrations() {
                 onClick={() => createMutation.mutate(tokenName)}
                 disabled={!tokenName.trim() || createMutation.isPending}
               >
-                {createMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                {createMutation.isPending && <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />}
                 Generate
               </Button>
             </div>
@@ -359,7 +360,7 @@ export function McpIntegrations() {
           <DialogContent className="max-h-[85vh] overflow-y-auto overflow-x-hidden sm:max-w-2xl">
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2 text-emerald-500">
-                <KeyRound className="h-5 w-5" />
+                <AppIcon name="key-round" fallback={KeyRound} className="h-5 w-5"  />
                 Token Generated Successfully
               </DialogTitle>
               <DialogDescription>
@@ -375,7 +376,7 @@ export function McpIntegrations() {
                   {newToken?.raw}
                 </code>
                 <Button variant="secondary" size="icon" onClick={() => handleCopy(newToken?.raw || "", "Token")} className="shrink-0">
-                  <Copy className="h-4 w-4" />
+                  <AppIcon name="copy" fallback={Copy} className="h-4 w-4"  />
                 </Button>
               </div>
 
@@ -418,7 +419,7 @@ export function McpIntegrations() {
                       className="absolute right-2 top-11 h-7 w-7 opacity-70 transition-opacity hover:opacity-100"
                       aria-label="Copy configuration"
                     >
-                      <Copy className="h-3 w-3" />
+                      <AppIcon name="copy" fallback={Copy} className="h-3 w-3"  />
                     </Button>
                   </div>
                 </div>

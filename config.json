@@ -13,6 +13,7 @@
         "upload_path": "uploads",
         "max_connections": 100000,
         "max_connections_per_ip": 0,
+        "idle_connection_timeout": 300,
         "log": {
             "log_path": "./logs",
             "logfile_base_name": "stackpilot-platform",

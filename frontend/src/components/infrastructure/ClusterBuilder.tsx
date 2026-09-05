@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import {
+  AlertTriangle,
   Boxes,
   CheckCircle2,
   ExternalLink,
@@ -12,10 +13,13 @@ import {
   KeyRound,
   Loader2,
   Network,
+  Plus,
   RefreshCw,
   Server,
   ShieldCheck,
+  Trash2,
 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 import api from "@/lib/api";
@@ -141,6 +145,12 @@ export function ClusterBuilder() {
   const [workerSudo, setWorkerSudo] = useState("");
   const [selectedWorkerIds, setSelectedWorkerIds] = useState<string[]>([]);
   const [actionResult, setActionResult] = useState<ClusterActionResponse | null>(null);
+  const [clusterToDelete, setClusterToDelete] = useState<KubernetesCluster | null>(null);
+  const [wipeServersOnDelete, setWipeServersOnDelete] = useState(false);
+  const [deleteSudoPassword, setDeleteSudoPassword] = useState("");
+  const [serverToWipe, setServerToWipe] = useState<SshConnection | null>(null);
+  const [wipeServerPassword, setWipeServerPassword] = useState("");
+  const [showWipeServerDialog, setShowWipeServerDialog] = useState(false);
 
   const connectionsQuery = useQuery({
     queryKey: ["ssh-connections"],
@@ -169,8 +179,19 @@ export function ClusterBuilder() {
   const effectiveControlPlaneId = controlPlaneId || connections[0]?.id || "";
   const selectedControlPlane = connections.find((connection) => connection.id === effectiveControlPlaneId);
   const effectiveClusterName = clusterName.trim() || (selectedControlPlane ? `${selectedControlPlane.name}-cluster` : "");
-  const workerOptions = connections.filter((connection) => connection.id !== effectiveControlPlaneId);
-  const effectiveSelectedWorkerIds = selectedWorkerIds.filter((id) => id !== effectiveControlPlaneId);
+  const workerOptions = useMemo(() => {
+    return connections.filter((connection) => {
+      if (connection.id === effectiveControlPlaneId) return false;
+      if (selectedControlPlane && connection.host === selectedControlPlane.host) return false;
+      return true;
+    });
+  }, [connections, effectiveControlPlaneId, selectedControlPlane]);
+
+  const effectiveSelectedWorkerIds = useMemo(() => {
+    const validWorkerIdSet = new Set(workerOptions.map((w) => w.id));
+    return selectedWorkerIds.filter((id) => validWorkerIdSet.has(id));
+  }, [selectedWorkerIds, workerOptions]);
+
   const selectedCluster = useMemo(
     () => clusters.find((cluster) => cluster.control_plane_connection_id === effectiveControlPlaneId),
     [clusters, effectiveControlPlaneId]
@@ -179,12 +200,16 @@ export function ClusterBuilder() {
   const initializeMutation = useMutation({
     mutationKey: ["kubernetes-cluster-init"],
     mutationFn: async () => {
-      const response = await api.post<ClusterActionResponse>(`/ssh/connections/${effectiveControlPlaneId}/cluster/init`, {
-        cluster_name: effectiveClusterName,
-        advertise_address: advertiseAddress.trim(),
-        tls_san: tlsSan.trim(),
-        sudo_password: controlPlaneSudo,
-      });
+      const response = await api.post<ClusterActionResponse>(
+        `/ssh/connections/${effectiveControlPlaneId}/cluster/init`,
+        {
+          cluster_name: effectiveClusterName,
+          advertise_address: advertiseAddress.trim(),
+          tls_san: tlsSan.trim(),
+          sudo_password: controlPlaneSudo,
+        },
+        { timeout: 600000 }
+      );
       return response.data;
     },
     onSuccess: (data) => {
@@ -210,27 +235,30 @@ export function ClusterBuilder() {
   const joinWorkersMutation = useMutation({
     mutationKey: ["kubernetes-cluster-join-workers"],
     mutationFn: async (options?: { replaceExisting?: boolean }) => {
-      const results: ClusterActionResponse[] = [];
-      for (const workerId of effectiveSelectedWorkerIds) {
+      const promises = effectiveSelectedWorkerIds.map(async (workerId) => {
         try {
-          const response = await api.post<ClusterActionResponse>(`/ssh/connections/${effectiveControlPlaneId}/cluster/join`, {
-            worker_connection_id: workerId,
-            sudo_password: workerSudo,
-            // Only ever set after the user confirms in the dialog below.
-            // Converting a standalone node destroys what it was running.
-            replace_existing: options?.replaceExisting === true,
-          });
-          results.push(response.data);
+          const response = await api.post<ClusterActionResponse>(
+            `/ssh/connections/${effectiveControlPlaneId}/cluster/join`,
+            {
+              worker_connection_id: workerId,
+              sudo_password: workerSudo,
+              // Only ever set after the user confirms in the dialog below.
+              // Converting a standalone node destroys what it was running.
+              replace_existing: options?.replaceExisting === true,
+            },
+            { timeout: 600000 }
+          );
+          return response.data;
         } catch (error) {
           const data = errorPayload(error);
-          results.push(data ?? {
+          return data ?? {
             success: false,
             error: "Worker join failed",
             worker_connection_id: workerId,
-          });
+          };
         }
-      }
-      return results;
+      });
+      return await Promise.all(promises);
     },
     onSuccess: (results) => {
       const failed = results.filter((result) => !result.success);
@@ -249,7 +277,8 @@ export function ClusterBuilder() {
       // failure the user can resolve without understanding k3s internals, so
       // offer to do it for them instead of explaining server-versus-agent.
       const alreadyServers = failed.filter((result) =>
-        (result.error || "").includes("already running k3s as its own control plane")
+        (result.error || "").includes("already running k3s as its own control plane") ||
+        (result.error || "").includes("already registered as the control plane")
       );
       if (alreadyServers.length > 0) {
         setReplaceCandidates(
@@ -284,9 +313,73 @@ export function ClusterBuilder() {
     onError: (error: unknown) => {
       const data = errorPayload(error);
       setActionResult(data ?? { success: false, error: "Failed to inspect cluster" });
+      const sanitizedDetails = data?.details
+        ? data.details.replace(/__[A-Z0-9_]+__/g, "").replace(/E\d+\s+[\d:.]+\s+\d+\s+\S+\]/g, "").trim().slice(0, 180)
+        : undefined;
       toast.error(data?.error || "Failed to inspect cluster", {
-        description: data?.hint || (data?.details ? data.details.slice(0, 220) : undefined),
+        description: data?.hint || sanitizedDetails,
       });
+    },
+  });
+
+  const deleteClusterMutation = useMutation({
+    mutationKey: ["delete-kubernetes-cluster"],
+    mutationFn: async ({
+      clusterId,
+      wipeServers,
+      sudoPassword,
+    }: {
+      clusterId: string;
+      wipeServers: boolean;
+      sudoPassword?: string;
+    }) => {
+      const response = await api.delete<ClusterActionResponse>(`/ssh/clusters/${clusterId}`, {
+        data: { wipe_servers: wipeServers, sudo_password: sudoPassword },
+        timeout: wipeServers ? 300000 : 30000,
+      });
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data.message || "Cluster deleted");
+      setClusterToDelete(null);
+      setWipeServersOnDelete(false);
+      setDeleteSudoPassword("");
+      queryClient.invalidateQueries({ queryKey: ["kubernetes-clusters"] });
+      queryClient.invalidateQueries({ queryKey: ["ssh-connections"] });
+    },
+    onError: (error: unknown) => {
+      const data = errorPayload(error);
+      toast.error(data?.error || "Failed to delete cluster");
+    },
+  });
+
+  const wipeServerMutation = useMutation({
+    mutationKey: ["wipe-server-k3s"],
+    mutationFn: async ({
+      connectionId,
+      sudoPassword,
+    }: {
+      connectionId: string;
+      sudoPassword?: string;
+    }) => {
+      const response = await api.post<ClusterActionResponse>(
+        `/ssh/connections/${connectionId}/wipe`,
+        { sudo_password: sudoPassword },
+        { timeout: 300000 }
+      );
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data.message || "Server wiped successfully");
+      setServerToWipe(null);
+      setWipeServerPassword("");
+      setShowWipeServerDialog(false);
+      queryClient.invalidateQueries({ queryKey: ["kubernetes-clusters"] });
+      queryClient.invalidateQueries({ queryKey: ["ssh-connections"] });
+    },
+    onError: (error: unknown) => {
+      const data = errorPayload(error);
+      toast.error(data?.error || "Failed to wipe server");
     },
   });
 
@@ -304,7 +397,7 @@ export function ClusterBuilder() {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div className="space-y-2">
           <div className="inline-flex items-center gap-2 rounded-full border border-border bg-muted/30 px-3 py-1 text-xs font-medium text-muted-foreground">
-            <Network className="h-3.5 w-3.5" />
+            <AppIcon name="network" fallback={Network} className="h-3.5 w-3.5"  />
             k3s multi-node bootstrap
           </div>
           <h1 className="text-4xl font-extrabold tracking-tight">Cluster Builder</h1>
@@ -322,16 +415,27 @@ export function ClusterBuilder() {
             disabled={connectionsQuery.isFetching || clustersQuery.isFetching}
           >
             {connectionsQuery.isFetching || clustersQuery.isFetching ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
             ) : (
-              <RefreshCw className="mr-2 h-4 w-4" />
+              <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />
             )}
             Refresh
           </Button>
           <Link href="/dashboard/settings" className={buttonVariants({ variant: "outline" })}>
-              <KeyRound className="mr-2 h-4 w-4" />
+              <AppIcon name="key-round" fallback={KeyRound} className="mr-2 h-4 w-4"  />
               Manage Servers
           </Link>
+          <Button
+            variant="outline"
+            className="border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
+            onClick={() => {
+              setServerToWipe(connections[0] || null);
+              setShowWipeServerDialog(true);
+            }}
+          >
+            <AppIcon name="trash-2" fallback={Trash2} className="mr-2 h-4 w-4" />
+            Wipe Server K3s
+          </Button>
         </div>
       </div>
 
@@ -339,7 +443,7 @@ export function ClusterBuilder() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Server className="h-5 w-5 text-primary" />
+              <AppIcon name="server" fallback={Server} className="h-5 w-5 text-primary"  />
               Create or Expand Cluster
             </CardTitle>
             <CardDescription>
@@ -353,6 +457,19 @@ export function ClusterBuilder() {
               </div>
             ) : (
               <>
+                <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 text-xs text-muted-foreground space-y-1.5">
+                  <div className="font-semibold text-foreground flex items-center gap-1.5 text-xs">
+                    <AppIcon name="shield-check" fallback={ShieldCheck} className="h-4 w-4 text-primary" />
+                    AWS EC2 & Cloud Multi-Node Setup
+                  </div>
+                  <p>
+                    StackPilot automatically provisions packages (curl, wget, tar, container-selinux), multi-SAN certificates, and OS firewall rules (UFW/firewalld) on all fresh instances.
+                  </p>
+                  <p>
+                    <strong>AWS Security Group:</strong> Ensure your EC2 instances allow inbound <strong>TCP 6443</strong> (K8s API) and <strong>UDP 8472</strong> (Flannel VXLAN overlay) from each other.
+                  </p>
+                </div>
+
                 <div className="flex items-center gap-2">
                   <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
                     1
@@ -449,52 +566,102 @@ export function ClusterBuilder() {
                   <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
                     2
                   </span>
-                  <h3 className="text-sm font-semibold">Install Kubernetes on it</h3>
+                  <h3 className="text-sm font-semibold">
+                    {selectedCluster && selectedCluster.status === "ready"
+                      ? "Control plane active"
+                      : "Install Kubernetes on it"}
+                  </h3>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/20 p-4">
-                  <Button
-                    onClick={() => initializeMutation.mutate()}
-                    disabled={!effectiveControlPlaneId || !effectiveClusterName || initializeMutation.isPending}
-                  >
-                    {initializeMutation.isPending ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                {selectedCluster && selectedCluster.status === "ready" ? (
+                  <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 space-y-3">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <AppIcon name="check-circle-2" fallback={CheckCircle2} className="h-5 w-5 text-emerald-500 shrink-0" />
+                        <div>
+                          <div className="font-semibold text-foreground flex items-center gap-2">
+                            <span>{selectedCluster.name}</span>
+                            <Badge variant="outline" className="border-emerald-500/40 text-emerald-500 text-[10px]">
+                              Ready
+                            </Badge>
+                          </div>
+                          <div className="font-mono text-xs text-muted-foreground">{selectedCluster.server_url}</div>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => inspectMutation.mutate(effectiveControlPlaneId)}
+                          disabled={inspectMutation.isPending}
+                        >
+                          {inspectMutation.isPending && inspectMutation.variables === effectiveControlPlaneId ? (
+                            <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4" />
+                          )}
+                          Inspect Cluster
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => initializeMutation.mutate()}
+                          disabled={initializeMutation.isPending}
+                        >
+                          Re-initialize
+                        </Button>
+                      </div>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Kubernetes control plane is active. To add worker servers to this cluster, select them in <strong>Step 3</strong> below and click <strong>Join Workers</strong>.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-muted/20 p-4">
+                    <Button
+                      onClick={() => initializeMutation.mutate()}
+                      disabled={!effectiveControlPlaneId || !effectiveClusterName || initializeMutation.isPending}
+                    >
+                      {initializeMutation.isPending ? (
+                        <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
+                      ) : (
+                        <AppIcon name="shield-check" fallback={ShieldCheck} className="mr-2 h-4 w-4"  />
+                      )}
+                      Initialize Control Plane
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => inspectMutation.mutate(effectiveControlPlaneId)}
+                      disabled={!selectedCluster || inspectMutation.isPending}
+                    >
+                      {inspectMutation.isPending && inspectMutation.variables === effectiveControlPlaneId ? (
+                        <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
+                      ) : (
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />
+                      )}
+                      Inspect Cluster
+                    </Button>
+                    {selectedCluster ? (
+                      <Badge variant={statusBadgeVariant(selectedCluster.status)}>
+                        {selectedCluster.status}
+                      </Badge>
                     ) : (
-                      <ShieldCheck className="mr-2 h-4 w-4" />
+                      <span className="text-sm text-muted-foreground">
+                        Initialize this server before joining workers.
+                      </span>
                     )}
-                    Initialize Control Plane
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() => inspectMutation.mutate(effectiveControlPlaneId)}
-                    disabled={!selectedCluster || inspectMutation.isPending}
-                  >
-                    {inspectMutation.isPending && inspectMutation.variables === effectiveControlPlaneId ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <RefreshCw className="mr-2 h-4 w-4" />
-                    )}
-                    Inspect Cluster
-                  </Button>
-                  {selectedCluster ? (
-                    <Badge variant={statusBadgeVariant(selectedCluster.status)}>
-                      {selectedCluster.status}
-                    </Badge>
-                  ) : (
-                    <span className="text-sm text-muted-foreground">
-                      Initialize this server before joining workers.
-                    </span>
-                  )}
-                </div>
+                  </div>
+                )}
 
-                <div className="space-y-3 rounded-xl border border-border bg-card p-4">
+                <div id="cluster-step-3-workers" className="space-y-3 rounded-xl border border-border bg-card p-4 scroll-mt-6">
                   <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
                     <div>
                       <h3 className="flex items-center gap-2 font-semibold text-foreground">
                         <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/15 text-xs font-semibold text-primary">
                           3
                         </span>
-                        Join worker servers
+                        {selectedCluster ? `Join worker servers to ${selectedCluster.name}` : "Join worker servers"}
                       </h3>
                       <p className="text-sm text-muted-foreground">
                         Select one or more saved servers. They will join the selected control plane as k3s agents.
@@ -509,25 +676,39 @@ export function ClusterBuilder() {
                     </div>
                   ) : (
                     <div className="grid gap-2 md:grid-cols-2">
-                      {workerOptions.map((connection) => (
-                        <Label
-                          key={connection.id}
-                          htmlFor={`worker-${connection.id}`}
-                          className="flex cursor-pointer items-start gap-3 rounded-lg border border-border bg-muted/20 p-3 font-normal"
-                        >
-                          <Checkbox
-                            id={`worker-${connection.id}`}
-                            checked={effectiveSelectedWorkerIds.includes(connection.id)}
-                            onCheckedChange={(checked) => toggleWorker(connection.id, checked === true)}
-                          />
-                          <span className="min-w-0">
-                            <span className="block truncate font-medium text-foreground">{connection.name}</span>
-                            <span className="block truncate font-mono text-xs text-muted-foreground">
-                              {connection.username}@{connection.host}
+                      {workerOptions.map((connection) => {
+                        const isAlreadyMember = selectedCluster?.nodes.some((n) => n.connection_id === connection.id);
+                        return (
+                          <Label
+                            key={connection.id}
+                            htmlFor={`worker-${connection.id}`}
+                            className="flex cursor-pointer items-start gap-3 rounded-lg border border-border bg-muted/20 p-3 font-normal"
+                          >
+                            <Checkbox
+                              id={`worker-${connection.id}`}
+                              checked={effectiveSelectedWorkerIds.includes(connection.id)}
+                              onCheckedChange={(checked) => toggleWorker(connection.id, checked === true)}
+                            />
+                            <span className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <span className="truncate font-medium text-foreground">{connection.name}</span>
+                                {isAlreadyMember ? (
+                                  <Badge variant="outline" className="text-[10px] px-1.5 py-0 border-emerald-500/40 text-emerald-500">
+                                    In this cluster
+                                  </Badge>
+                                ) : clusters.some((c) => c.control_plane_connection_id === connection.id) ? (
+                                  <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                                    Standalone CP
+                                  </Badge>
+                                ) : null}
+                              </div>
+                              <span className="block truncate font-mono text-xs text-muted-foreground">
+                                {connection.username}@{connection.host}
+                              </span>
                             </span>
-                          </span>
-                        </Label>
-                      ))}
+                          </Label>
+                        );
+                      })}
                     </div>
                   )}
 
@@ -547,9 +728,9 @@ export function ClusterBuilder() {
                       disabled={!selectedCluster || effectiveSelectedWorkerIds.length === 0 || joinWorkersMutation.isPending}
                     >
                       {joinWorkersMutation.isPending ? (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <Boxes className="mr-2 h-4 w-4" />
+                        <AppIcon name="boxes" fallback={Boxes} className="mr-2 h-4 w-4"  />
                       )}
                       Join Workers
                     </Button>
@@ -563,7 +744,7 @@ export function ClusterBuilder() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <CheckCircle2 className="h-5 w-5 text-primary" />
+              <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-5 w-5 text-primary"  />
               Operation Output
             </CardTitle>
             <CardDescription>
@@ -608,7 +789,7 @@ export function ClusterBuilder() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <GitBranch className="h-5 w-5 text-primary" />
+            <AppIcon name="git-branch" fallback={GitBranch} className="h-5 w-5 text-primary"  />
             Registered Clusters
           </CardTitle>
           <CardDescription>
@@ -618,7 +799,7 @@ export function ClusterBuilder() {
         <CardContent>
           {clustersQuery.isLoading ? (
             <div className="flex items-center text-sm text-muted-foreground">
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
               Loading clusters...
             </div>
           ) : clusters.length === 0 ? (
@@ -670,11 +851,33 @@ export function ClusterBuilder() {
                           size="sm"
                           onClick={() => {
                             setControlPlaneId(cluster.control_plane_connection_id);
+                            setClusterName(cluster.name);
+                            const step3 = document.getElementById("cluster-step-3-workers");
+                            if (step3) {
+                              step3.scrollIntoView({ behavior: "smooth" });
+                            } else {
+                              window.scrollTo({ top: 0, behavior: "smooth" });
+                            }
+                            toast.info(`Selected cluster "${cluster.name}". Choose worker servers in Step 3 to expand it.`);
+                          }}
+                        >
+                          <AppIcon name="plus" fallback={Plus} className="mr-1.5 h-3.5 w-3.5" />
+                          Add Worker
+                        </Button>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setControlPlaneId(cluster.control_plane_connection_id);
                             inspectMutation.mutate(cluster.control_plane_connection_id);
                           }}
                           disabled={inspectMutation.isPending}
                         >
-                          <RefreshCw className="mr-2 h-4 w-4" />
+                          {inspectMutation.isPending && inspectMutation.variables === cluster.control_plane_connection_id ? (
+                            <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4" />
+                          )}
                           Inspect
                         </Button>
                         <Link
@@ -686,9 +889,22 @@ export function ClusterBuilder() {
                           )}`}
                           className={buttonVariants({ variant: "outline", size: "sm" })}
                         >
-                            <ExternalLink className="mr-2 h-4 w-4" />
+                            <AppIcon name="external-link" fallback={ExternalLink} className="mr-2 h-4 w-4"  />
                             Monitor
                         </Link>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                          onClick={() => {
+                            setClusterToDelete(cluster);
+                            setWipeServersOnDelete(false);
+                            setDeleteSudoPassword("");
+                          }}
+                          title="Delete or deregister cluster"
+                        >
+                          <AppIcon name="trash-2" fallback={Trash2} className="h-3.5 w-3.5" />
+                        </Button>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -731,6 +947,149 @@ export function ClusterBuilder() {
               }}
             >
               Replace and join
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Cluster Confirmation Dialog */}
+      <Dialog open={Boolean(clusterToDelete)} onOpenChange={(open) => !open && setClusterToDelete(null)}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AppIcon name="trash-2" fallback={Trash2} className="h-5 w-5" />
+              Delete Cluster &ldquo;{clusterToDelete?.name}&rdquo;?
+            </DialogTitle>
+            <DialogDescription>
+              This removes the cluster registration from StackPilot.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 text-sm py-2">
+            <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-4 space-y-3">
+              <div className="flex items-start gap-3">
+                <Checkbox
+                  id="wipeServersCheckbox"
+                  checked={wipeServersOnDelete}
+                  onCheckedChange={(checked) => setWipeServersOnDelete(checked === true)}
+                />
+                <div className="space-y-1">
+                  <Label htmlFor="wipeServersCheckbox" className="font-semibold cursor-pointer text-foreground">
+                    Wipe &amp; uninstall K3s on all nodes via SSH
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    Connects to control plane ({clusterToDelete?.control_plane_host}) and all worker nodes, stops k3s, executes <code>k3s-uninstall.sh</code> and <code>k3s-agent-uninstall.sh</code>, and cleans <code>/etc/rancher</code>. Check this if you want to reuse these servers fresh.
+                  </p>
+                </div>
+              </div>
+            </div>
+            {wipeServersOnDelete && (
+              <div className="space-y-2">
+                <Label htmlFor="deleteSudoPassword">Sudo password (if required)</Label>
+                <Input
+                  id="deleteSudoPassword"
+                  type="password"
+                  value={deleteSudoPassword}
+                  onChange={(e) => setDeleteSudoPassword(e.target.value)}
+                  placeholder="Leave empty if passwordless sudo works"
+                />
+              </div>
+            )}
+          </div>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button variant="outline" onClick={() => setClusterToDelete(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                if (clusterToDelete) {
+                  deleteClusterMutation.mutate({
+                    clusterId: clusterToDelete.id,
+                    wipeServers: wipeServersOnDelete,
+                    sudoPassword: deleteSudoPassword,
+                  });
+                }
+              }}
+              disabled={deleteClusterMutation.isPending}
+            >
+              {deleteClusterMutation.isPending ? (
+                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <AppIcon name="trash-2" fallback={Trash2} className="mr-2 h-4 w-4" />
+              )}
+              {wipeServersOnDelete ? "Wipe Servers & Delete Cluster" : "Deregister Cluster"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Wipe Single Server Dialog */}
+      <Dialog open={showWipeServerDialog} onOpenChange={(open) => !open && setShowWipeServerDialog(false)}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-destructive">
+              <AppIcon name="trash-2" fallback={Trash2} className="h-5 w-5" />
+              Wipe Server &amp; Uninstall K3s
+            </DialogTitle>
+            <DialogDescription>
+              Completely uninstalls K3s, kills background processes, removes /etc/rancher and resets iptables so this machine is ready for a fresh start.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2 text-sm">
+            <div className="space-y-2">
+              <Label>Target Server</Label>
+              <Select
+                value={serverToWipe?.id || ""}
+                onValueChange={(val) => {
+                  const s = connections.find((c) => c.id === val);
+                  if (s) setServerToWipe(s);
+                }}
+              >
+                <SelectTrigger className="w-full">
+                  <span>{serverToWipe ? `${serverToWipe.name} (${serverToWipe.host})` : "Select a server"}</span>
+                </SelectTrigger>
+                <SelectContent>
+                  {connections.map((conn) => (
+                    <SelectItem key={conn.id} value={conn.id}>
+                      {conn.name} ({conn.host})
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="wipeServerPassword">Sudo password</Label>
+              <Input
+                id="wipeServerPassword"
+                type="password"
+                value={wipeServerPassword}
+                onChange={(e) => setWipeServerPassword(e.target.value)}
+                placeholder="Leave blank for passwordless sudo"
+              />
+            </div>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button variant="outline" onClick={() => setShowWipeServerDialog(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                if (serverToWipe) {
+                  wipeServerMutation.mutate({
+                    connectionId: serverToWipe.id,
+                    sudoPassword: wipeServerPassword,
+                  });
+                }
+              }}
+              disabled={!serverToWipe || wipeServerMutation.isPending}
+            >
+              {wipeServerMutation.isPending ? (
+                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <AppIcon name="trash-2" fallback={Trash2} className="mr-2 h-4 w-4" />
+              )}
+              Wipe Server Clean
             </Button>
           </DialogFooter>
         </DialogContent>

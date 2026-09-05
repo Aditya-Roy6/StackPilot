@@ -8,8 +8,14 @@
 #include "../db/Database.h"
 #include "../utils/StringUtils.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <map>
 #include <mutex>
 #include <sstream>
+#include <thread>
+#include <vector>
 #include <spdlog/spdlog.h>
 
 namespace stackpilot {
@@ -18,43 +24,165 @@ namespace {
 using strings::parseJsonObject;
 using strings::trim;
 
-/// Serialises log appends so two concurrent writers cannot interleave a
-/// read-modify-write on the same logs column.
-std::mutex g_logMutex;
-
 std::string jsonString(const Json::Value& value, const std::string& key, const std::string& fallback = "") {
     return value.isObject() && value.isMember(key) && value[key].isString() ? value[key].asString() : fallback;
+}
+
+struct DeploymentLogBuffer {
+    std::string accumulatedText;
+    size_t lineCount = 0;
+    std::chrono::steady_clock::time_point firstLineTime;
+};
+
+std::mutex s_bufferMutex;
+std::map<std::string, DeploymentLogBuffer> s_pendingLogs;
+std::atomic<bool> s_flusherRunning{false};
+std::thread s_flusherThread;
+std::condition_variable s_flusherCv;
+
+void writeLogsToDb(const std::string& deploymentId, const std::string& batched) {
+    if (deploymentId.empty() || batched.empty()) {
+        return;
+    }
+    try {
+        auto& db = Database::getInstance();
+        if (!db.isConnected()) {
+            return;
+        }
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+        txn.exec_params(
+            "UPDATE deployments "
+            "SET logs = COALESCE(logs, '') || $1, updated_at = NOW() "
+            "WHERE id = $2",
+            batched,
+            deploymentId
+        );
+        txn.commit();
+    } catch (const std::exception& e) {
+        spdlog::error("Failed to append build log block for {}: {}", deploymentId, e.what());
+    }
+}
+
+void ensureFlusherStarted() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        s_flusherRunning = true;
+        s_flusherThread = std::thread([]() {
+            while (s_flusherRunning.load()) {
+                std::unique_lock<std::mutex> lock(s_bufferMutex);
+                s_flusherCv.wait_for(lock, std::chrono::milliseconds(250), [] {
+                    return !s_flusherRunning.load();
+                });
+                if (!s_flusherRunning.load()) {
+                    break;
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                std::vector<std::pair<std::string, std::string>> toFlush;
+                for (auto it = s_pendingLogs.begin(); it != s_pendingLogs.end(); ) {
+                    if (now - it->second.firstLineTime >= std::chrono::milliseconds(500)) {
+                        if (!it->second.accumulatedText.empty()) {
+                            toFlush.emplace_back(it->first, std::move(it->second.accumulatedText));
+                        }
+                        it = s_pendingLogs.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                lock.unlock();
+
+                for (const auto& [depId, text] : toFlush) {
+                    writeLogsToDb(depId, text);
+                }
+            }
+        });
+        s_flusherThread.detach();
+    });
 }
 
 }  // namespace
 
 void DeploymentJournal::appendLine(const std::string& deploymentId, const std::string& line) {
-    std::lock_guard<std::mutex> lock(g_logMutex);
-
-    try {
-        auto& db = Database::getInstance();
-        auto conn = db.getConnection();
-        pqxx::work txn(*conn);
-        txn.exec_params(
-            "UPDATE deployments "
-            "SET logs = COALESCE(logs, '') || $1 || E'\\n', updated_at = NOW() "
-            "WHERE id = $2",
-            line,
-            deploymentId
-        );
-        txn.commit();
-    } catch (const std::exception& e) {
-        spdlog::error("Failed to append build log for {}: {}", deploymentId, e.what());
+    if (deploymentId.empty() || line.empty()) {
+        return;
     }
+
+    appendBlock(deploymentId, line);
 }
 
 void DeploymentJournal::appendBlock(const std::string& deploymentId, const std::string& block) {
+    if (block.empty() || deploymentId.empty()) {
+        return;
+    }
+
     std::istringstream stream(block);
     std::string line;
+    std::string batched;
+    size_t linesAdded = 0;
     while (std::getline(stream, line)) {
-        if (!line.empty()) {
-            appendLine(deploymentId, line);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
         }
+        if (!line.empty()) {
+            batched += line;
+            batched += '\n';
+            ++linesAdded;
+        }
+    }
+
+    if (batched.empty()) {
+        return;
+    }
+
+    ensureFlusherStarted();
+
+    std::string textToFlushImmediately;
+    {
+        std::lock_guard<std::mutex> lock(s_bufferMutex);
+        auto& entry = s_pendingLogs[deploymentId];
+        if (entry.lineCount == 0) {
+            entry.firstLineTime = std::chrono::steady_clock::now();
+        }
+        entry.accumulatedText += batched;
+        entry.lineCount += linesAdded;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (entry.lineCount >= 50 || (now - entry.firstLineTime >= std::chrono::milliseconds(500))) {
+            textToFlushImmediately = std::move(entry.accumulatedText);
+            s_pendingLogs.erase(deploymentId);
+        }
+    }
+
+    if (!textToFlushImmediately.empty()) {
+        writeLogsToDb(deploymentId, textToFlushImmediately);
+    }
+}
+
+void DeploymentJournal::flush(const std::string& deploymentId) {
+    std::vector<std::pair<std::string, std::string>> toFlush;
+    {
+        std::lock_guard<std::mutex> lock(s_bufferMutex);
+        if (deploymentId.empty()) {
+            for (auto& [id, entry] : s_pendingLogs) {
+                if (!entry.accumulatedText.empty()) {
+                    toFlush.emplace_back(id, std::move(entry.accumulatedText));
+                }
+            }
+            s_pendingLogs.clear();
+        } else {
+            auto it = s_pendingLogs.find(deploymentId);
+            if (it != s_pendingLogs.end()) {
+                if (!it->second.accumulatedText.empty()) {
+                    toFlush.emplace_back(it->first, std::move(it->second.accumulatedText));
+                }
+                s_pendingLogs.erase(it);
+            }
+        }
+    }
+
+    for (const auto& [id, text] : toFlush) {
+        writeLogsToDb(id, text);
     }
 }
 
@@ -123,6 +251,7 @@ void DeploymentJournal::hydrateRuntimeFields(Json::Value& dep, const pqxx::row& 
 }
 
 Json::Value DeploymentJournal::loadSummary(const std::string& deploymentId) {
+    flush(deploymentId);
     auto& db = Database::getInstance();
     auto conn = db.getConnection();
     pqxx::work txn(*conn);

@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Copy, Eye, KeyRound, Loader2, Plus, Search, Trash2 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 import api from "@/lib/api";
@@ -191,7 +192,7 @@ export default function SecretsPage() {
       <section className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="flex items-center gap-2 text-3xl font-bold tracking-tight">
-            <KeyRound className="h-7 w-7 text-primary" />
+            <AppIcon name="key-round" fallback={KeyRound} className="h-7 w-7 text-primary"  />
             Secrets
           </h1>
           <p className="mt-2 max-w-3xl text-muted-foreground">
@@ -207,7 +208,7 @@ export default function SecretsPage() {
           }}
           disabled={projects.length === 0}
         >
-          <Plus className="mr-2 h-4 w-4" />
+          <AppIcon name="plus" fallback={Plus} className="mr-2 h-4 w-4"  />
           New secret
         </Button>
       </section>
@@ -222,12 +223,12 @@ export default function SecretsPage() {
               </CardDescription>
             </div>
             <div className="relative w-full sm:max-w-xs">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <AppIcon name="search" fallback={Search} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground"  />
               <Input
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
                 placeholder="Search by key, project or environment"
-                className="pl-9"
+                className="pl-10"
               />
             </div>
           </div>
@@ -235,12 +236,12 @@ export default function SecretsPage() {
         <CardContent>
           {secretsQuery.isLoading ? (
             <div className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
               Loading secrets…
             </div>
           ) : filtered.length === 0 ? (
             <div className="rounded-lg border border-dashed border-border py-12 text-center">
-              <KeyRound className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
+              <AppIcon name="key-round" fallback={KeyRound} className="mx-auto mb-3 h-8 w-8 text-muted-foreground"  />
               <p className="font-medium">
                 {secrets.length === 0 ? "No secrets yet" : "No secrets match that search"}
               </p>
@@ -287,7 +288,7 @@ export default function SecretsPage() {
                             onClick={() => revealMutation.mutate(secret)}
                             disabled={revealMutation.isPending}
                           >
-                            <Eye className="h-4 w-4" />
+                            <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />
                           </Button>
                           <Button
                             size="icon-sm"
@@ -295,7 +296,7 @@ export default function SecretsPage() {
                             title="Delete secret"
                             onClick={() => setPendingDelete(secret)}
                           >
-                            <Trash2 className="h-4 w-4 text-destructive" />
+                            <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4 text-destructive"  />
                           </Button>
                         </div>
                       </td>
@@ -404,7 +405,7 @@ export default function SecretsPage() {
               onClick={() => saveMutation.mutate()}
               disabled={!projectId || !secretKey.trim() || !secretValue || saveMutation.isPending}
             >
-              {saveMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {saveMutation.isPending && <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />}
               Save secret
             </Button>
           </div>
@@ -428,7 +429,7 @@ export default function SecretsPage() {
               className="shrink-0"
               onClick={() => copyValue(revealed?.value ?? "")}
             >
-              <Copy className="h-4 w-4" />
+              <AppIcon name="copy" fallback={Copy} className="h-4 w-4"  />
             </Button>
           </div>
           <div className="flex justify-end">
@@ -442,7 +443,7 @@ export default function SecretsPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <div className="mx-auto mb-1 flex h-10 w-10 items-center justify-center rounded-full border border-destructive/20 bg-destructive/10">
-              <AlertTriangle className="h-5 w-5 text-destructive" />
+              <AppIcon name="alert-triangle" fallback={AlertTriangle} className="h-5 w-5 text-destructive"  />
             </div>
             <DialogTitle className="text-center">Delete secret?</DialogTitle>
             <DialogDescription className="text-center">
@@ -459,7 +460,7 @@ export default function SecretsPage() {
               onClick={() => pendingDelete && deleteMutation.mutate(pendingDelete)}
               disabled={deleteMutation.isPending}
             >
-              {deleteMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {deleteMutation.isPending && <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />}
               Delete
             </Button>
           </div>

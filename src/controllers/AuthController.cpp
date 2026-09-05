@@ -103,7 +103,38 @@ struct AuthRateLimitState {
 };
 
 std::mutex authRateLimitMutex;
+constexpr size_t kMaxAuthRateLimitEntries = 50000;
 std::unordered_map<std::string, AuthRateLimitState> authRateLimitStates;
+
+void pruneAuthRateLimitStatesLocked(const std::chrono::steady_clock::time_point& now) {
+    if (authRateLimitStates.size() < kMaxAuthRateLimitEntries) {
+        return;
+    }
+    // Prune expired / stale entries where block has expired and attempt window has passed
+    for (auto it = authRateLimitStates.begin(); it != authRateLimitStates.end(); ) {
+        if (now >= it->second.blockedUntil &&
+            std::chrono::duration_cast<std::chrono::seconds>(now - it->second.windowStart).count() > 900) {
+            it = authRateLimitStates.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // If still at or above cap, evict oldest entries by windowStart down to 40,000
+    if (authRateLimitStates.size() >= kMaxAuthRateLimitEntries) {
+        std::vector<std::pair<std::chrono::steady_clock::time_point, std::string>> entries;
+        entries.reserve(authRateLimitStates.size());
+        for (const auto& [k, v] : authRateLimitStates) {
+            entries.emplace_back(v.windowStart, k);
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+        const size_t toRemove = authRateLimitStates.size() - 40000;
+        for (size_t i = 0; i < toRemove && i < entries.size(); ++i) {
+            authRateLimitStates.erase(entries[i].second);
+        }
+    }
+}
 
 std::string trimForStorage(const std::string& value, size_t maxLength) {
     if (value.size() <= maxLength) {
@@ -199,8 +230,16 @@ bool isRateLimited(const std::string& key, int& retryAfterSeconds) {
 
 void recordRateLimitFailure(const std::string& key, const AuthRateLimitPolicy& policy) {
     std::lock_guard<std::mutex> lock(authRateLimitMutex);
-    auto& state = authRateLimitStates[key];
     const auto now = std::chrono::steady_clock::now();
+
+    auto it = authRateLimitStates.find(key);
+    if (it == authRateLimitStates.end()) {
+        if (authRateLimitStates.size() >= kMaxAuthRateLimitEntries) {
+            pruneAuthRateLimitStatesLocked(now);
+        }
+        it = authRateLimitStates.emplace(key, AuthRateLimitState{0, now, std::chrono::steady_clock::time_point::min()}).first;
+    }
+    auto& state = it->second;
 
     if (now >= state.blockedUntil && now - state.windowStart > std::chrono::seconds(policy.windowSeconds)) {
         state.attempts = 0;
@@ -420,11 +459,11 @@ std::string hashPasswordResetOtp(const std::string& email, const std::string& ot
     return hmacSha256Hex(getPasswordResetSecret(), toLower(trim(email)) + ":" + otp);
 }
 
-std::string buildGitHubState(const std::string& mode, const std::string& userId) {
+std::string buildGitHubState(const std::string& mode, const std::string& userId, const std::string& nonce = "") {
     Json::Value payload;
     payload["mode"] = mode;
     payload["user_id"] = userId;
-    payload["nonce"] = randomHex(12);
+    payload["nonce"] = !nonce.empty() ? nonce : randomHex(16);
     payload["exp"] = static_cast<Json::Int64>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()
@@ -527,6 +566,62 @@ void clearAuthCookie(const drogon::HttpResponsePtr& resp) {
 
     std::ostringstream cookie;
     cookie << "token="
+           << "; Path=/"
+           << "; Max-Age=0"
+           << "; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
+           << "; HttpOnly"
+           << "; SameSite=Lax";
+
+    if (secure) {
+        cookie << "; Secure";
+    }
+
+    resp->addHeader("Set-Cookie", cookie.str());
+}
+
+std::string extractCookieValue(const std::string& cookieHeader, const std::string& name) {
+    std::stringstream stream(cookieHeader);
+    std::string chunk;
+    const std::string prefix = name + "=";
+
+    while (std::getline(stream, chunk, ';')) {
+        chunk = trim(chunk);
+        if (chunk.rfind(prefix, 0) == 0) {
+            return chunk.substr(prefix.size());
+        }
+    }
+
+    return "";
+}
+
+void attachOAuthStateCookie(const drogon::HttpResponsePtr& resp, const std::string& nonce) {
+    if (nonce.empty()) {
+        return;
+    }
+
+    const std::string backendPublicUrl = getEnvOrDefault("BACKEND_PUBLIC_URL", "http://localhost:8090");
+    const bool secure = backendPublicUrl.rfind("https://", 0) == 0;
+
+    std::ostringstream cookie;
+    cookie << "__Host-oauth-state=" << drogon::utils::urlEncode(nonce)
+           << "; Path=/"
+           << "; Max-Age=600"
+           << "; HttpOnly"
+           << "; SameSite=Lax";
+
+    if (secure) {
+        cookie << "; Secure";
+    }
+
+    resp->addHeader("Set-Cookie", cookie.str());
+}
+
+void clearOAuthStateCookie(const drogon::HttpResponsePtr& resp) {
+    const std::string backendPublicUrl = getEnvOrDefault("BACKEND_PUBLIC_URL", "http://localhost:8090");
+    const bool secure = backendPublicUrl.rfind("https://", 0) == 0;
+
+    std::ostringstream cookie;
+    cookie << "__Host-oauth-state="
            << "; Path=/"
            << "; Max-Age=0"
            << "; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
@@ -1023,11 +1118,14 @@ void AuthController::startGitHubAuth(
         }
     }
 
+    const std::string oauthNonce = randomHex(16);
     Json::Value respBody;
-    respBody["authorization_url"] = service.buildAuthorizationUrl(buildGitHubState(mode, userId));
+    respBody["authorization_url"] = service.buildAuthorizationUrl(buildGitHubState(mode, userId, oauthNonce));
     respBody["callback_url"] = service.getCallbackUrl();
     clearRateLimitState(rateLimitKey);
-    callback(drogon::HttpResponse::newHttpJsonResponse(respBody));
+    auto resp = drogon::HttpResponse::newHttpJsonResponse(respBody);
+    attachOAuthStateCookie(resp, oauthNonce);
+    callback(resp);
 }
 
 void AuthController::githubCallback(
@@ -1039,11 +1137,13 @@ void AuthController::githubCallback(
     const std::string error = req->getParameter("error");
     const std::string errorDescription = req->getParameter("error_description");
     if (!error.empty()) {
-        callback(makeRedirectResponse(buildGitHubFrontendRedirect(
+        auto resp = makeRedirectResponse(buildGitHubFrontendRedirect(
             "error",
             "signin",
             errorDescription.empty() ? "GitHub authorization was cancelled" : errorDescription
-        )));
+        ));
+        clearOAuthStateCookie(resp);
+        callback(resp);
         return;
     }
 
@@ -1051,11 +1151,36 @@ void AuthController::githubCallback(
     const std::string state = req->getParameter("state");
     Json::Value statePayload;
     if (code.empty() || state.empty() || !parseGitHubState(state, statePayload)) {
-        callback(makeRedirectResponse(buildGitHubFrontendRedirect(
+        auto resp = makeRedirectResponse(buildGitHubFrontendRedirect(
             "error",
             "signin",
             "GitHub authorization session is invalid or expired"
-        )));
+        ));
+        clearOAuthStateCookie(resp);
+        callback(resp);
+        return;
+    }
+
+    std::string cookieNonce = req->getCookie("__Host-oauth-state");
+    if (cookieNonce.empty()) {
+        const std::string cookieHeader = req->getHeader("cookie");
+        if (!cookieHeader.empty()) {
+            cookieNonce = extractCookieValue(cookieHeader, "__Host-oauth-state");
+        }
+    }
+
+    const std::string stateNonce = statePayload.isMember("nonce") ? statePayload["nonce"].asString() : "";
+    if (cookieNonce.empty() || stateNonce.empty() ||
+        cookieNonce.size() != stateNonce.size() ||
+        CRYPTO_memcmp(cookieNonce.data(), stateNonce.data(), stateNonce.size()) != 0) {
+        spdlog::warn("GitHub OAuth state nonce mismatch or missing __Host-oauth-state cookie");
+        auto resp = makeRedirectResponse(buildGitHubFrontendRedirect(
+            "error",
+            statePayload.isMember("mode") ? statePayload["mode"].asString() : "signin",
+            "OAuth state validation failed (CSRF protection)"
+        ));
+        clearOAuthStateCookie(resp);
+        callback(resp);
         return;
     }
 
@@ -1249,6 +1374,18 @@ void AuthController::logoutUser(
 ) {
     const std::string userId = extractUserIdFromRequest(req);
     if (!userId.empty()) {
+        try {
+            auto& db = Database::getInstance();
+            auto conn = db.getConnection();
+            pqxx::work txn(*conn);
+            txn.exec_params(
+                "UPDATE users SET token_invalid_before = NOW() WHERE id = $1",
+                userId
+            );
+            txn.commit();
+        } catch (const std::exception& e) {
+            spdlog::warn("Failed to update token_invalid_before on logout for user {}: {}", userId, e.what());
+        }
         AuditLogger::recordFromRequest(req, userId, "auth.logout", "user", userId, Json::Value(Json::objectValue));
     }
     Json::Value body;
@@ -1698,6 +1835,36 @@ void AuthController::getMe(
             !result[0]["github_access_token"].is_null() &&
             !TokenCrypto::decrypt(result[0]["github_access_token"].as<std::string>()).empty();
         body["user"]["github_connected"] = !result[0]["github_id"].is_null() && hasGitHubToken;
+
+        auto prefRows = txn.exec_params(
+            "SELECT ui_theme, color_mode, sidebar_collapsed, icon_mode, icon_pack, icon_overrides, preferences "
+            "FROM user_preferences WHERE user_id = $1",
+            userId
+        );
+        Json::Value prefs;
+        if (!prefRows.empty()) {
+            prefs["ui_theme"] = prefRows[0]["ui_theme"].as<std::string>("shadcn");
+            prefs["color_mode"] = prefRows[0]["color_mode"].as<std::string>("system");
+            prefs["sidebar_collapsed"] = prefRows[0]["sidebar_collapsed"].as<bool>(false);
+            prefs["icon_mode"] = prefRows[0]["icon_mode"].as<std::string>("custom");
+            prefs["icon_pack"] = prefRows[0]["icon_pack"].as<std::string>("duotone");
+            prefs["icon_overrides"] = !prefRows[0]["icon_overrides"].is_null()
+                ? strings::parseJsonObject(prefRows[0]["icon_overrides"].as<std::string>())
+                : Json::Value(Json::objectValue);
+            prefs["preferences"] = !prefRows[0]["preferences"].is_null()
+                ? strings::parseJsonObject(prefRows[0]["preferences"].as<std::string>())
+                : Json::Value(Json::objectValue);
+        } else {
+            prefs["ui_theme"] = "shadcn";
+            prefs["color_mode"] = "system";
+            prefs["sidebar_collapsed"] = false;
+            prefs["icon_mode"] = "custom";
+            prefs["icon_pack"] = "duotone";
+            prefs["icon_overrides"] = Json::Value(Json::objectValue);
+            prefs["preferences"] = Json::Value(Json::objectValue);
+        }
+        body["user"]["preferences"] = prefs;
+
         callback(drogon::HttpResponse::newHttpJsonResponse(body));
     } catch (const std::exception& e) {
         spdlog::error("GetMe error: {}", e.what());
@@ -1872,6 +2039,334 @@ void AuthController::updateMe(
         callback(drogon::HttpResponse::newHttpJsonResponse(respBody));
     } catch (const std::exception& e) {
         spdlog::error("UpdateMe error: {}", e.what());
+        Json::Value err; err["error"] = "Internal server error";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
+    }
+}
+
+void AuthController::getIconSettings(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback
+) {
+    try {
+        const std::string userId = extractUserIdFromRequest(req);
+        if (userId.empty()) {
+            Json::Value def;
+            def["mode"] = "default";
+            def["pack"] = "duotone";
+            def["overrides"] = Json::Value(Json::objectValue);
+            callback(drogon::HttpResponse::newHttpJsonResponse(def));
+            return;
+        }
+
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+        auto result = txn.exec_params(
+            "SELECT mode, pack, overrides FROM user_icon_settings WHERE user_id = $1",
+            userId
+        );
+        txn.commit();
+
+        Json::Value resp;
+        if (result.empty()) {
+            resp["mode"] = "default";
+            resp["pack"] = "duotone";
+            resp["overrides"] = Json::Value(Json::objectValue);
+        } else {
+            resp["mode"] = result[0]["mode"].as<std::string>("default");
+            resp["pack"] = result[0]["pack"].as<std::string>("duotone");
+            if (!result[0]["overrides"].is_null()) {
+                resp["overrides"] = strings::parseJsonObject(result[0]["overrides"].as<std::string>());
+            } else {
+                resp["overrides"] = Json::Value(Json::objectValue);
+            }
+        }
+        
+        callback(drogon::HttpResponse::newHttpJsonResponse(resp));
+    } catch (const std::exception& e) {
+        spdlog::error("getIconSettings error: {}", e.what());
+        Json::Value def;
+        def["mode"] = "default";
+        def["pack"] = "duotone";
+        def["overrides"] = Json::Value(Json::objectValue);
+        callback(drogon::HttpResponse::newHttpJsonResponse(def));
+    }
+}
+
+void AuthController::updateIconSettings(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback
+) {
+    try {
+        const std::string userId = extractUserIdFromRequest(req);
+        if (userId.empty()) {
+            Json::Value err; err["error"] = "Invalid or expired token";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k401Unauthorized);
+            callback(resp);
+            return;
+        }
+
+        auto json = req->getJsonObject();
+        if (!json || !json->isObject()) {
+            Json::Value err; err["error"] = "Invalid request body";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k400BadRequest);
+            callback(resp);
+            return;
+        }
+
+        std::string mode = (*json).get("mode", "default").asString();
+        std::string pack = (*json).get("pack", "duotone").asString();
+        Json::Value overrides = (*json).get("overrides", Json::Value(Json::objectValue));
+        if (!overrides.isObject()) {
+            overrides = Json::Value(Json::objectValue);
+        }
+
+        Json::StreamWriterBuilder writerBuilder;
+        writerBuilder["indentation"] = "";
+        std::string overridesStr = Json::writeString(writerBuilder, overrides);
+
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+        txn.exec_params(
+            "INSERT INTO user_icon_settings (user_id, mode, pack, overrides, updated_at) "
+            "VALUES ($1, $2, $3, $4::jsonb, NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET mode = EXCLUDED.mode, pack = EXCLUDED.pack, overrides = EXCLUDED.overrides, updated_at = NOW()",
+            userId,
+            mode,
+            pack,
+            overridesStr
+        );
+
+        // Also mirror to user_preferences
+        txn.exec_params(
+            "INSERT INTO user_preferences (user_id, icon_mode, icon_pack, icon_overrides, updated_at) "
+            "VALUES ($1, $2, $3, $4::jsonb, NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET icon_mode = EXCLUDED.icon_mode, icon_pack = EXCLUDED.icon_pack, "
+            "    icon_overrides = EXCLUDED.icon_overrides, updated_at = NOW()",
+            userId,
+            mode,
+            pack,
+            overridesStr
+        );
+        txn.commit();
+
+        Json::Value resp;
+        resp["success"] = true;
+        resp["mode"] = mode;
+        resp["pack"] = pack;
+        resp["overrides"] = overrides;
+        callback(drogon::HttpResponse::newHttpJsonResponse(resp));
+    } catch (const std::exception& e) {
+        spdlog::error("updateIconSettings error: {}", e.what());
+        Json::Value err; err["error"] = "Internal server error";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
+    }
+}
+
+void AuthController::getPreferences(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback
+) {
+    try {
+        const std::string userId = extractUserIdFromRequest(req);
+        if (userId.empty()) {
+            Json::Value def;
+            def["ui_theme"] = "shadcn";
+            def["color_mode"] = "system";
+            def["sidebar_collapsed"] = false;
+            def["icon_mode"] = "custom";
+            def["icon_pack"] = "duotone";
+            def["icon_overrides"] = Json::Value(Json::objectValue);
+            def["preferences"] = Json::Value(Json::objectValue);
+            callback(drogon::HttpResponse::newHttpJsonResponse(def));
+            return;
+        }
+
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+        auto result = txn.exec_params(
+            "SELECT ui_theme, color_mode, sidebar_collapsed, icon_mode, icon_pack, icon_overrides, preferences "
+            "FROM user_preferences WHERE user_id = $1",
+            userId
+        );
+        txn.commit();
+
+        Json::Value resp;
+        if (result.empty()) {
+            resp["ui_theme"] = "shadcn";
+            resp["color_mode"] = "system";
+            resp["sidebar_collapsed"] = false;
+            resp["icon_mode"] = "custom";
+            resp["icon_pack"] = "duotone";
+            resp["icon_overrides"] = Json::Value(Json::objectValue);
+            resp["preferences"] = Json::Value(Json::objectValue);
+        } else {
+            resp["ui_theme"] = result[0]["ui_theme"].as<std::string>("shadcn");
+            resp["color_mode"] = result[0]["color_mode"].as<std::string>("system");
+            resp["sidebar_collapsed"] = result[0]["sidebar_collapsed"].as<bool>(false);
+            resp["icon_mode"] = result[0]["icon_mode"].as<std::string>("custom");
+            resp["icon_pack"] = result[0]["icon_pack"].as<std::string>("duotone");
+            resp["icon_overrides"] = !result[0]["icon_overrides"].is_null()
+                ? strings::parseJsonObject(result[0]["icon_overrides"].as<std::string>())
+                : Json::Value(Json::objectValue);
+            resp["preferences"] = !result[0]["preferences"].is_null()
+                ? strings::parseJsonObject(result[0]["preferences"].as<std::string>())
+                : Json::Value(Json::objectValue);
+        }
+
+        callback(drogon::HttpResponse::newHttpJsonResponse(resp));
+    } catch (const std::exception& e) {
+        spdlog::error("getPreferences error: {}", e.what());
+        Json::Value def;
+        def["ui_theme"] = "shadcn";
+        def["color_mode"] = "system";
+        def["sidebar_collapsed"] = false;
+        def["icon_mode"] = "custom";
+        def["icon_pack"] = "duotone";
+        def["icon_overrides"] = Json::Value(Json::objectValue);
+        def["preferences"] = Json::Value(Json::objectValue);
+        callback(drogon::HttpResponse::newHttpJsonResponse(def));
+    }
+}
+
+void AuthController::updatePreferences(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback
+) {
+    try {
+        const std::string userId = extractUserIdFromRequest(req);
+        if (userId.empty()) {
+            Json::Value err; err["error"] = "Invalid or expired token";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k401Unauthorized);
+            callback(resp);
+            return;
+        }
+
+        auto json = req->getJsonObject();
+        if (!json || !json->isObject()) {
+            Json::Value err; err["error"] = "Invalid request body";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k400BadRequest);
+            callback(resp);
+            return;
+        }
+
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+
+        auto currentRows = txn.exec_params(
+            "SELECT ui_theme, color_mode, sidebar_collapsed, icon_mode, icon_pack, icon_overrides, preferences "
+            "FROM user_preferences WHERE user_id = $1",
+            userId
+        );
+
+        std::string uiTheme = "shadcn";
+        std::string colorMode = "system";
+        bool sidebarCollapsed = false;
+        std::string iconMode = "custom";
+        std::string iconPack = "duotone";
+        Json::Value iconOverrides = Json::Value(Json::objectValue);
+        Json::Value customPrefs = Json::Value(Json::objectValue);
+
+        if (!currentRows.empty()) {
+            uiTheme = currentRows[0]["ui_theme"].as<std::string>("shadcn");
+            colorMode = currentRows[0]["color_mode"].as<std::string>("system");
+            sidebarCollapsed = currentRows[0]["sidebar_collapsed"].as<bool>(false);
+            iconMode = currentRows[0]["icon_mode"].as<std::string>("custom");
+            iconPack = currentRows[0]["icon_pack"].as<std::string>("duotone");
+            if (!currentRows[0]["icon_overrides"].is_null()) {
+                iconOverrides = strings::parseJsonObject(currentRows[0]["icon_overrides"].as<std::string>());
+            }
+            if (!currentRows[0]["preferences"].is_null()) {
+                customPrefs = strings::parseJsonObject(currentRows[0]["preferences"].as<std::string>());
+            }
+        }
+
+        if (json->isMember("ui_theme") && (*json)["ui_theme"].isString()) {
+            uiTheme = (*json)["ui_theme"].asString();
+        }
+        if (json->isMember("color_mode") && (*json)["color_mode"].isString()) {
+            colorMode = (*json)["color_mode"].asString();
+        }
+        if (json->isMember("sidebar_collapsed") && (*json)["sidebar_collapsed"].isBool()) {
+            sidebarCollapsed = (*json)["sidebar_collapsed"].asBool();
+        }
+        if (json->isMember("icon_mode") && (*json)["icon_mode"].isString()) {
+            iconMode = (*json)["icon_mode"].asString();
+        }
+        if (json->isMember("icon_pack") && (*json)["icon_pack"].isString()) {
+            iconPack = (*json)["icon_pack"].asString();
+        }
+        if (json->isMember("icon_overrides") && (*json)["icon_overrides"].isObject()) {
+            iconOverrides = (*json)["icon_overrides"];
+        }
+        if (json->isMember("preferences") && (*json)["preferences"].isObject()) {
+            for (const auto& key : (*json)["preferences"].getMemberNames()) {
+                customPrefs[key] = (*json)["preferences"][key];
+            }
+        }
+
+        Json::StreamWriterBuilder writerBuilder;
+        writerBuilder["indentation"] = "";
+        std::string overridesStr = Json::writeString(writerBuilder, iconOverrides);
+        std::string prefsStr = Json::writeString(writerBuilder, customPrefs);
+
+        txn.exec_params(
+            "INSERT INTO user_preferences (user_id, ui_theme, color_mode, sidebar_collapsed, icon_mode, icon_pack, icon_overrides, preferences, updated_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET ui_theme = EXCLUDED.ui_theme, color_mode = EXCLUDED.color_mode, "
+            "    sidebar_collapsed = EXCLUDED.sidebar_collapsed, icon_mode = EXCLUDED.icon_mode, "
+            "    icon_pack = EXCLUDED.icon_pack, icon_overrides = EXCLUDED.icon_overrides, "
+            "    preferences = EXCLUDED.preferences, updated_at = NOW()",
+            userId,
+            uiTheme,
+            colorMode,
+            sidebarCollapsed,
+            iconMode,
+            iconPack,
+            overridesStr,
+            prefsStr
+        );
+
+        txn.exec_params(
+            "INSERT INTO user_icon_settings (user_id, mode, pack, overrides, updated_at) "
+            "VALUES ($1, $2, $3, $4::jsonb, NOW()) "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET mode = EXCLUDED.mode, pack = EXCLUDED.pack, overrides = EXCLUDED.overrides, updated_at = NOW()",
+            userId,
+            iconMode,
+            iconPack,
+            overridesStr
+        );
+
+        txn.commit();
+
+        Json::Value resp;
+        resp["success"] = true;
+        resp["ui_theme"] = uiTheme;
+        resp["color_mode"] = colorMode;
+        resp["sidebar_collapsed"] = sidebarCollapsed;
+        resp["icon_mode"] = iconMode;
+        resp["icon_pack"] = iconPack;
+        resp["icon_overrides"] = iconOverrides;
+        resp["preferences"] = customPrefs;
+        callback(drogon::HttpResponse::newHttpJsonResponse(resp));
+    } catch (const std::exception& e) {
+        spdlog::error("updatePreferences error: {}", e.what());
         Json::Value err; err["error"] = "Internal server error";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
         resp->setStatusCode(drogon::k500InternalServerError);

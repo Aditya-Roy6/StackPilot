@@ -52,16 +52,67 @@ void sampleRunningDeployments(pqxx::transaction_base& txn) {
     const auto rows = txn.exec(
         "SELECT d.id, d.project_id, p.organization_id, "
         "COALESCE(d.desired_replicas, 1) AS replicas, "
-        "COALESCE(d.runtime_snapshot->>'resource_preset', 'small') AS preset "
+        "COALESCE(d.runtime_provider, '') AS runtime_provider, "
+        "COALESCE(d.runtime_snapshot->>'resource_preset', 'small') AS preset, "
+        "d.runtime_snapshot::text AS runtime_snapshot "
         "FROM deployments d JOIN projects p ON p.id = d.project_id "
         "WHERE d.status = 'running' AND COALESCE(d.runtime_paused, FALSE) = FALSE"
     );
 
     for (const auto& row : rows) {
-        const ResourceShape shape = CostModel::shapeForPreset(row["preset"].as<std::string>());
+        const std::string runtimeProvider = strings::toLower(strings::trim(
+            row["runtime_provider"].is_null() ? "" : row["runtime_provider"].as<std::string>()
+        ));
         const int replicas = row["replicas"].as<int>();
-        const long long accrued =
-            CostModel::accrueMillicents(shape, replicas, kSampleWindowSeconds, rate);
+
+        ResourceShape shape{0, 0};
+        long long accrued = 0;
+
+        if (runtimeProvider == "local_docker" || runtimeProvider == "docker") {
+            // Free local development
+            shape = {0, 0};
+            accrued = 0;
+        } else {
+            // Kubernetes (or fallback to presets)
+            const Json::Value snapshot = strings::parseJsonObject(
+                row["runtime_snapshot"].is_null() ? "" : row["runtime_snapshot"].as<std::string>()
+            );
+
+            auto extractStringOrNumber = [](const Json::Value& val) -> std::string {
+                if (val.isString()) return val.asString();
+                if (val.isInt() || val.isUInt()) return std::to_string(val.asInt64());
+                if (val.isDouble()) return std::to_string(val.asDouble());
+                return "";
+            };
+
+            std::string cpuReq;
+            std::string memReq;
+
+            if (snapshot.isMember("cpu_request")) {
+                cpuReq = extractStringOrNumber(snapshot["cpu_request"]);
+            } else if (snapshot.isMember("cpu")) {
+                cpuReq = extractStringOrNumber(snapshot["cpu"]);
+            }
+
+            if (snapshot.isMember("memory_request")) {
+                memReq = extractStringOrNumber(snapshot["memory_request"]);
+            } else if (snapshot.isMember("memory")) {
+                memReq = extractStringOrNumber(snapshot["memory"]);
+            }
+
+            const int customCpu = CostModel::parseCpuMillicores(cpuReq);
+            const int customMem = CostModel::parseMemoryMb(memReq);
+
+            if (customCpu > 0 || customMem > 0) {
+                const ResourceShape presetShape = CostModel::shapeForPreset(row["preset"].as<std::string>());
+                shape.cpuMillicores = customCpu > 0 ? customCpu : presetShape.cpuMillicores;
+                shape.memoryMb = customMem > 0 ? customMem : presetShape.memoryMb;
+            } else {
+                shape = CostModel::shapeForPreset(row["preset"].as<std::string>());
+            }
+
+            accrued = CostModel::accrueMillicents(shape, replicas, kSampleWindowSeconds, rate);
+        }
 
         txn.exec_params(
             "INSERT INTO deployment_cost_samples "

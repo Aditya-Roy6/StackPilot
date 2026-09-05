@@ -55,7 +55,7 @@ services:
     image: alpine:3
     container_name: stackpilot-uploads-init
     user: "0:0"
-    command: sh -c "mkdir -p /work/builds /work/source-artifacts && chown -R 10001:10001 /work && chmod -R u+rwX,g+rwX /work"
+    command: sh -c "mkdir -p /work/builds /work/source-artifacts && chown 10001:10001 /work /work/builds /work/source-artifacts && chmod 777 /work /work/builds /work/source-artifacts"
     volumes:
       - ./uploads:/work
     restart: "no"
@@ -101,6 +101,8 @@ services:
       - SMTP_PASSWORD=${SMTP_PASSWORD:-}
       - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
       - SMTP_FROM_NAME=${SMTP_FROM_NAME:-StackPilot Platform}
+      - BREVO_API_KEY=${BREVO_API_KEY:-}
+      - BREVO_FROM_EMAIL=${BREVO_FROM_EMAIL:-}
       - BUILD_WORKSPACE_DIR=/app/uploads/builds
       - SOURCE_ARTIFACT_DIR=/app/uploads/source-artifacts
       - BUILD_MAX_LOG_BYTES=${BUILD_MAX_LOG_BYTES:-200000}
@@ -155,8 +157,8 @@ services:
       - K8S_LIVENESS_INITIAL_DELAY_SECONDS=${K8S_LIVENESS_INITIAL_DELAY_SECONDS:-15}
       - K8S_STARTUP_FAILURE_THRESHOLD=${K8S_STARTUP_FAILURE_THRESHOLD:-30}
       - K8S_ROLLOUT_TIMEOUT_SECONDS=${K8S_ROLLOUT_TIMEOUT_SECONDS:-180}
-      - KUBECONFIG_PATH=${KUBECONFIG_PATH:-/root/.kube/config}
-      - KUBECONFIG=/root/.kube/config
+      - KUBECONFIG_PATH=${KUBECONFIG_PATH:-/home/stackpilot/.kube/config}
+      - KUBECONFIG=/home/stackpilot/.kube/config
       - STACKPILOT_AI_ENABLED=${STACKPILOT_AI_ENABLED:-true}
       - STACKPILOT_AI_SERVICE_URL=${STACKPILOT_AI_SERVICE_URL:-http://ai-service:8010}
       - STACKPILOT_AI_SERVICE_TOKEN=${STACKPILOT_AI_SERVICE_TOKEN:-}
@@ -165,7 +167,7 @@ services:
       - STACKPILOT_AI_CONFIDENCE_THRESHOLD=${STACKPILOT_AI_CONFIDENCE_THRESHOLD:-0.72}
       - STACKPILOT_AI_RATE_LIMIT_PER_MINUTE=${STACKPILOT_AI_RATE_LIMIT_PER_MINUTE:-12}
       - STACKPILOT_AI_MAX_CONTEXT_BYTES=${STACKPILOT_AI_MAX_CONTEXT_BYTES:-32000}
-      - STACKPILOT_AI_SERVICE_TIMEOUT_SECONDS=${STACKPILOT_AI_SERVICE_TIMEOUT_SECONDS:-120}
+      - STACKPILOT_AI_SERVICE_TIMEOUT_SECONDS=${STACKPILOT_AI_SERVICE_TIMEOUT_SECONDS:-300}
       - STACKPILOT_AI_EMBEDDING_DIMENSIONS=${STACKPILOT_AI_EMBEDDING_DIMENSIONS:-384}
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET:-}
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
@@ -197,6 +199,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./uploads:/app/uploads
       - ${STACKPILOT_LOCAL_PROJECTS_DIR:-./local-projects}:/app/local-projects:ro
+      - ${USERPROFILE}/.kube/config:/home/stackpilot/.kube/config:ro
       - ${USERPROFILE}/.kube/config:/root/.kube/config:ro
     depends_on:
       uploads-init:
@@ -241,7 +244,7 @@ services:
       - OPENAI_COMPATIBLE_MODEL=${OPENAI_COMPATIBLE_MODEL:-}
       - OPENAI_COMPATIBLE_THINKING_MODEL=${OPENAI_COMPATIBLE_THINKING_MODEL:-}
       - OPENAI_COMPATIBLE_EMBEDDING_MODEL=${OPENAI_COMPATIBLE_EMBEDDING_MODEL:-text-embedding-3-small}
-      - STACKPILOT_AI_REQUEST_TIMEOUT_SECONDS=${STACKPILOT_AI_REQUEST_TIMEOUT_SECONDS:-90}
+      - STACKPILOT_AI_REQUEST_TIMEOUT_SECONDS=${STACKPILOT_AI_REQUEST_TIMEOUT_SECONDS:-300}
       - STACKPILOT_AI_MAX_TEXT_BYTES=${STACKPILOT_AI_MAX_TEXT_BYTES:-24000}
       - STACKPILOT_AI_EMBEDDING_DIMENSIONS=${STACKPILOT_AI_EMBEDDING_DIMENSIONS:-384}
       - STACKPILOT_AI_EMBEDDING_FALLBACK=${STACKPILOT_AI_EMBEDDING_FALLBACK:-true}
@@ -254,23 +257,25 @@ services:
       retries: 5
       start_period: 20s
 
-  # ─── Next.js Frontend ───────────────────────────────────────
+  # ─── Next.js Frontend (Live Hot-Reloading) ───────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8090/api/v1}
-        NEXT_PUBLIC_WS_BASE_URL: ${NEXT_PUBLIC_WS_BASE_URL:-ws://localhost:8090}
-        NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${NEXT_PUBLIC_GOOGLE_CLIENT_ID:-}
-        NEXT_PUBLIC_GITHUB_CLIENT_ID: ${NEXT_PUBLIC_GITHUB_CLIENT_ID:-}
+      target: dev
     container_name: stackpilot-frontend
     restart: unless-stopped
     logging: *stackpilot-logging
     environment:
-      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_BASE_URL=${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8090/api/v1}
+      - NEXT_PUBLIC_WS_BASE_URL=${NEXT_PUBLIC_WS_BASE_URL:-ws://localhost:8090}
       - NEXT_PUBLIC_GOOGLE_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_CLIENT_ID:-}
       - NEXT_PUBLIC_GITHUB_CLIENT_ID=${NEXT_PUBLIC_GITHUB_CLIENT_ID:-}
+      - WATCHPACK_POLLING=true
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:

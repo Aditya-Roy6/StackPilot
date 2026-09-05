@@ -6,6 +6,7 @@ import { AxiosError } from "axios";
 import Link from "next/link";
 import { toast } from "sonner";
 import { Eye, EyeOff, MailCheck, RotateCcw } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -162,7 +163,7 @@ export function ForgotPasswordClient() {
           <CardContent className="space-y-4 pb-6">
             <div className="rounded-lg border border-border/80 bg-muted/20 p-3 text-sm text-muted-foreground">
               <div className="flex items-center gap-2 font-medium text-foreground">
-                <MailCheck className="h-4 w-4" />
+                <AppIcon name="mail-check" fallback={MailCheck} className="h-4 w-4"  />
                 Verification code sent
               </div>
               <p className="mt-1">
@@ -214,7 +215,7 @@ export function ForgotPasswordClient() {
                   disabled={isBusy}
                   aria-label={showPassword ? "Hide password" : "Show password"}
                 >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  {showPassword ? <AppIcon name="eye-off" fallback={EyeOff} className="h-4 w-4"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
                 </button>
               </div>
               <p className="text-xs text-muted-foreground">Use at least 12 characters.</p>
@@ -239,7 +240,7 @@ export function ForgotPasswordClient() {
                   disabled={isBusy}
                   aria-label={showConfirmPassword ? "Hide password confirmation" : "Show password confirmation"}
                 >
-                  {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  {showConfirmPassword ? <AppIcon name="eye-off" fallback={EyeOff} className="h-4 w-4"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
                 </button>
               </div>
             </div>
@@ -253,7 +254,7 @@ export function ForgotPasswordClient() {
                 disabled={isBusy}
                 onClick={() => requestMutation.mutate()}
               >
-                <RotateCcw className="mr-2 h-4 w-4" />
+                <AppIcon name="rotate-ccw" fallback={RotateCcw} className="mr-2 h-4 w-4"  />
                 Resend code
               </Button>
               <Button type="submit" className="flex-1" disabled={isBusy}>

@@ -707,7 +707,7 @@ void SshController::provisionKubernetes(
         auto conn = db.getConnection();
         pqxx::work txn(*conn);
         auto rows = txn.exec_params(
-            "SELECT COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
+            "SELECT name, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
             "FROM ssh_connections WHERE id = $1 AND user_id = $2",
             id,
             userId
@@ -725,10 +725,67 @@ void SshController::provisionKubernetes(
         SshService sshService;
         auto provisionResult = sshService.provisionLightweightKubernetesHost(config, sudoPassword);
 
+        const std::string redactedDetails = redactClusterToken(provisionResult.output);
         Json::Value payload;
         payload["success"] = provisionResult.success;
-        payload["details"] = provisionResult.output;
+        payload["details"] = redactedDetails;
         payload["message"] = provisionResult.success ? "Lightweight Kubernetes prepared" : "Kubernetes preparation failed";
+
+        if (provisionResult.success) {
+            const std::string serverUrl = outputValue(provisionResult.output, "STACKPILOT_cluster_server_url");
+            const std::string nodeToken = outputValue(provisionResult.output, "STACKPILOT_cluster_token");
+            const std::string kubeconfig = extractBlock(provisionResult.output,
+                                                        "__STACKPILOT_K3S_KUBECONFIG_BEGIN__",
+                                                        "__STACKPILOT_K3S_KUBECONFIG_END__");
+            if (!serverUrl.empty() && !nodeToken.empty()) {
+                try {
+                    const std::string connectionName = rows[0]["name"].as<std::string>();
+                    const std::string clusterName = safeClusterName("", connectionName + "-cluster");
+                    const std::string encryptedToken = TokenCrypto::encrypt(nodeToken);
+                    const std::string encryptedKubeconfig = kubeconfig.empty() ? std::string() : TokenCrypto::encrypt(kubeconfig);
+
+                    pqxx::work writeTxn(*conn);
+                    auto clusterRows = writeTxn.exec_params(
+                        "INSERT INTO kubernetes_clusters (user_id, name, provider, control_plane_connection_id, server_url, join_token_encrypted, status, last_status, kubeconfig_encrypted) "
+                        "VALUES ($1, $2, 'k3s', $3, $4, $5, 'ready', $6, NULLIF($7, '')) "
+                        "ON CONFLICT (user_id, name) DO UPDATE SET "
+                        "control_plane_connection_id = EXCLUDED.control_plane_connection_id, "
+                        "server_url = EXCLUDED.server_url, join_token_encrypted = EXCLUDED.join_token_encrypted, "
+                        "status = 'ready', last_status = EXCLUDED.last_status, updated_at = NOW(), "
+                        "kubeconfig_encrypted = COALESCE(NULLIF(EXCLUDED.kubeconfig_encrypted, ''), kubernetes_clusters.kubeconfig_encrypted) "
+                        "RETURNING id, name, provider, server_url, status",
+                        userId,
+                        clusterName,
+                        id,
+                        serverUrl,
+                        encryptedToken,
+                        redactedDetails,
+                        encryptedKubeconfig
+                    );
+                    const std::string clusterId = clusterRows[0]["id"].as<std::string>();
+                    writeTxn.exec_params(
+                        "INSERT INTO kubernetes_cluster_nodes (cluster_id, connection_id, role, status, last_status, joined_at) "
+                        "VALUES ($1, $2, 'server', 'ready', $3, NOW()) "
+                        "ON CONFLICT (cluster_id, connection_id) DO UPDATE SET "
+                        "role = 'server', status = 'ready', last_status = EXCLUDED.last_status, joined_at = NOW(), updated_at = NOW()",
+                        clusterId,
+                        id,
+                        redactedDetails
+                    );
+                    writeTxn.commit();
+
+                    payload["cluster"]["id"] = clusterId;
+                    payload["cluster"]["name"] = clusterRows[0]["name"].as<std::string>();
+                    payload["cluster"]["provider"] = clusterRows[0]["provider"].as<std::string>();
+                    payload["cluster"]["server_url"] = clusterRows[0]["server_url"].as<std::string>();
+                    payload["cluster"]["status"] = clusterRows[0]["status"].as<std::string>();
+                    payload["message"] = "Lightweight Kubernetes prepared and registered as cluster: " + clusterName;
+                } catch (const std::exception& clusterEx) {
+                    spdlog::warn("Could not register provisioned cluster into kubernetes_clusters: {}", clusterEx.what());
+                }
+            }
+        }
+
         if (!provisionResult.error.empty()) {
             payload[provisionResult.success ? "warning" : "error"] = provisionResult.error;
             if (!provisionResult.success &&
@@ -957,6 +1014,40 @@ void SshController::joinKubernetesCluster(
             return;
         }
 
+        auto cpConnectionRows = readTxn.exec_params(
+            "SELECT host FROM ssh_connections WHERE id = $1 AND user_id = $2",
+            id,
+            userId
+        );
+        if (!cpConnectionRows.empty()) {
+            const std::string cpHost = cpConnectionRows[0]["host"].as<std::string>();
+            if (!cpHost.empty() && cpHost == workerRows[0]["host"].as<std::string>()) {
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload(
+                    "Worker host (" + workerRows[0]["host"].as<std::string>() +
+                    ") is identical to the control plane host. You cannot join a control-plane server to itself as a worker."));
+                resp->setStatusCode(drogon::k400BadRequest);
+                callback(resp);
+                return;
+            }
+        }
+
+        const bool replaceExisting = body->isMember("replace_existing") && (*body)["replace_existing"].asBool();
+        auto existingClusterAsCp = readTxn.exec_params(
+            "SELECT name FROM kubernetes_clusters WHERE user_id = $1 AND control_plane_connection_id = $2",
+            userId,
+            workerConnectionId
+        );
+        if (!existingClusterAsCp.empty() && !replaceExisting) {
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload(
+                "This server is already registered as the control plane for cluster '" +
+                existingClusterAsCp[0]["name"].as<std::string>() + "'. "
+                "Joining it as a worker will replace its standalone cluster. "
+                "Confirm 'replace_existing' to proceed."));
+            resp->setStatusCode(drogon::k400BadRequest);
+            callback(resp);
+            return;
+        }
+
         const std::string clusterId = clusterRows[0]["id"].as<std::string>();
         const std::string clusterName = clusterRows[0]["name"].as<std::string>();
         const std::string serverUrl = clusterRows[0]["server_url"].as<std::string>();
@@ -1023,6 +1114,10 @@ void SshController::joinKubernetesCluster(
             if (payload["error"].asString().find("root or passwordless sudo") != std::string::npos) {
                 payload["needs_sudo_password"] = true;
                 payload["hint"] = "The worker requires sudo. Enter the worker server password or configure passwordless sudo.";
+            } else if (payload["error"].asString().find("port 6443") != std::string::npos) {
+                payload["hint"] = "Port 6443 was unreachable from this worker. Verify that the control-plane host has port 6443 open in its AWS Security Group or cloud firewall, and that k3s server is actively running on it.";
+            } else if (payload["error"].asString().find("own control plane") != std::string::npos) {
+                payload["hint"] = "This server already has standalone Kubernetes installed. Click 'Replace and join' to uninstall it and join this cluster.";
             }
             auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
             resp->setStatusCode(drogon::k400BadRequest);
@@ -1098,9 +1193,9 @@ void SshController::removeKubernetesNode(
             writeTxn.exec_params(
                 "UPDATE kubernetes_cluster_nodes SET status = 'removed', removed_at = NOW(), "
                 "last_status = $3, updated_at = NOW() "
-                "WHERE cluster_id = $1 AND connection_id IN ("
-                "  SELECT id FROM ssh_connections WHERE user_id = $4 AND (name = $2 OR host = $2)"
-                ")",
+                "WHERE cluster_id = $1 AND (connection_id::text = $2 OR connection_id IN ("
+                "  SELECT id FROM ssh_connections WHERE user_id = $4 AND (name = $2 OR host = $2 OR id::text = $2)"
+                "))",
                 clusterId, nodeName, redactClusterToken(removal.output), userId);
         }
         writeTxn.commit();
@@ -1206,6 +1301,164 @@ void SshController::inspectKubernetesCluster(
         callback(drogon::HttpResponse::newHttpJsonResponse(payload));
     } catch (const std::exception& e) {
         spdlog::error("Inspect Kubernetes cluster error: {}", e.what());
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Internal server error"));
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
+    }
+}
+
+void SshController::deleteKubernetesCluster(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& id
+) {
+    const std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Unauthorized"));
+        resp->setStatusCode(drogon::k401Unauthorized);
+        callback(resp);
+        return;
+    }
+
+    const auto body = req->getJsonObject();
+    const bool wipeServers = body && body->isMember("wipe_servers") && (*body)["wipe_servers"].asBool();
+    const std::string sudoPassword = body ? jsonString(*body, "sudo_password") : "";
+
+    try {
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work readTxn(*conn);
+
+        auto clusterRows = readTxn.exec_params(
+            "SELECT id, name, control_plane_connection_id FROM kubernetes_clusters WHERE id = $1 AND user_id = $2",
+            id, userId
+        );
+        if (clusterRows.empty()) {
+            readTxn.commit();
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Cluster not found"));
+            resp->setStatusCode(drogon::k404NotFound);
+            callback(resp);
+            return;
+        }
+
+        const std::string clusterName = clusterRows[0]["name"].as<std::string>();
+        const std::string cpConnId = clusterRows[0]["control_plane_connection_id"].is_null() ? "" : clusterRows[0]["control_plane_connection_id"].as<std::string>();
+
+        std::vector<std::string> serverConnIds;
+        if (!cpConnId.empty()) {
+            serverConnIds.push_back(cpConnId);
+        }
+
+        auto nodeRows = readTxn.exec_params(
+            "SELECT connection_id FROM kubernetes_cluster_nodes WHERE cluster_id = $1",
+            id
+        );
+        for (const auto& r : nodeRows) {
+            if (!r["connection_id"].is_null()) {
+                const std::string nid = r["connection_id"].as<std::string>();
+                if (std::find(serverConnIds.begin(), serverConnIds.end(), nid) == serverConnIds.end()) {
+                    serverConnIds.push_back(nid);
+                }
+            }
+        }
+        readTxn.commit();
+
+        std::string wipeDetails;
+        if (wipeServers && !serverConnIds.empty()) {
+            SshService sshService;
+            for (const auto& connId : serverConnIds) {
+                pqxx::work fetchTxn(*conn);
+                auto connRows = fetchTxn.exec_params(
+                    "SELECT COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
+                    "FROM ssh_connections WHERE id = $1 AND user_id = $2",
+                    connId, userId
+                );
+                fetchTxn.commit();
+                if (!connRows.empty()) {
+                    auto config = rowToConfig(connRows[0]);
+                    auto wipeRes = sshService.wipeK3sInstallation(config, sudoPassword);
+                    wipeDetails += config.host + ": " + (wipeRes.success ? "wiped ok\n" : wipeRes.error + "\n");
+                }
+            }
+        }
+
+        pqxx::work deleteTxn(*conn);
+        deleteTxn.exec_params("DELETE FROM kubernetes_cluster_nodes WHERE cluster_id = $1", id);
+        deleteTxn.exec_params("DELETE FROM kubernetes_clusters WHERE id = $1 AND user_id = $2", id, userId);
+        deleteTxn.commit();
+
+        Json::Value payload;
+        payload["success"] = true;
+        payload["message"] = wipeServers ? ("Cluster '" + clusterName + "' deleted and associated nodes wiped.") : ("Cluster '" + clusterName + "' deregistered from StackPilot.");
+        payload["cluster_id"] = id;
+        payload["wipe_details"] = wipeDetails;
+
+        callback(drogon::HttpResponse::newHttpJsonResponse(payload));
+    } catch (const std::exception& e) {
+        spdlog::error("Delete cluster error: {}", e.what());
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Internal server error"));
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
+    }
+}
+
+void SshController::wipeConnection(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& id
+) {
+    const std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Unauthorized"));
+        resp->setStatusCode(drogon::k401Unauthorized);
+        callback(resp);
+        return;
+    }
+
+    const auto body = req->getJsonObject();
+    const std::string sudoPassword = body ? jsonString(*body, "sudo_password") : "";
+
+    try {
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work readTxn(*conn);
+
+        auto rows = readTxn.exec_params(
+            "SELECT COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
+            "FROM ssh_connections WHERE id = $1 AND user_id = $2",
+            id, userId
+        );
+        if (rows.empty()) {
+            readTxn.commit();
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("SSH connection not found"));
+            resp->setStatusCode(drogon::k404NotFound);
+            callback(resp);
+            return;
+        }
+        const SshConnectionConfig config = rowToConfig(rows[0]);
+        readTxn.commit();
+
+        SshService sshService;
+        auto wipeRes = sshService.wipeK3sInstallation(config, sudoPassword);
+
+        pqxx::work writeTxn(*conn);
+        writeTxn.exec_params("DELETE FROM kubernetes_cluster_nodes WHERE connection_id = $1", id);
+        writeTxn.exec_params("UPDATE kubernetes_clusters SET status = 'degraded', last_status = 'Control plane node wiped' WHERE control_plane_connection_id = $1", id);
+        writeTxn.commit();
+
+        Json::Value payload;
+        payload["success"] = wipeRes.success;
+        payload["message"] = wipeRes.success ? "Server wiped and K3s uninstalled cleanly" : "Failed to wipe server";
+        payload["details"] = wipeRes.output;
+        if (!wipeRes.success) {
+            payload["error"] = wipeRes.error;
+        }
+
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+        resp->setStatusCode(wipeRes.success ? drogon::k200OK : drogon::k400BadRequest);
+        callback(resp);
+    } catch (const std::exception& e) {
+        spdlog::error("Wipe connection error: {}", e.what());
         auto resp = drogon::HttpResponse::newHttpJsonResponse(makeErrorPayload("Internal server error"));
         resp->setStatusCode(drogon::k500InternalServerError);
         callback(resp);

@@ -15,6 +15,7 @@
 #include "../services/KubernetesService.h"
 #include "../services/SshService.h"
 #include "../utils/AuditLogger.h"
+#include "../utils/Authz.h"
 #include "../utils/JwtHelper.h"
 #include "../utils/TokenCrypto.h"
 #include <spdlog/spdlog.h>
@@ -1144,11 +1145,44 @@ void startBackgroundBuild(const std::string& deploymentId,
     buildThread.detach();
 }
 
+bool isSshConnectionAccessible(pqxx::transaction_base& txn,
+                               const std::string& connectionId,
+                               const std::string& userId,
+                               const std::string& orgId,
+                               bool isPersonal) {
+    if (connectionId.empty()) {
+        return true;
+    }
+    if (isPersonal || orgId.empty()) {
+        auto rows = txn.exec_params(
+            "SELECT id FROM ssh_connections WHERE id = $1 AND user_id = $2",
+            connectionId,
+            userId
+        );
+        return !rows.empty();
+    }
+    auto rows = txn.exec_params(
+        "SELECT id FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
+        "  SELECT 1 FROM organization_members m "
+        "  WHERE m.organization_id = $3::uuid AND m.user_id = ssh_connections.user_id))",
+        connectionId,
+        userId,
+        orgId
+    );
+    return !rows.empty();
+}
+
 Json::Value projectRowToJson(const pqxx::row& row) {
     Json::Value pj;
     pj["id"] = row["id"].as<std::string>();
     try {
         pj["user_id"] = row["user_id"].as<std::string>();
+    } catch (...) {}
+    try {
+        pj["organization_id"] = row["organization_id"].is_null() ? "" : row["organization_id"].as<std::string>();
+    } catch (...) {}
+    try {
+        pj["organization_name"] = row["organization_name"].is_null() ? "" : row["organization_name"].as<std::string>();
     } catch (...) {}
     pj["name"] = row["name"].as<std::string>();
     pj["description"] = row["description"].as<std::string>();
@@ -1206,6 +1240,11 @@ Json::Value projectRowToJson(const pqxx::row& row) {
         pj["local_https_enabled"] = row["local_https_enabled"].is_null() ? false : row["local_https_enabled"].as<bool>();
     } catch (...) {
         pj["local_https_enabled"] = false;
+    }
+    try {
+        pj["default_cluster_id"] = row["default_cluster_id"].is_null() ? "" : row["default_cluster_id"].as<std::string>();
+    } catch (...) {
+        pj["default_cluster_id"] = "";
     }
     try {
         pj["env_var_count"] = row["env_var_count"].is_null() ? 0 : row["env_var_count"].as<int>();
@@ -1305,10 +1344,27 @@ void ProjectController::createProject(
         Json::Value applicationConfig = (*body).isMember("application_config") && (*body)["application_config"].isObject()
             ? (*body)["application_config"]
             : Json::Value(Json::objectValue);
+        std::string organizationId =
+            (*body).isMember("organization_id") ? trim((*body)["organization_id"].asString()) : "";
+        std::string targetOrgId = organizationId;
+        std::string defaultClusterId =
+            (*body).isMember("default_cluster_id") ? trim((*body)["default_cluster_id"].asString()) : "";
         std::vector<BuildEnvVar> envVars = parseEnvVars(*body);
 
         if (name.empty()) {
             Json::Value err; err["error"] = "Project name is required";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k400BadRequest);
+            callback(resp); return;
+        }
+        if (name.size() > 100) {
+            Json::Value err; err["error"] = "Project name cannot exceed 100 characters";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k400BadRequest);
+            callback(resp); return;
+        }
+        if (name.find_first_of("\r\n\t\0") != std::string::npos) {
+            Json::Value err; err["error"] = "Project name contains invalid characters";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k400BadRequest);
             callback(resp); return;
@@ -1365,6 +1421,28 @@ void ProjectController::createProject(
         auto conn = db.getConnection();
         pqxx::work txn(*conn);
 
+        bool isPersonalProject = false;
+        if (targetOrgId.empty()) {
+            auto personalOrgRows = txn.exec_params(
+                "SELECT o.id FROM organizations o "
+                "JOIN organization_members m ON m.organization_id = o.id "
+                "WHERE m.user_id = $1 AND o.is_personal LIMIT 1",
+                userId
+            );
+            if (!personalOrgRows.empty()) {
+                targetOrgId = personalOrgRows[0]["id"].as<std::string>();
+            }
+            isPersonalProject = true;
+        } else {
+            auto orgRows = txn.exec_params(
+                "SELECT is_personal FROM organizations WHERE id = $1::uuid",
+                targetOrgId
+            );
+            if (!orgRows.empty()) {
+                isPersonalProject = orgRows[0]["is_personal"].as<bool>();
+            }
+        }
+
         if (sourceType == "ssh") {
             SshService sshService;
             if (!sshService.isValidRemotePath(sourcePath)) {
@@ -1373,19 +1451,7 @@ void ProjectController::createProject(
                 resp->setStatusCode(drogon::k400BadRequest);
                 callback(resp); return;
             }
-            auto sshRows = txn.exec_params(
-                // Org-visible, not owner-only. The deploy path already resolves this
-                // connection with no user gate, so refusing a teammate here
-                // produced a project they could deploy but not edit.
-                "SELECT s.id FROM ssh_connections s "
-                "WHERE s.id = $1 AND (s.user_id = $2 OR EXISTS ("
-                "  SELECT 1 FROM organization_members m1 "
-                "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
-                "  WHERE m1.user_id = s.user_id AND m2.user_id = $2))",
-                sshConnectionId,
-                userId
-            );
-            if (sshRows.empty()) {
+            if (!isSshConnectionAccessible(txn, sshConnectionId, userId, targetOrgId, isPersonalProject)) {
                 Json::Value err; err["error"] = "SSH connection not found";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k404NotFound);
@@ -1504,19 +1570,7 @@ void ProjectController::createProject(
                 resp->setStatusCode(drogon::k400BadRequest);
                 callback(resp); return;
             }
-            auto remoteRows = txn.exec_params(
-                // Org-visible, not owner-only. The deploy path already resolves this
-                // connection with no user gate, so refusing a teammate here
-                // produced a project they could deploy but not edit.
-                "SELECT s.id FROM ssh_connections s "
-                "WHERE s.id = $1 AND (s.user_id = $2 OR EXISTS ("
-                "  SELECT 1 FROM organization_members m1 "
-                "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
-                "  WHERE m1.user_id = s.user_id AND m2.user_id = $2))",
-                remoteConnectionId,
-                userId
-            );
-            if (remoteRows.empty()) {
+            if (!isSshConnectionAccessible(txn, remoteConnectionId, userId, targetOrgId, isPersonalProject)) {
                 Json::Value err; err["error"] = "Remote execution connection not found";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k404NotFound);
@@ -1558,19 +1612,7 @@ void ProjectController::createProject(
                 callback(resp); return;
             }
             if (!envConfig.remoteConnectionId.empty()) {
-                auto envRemoteRows = txn.exec_params(
-                    // Org-visible, not owner-only. The deploy path already resolves this
-                // connection with no user gate, so refusing a teammate here
-                // produced a project they could deploy but not edit.
-                "SELECT s.id FROM ssh_connections s "
-                "WHERE s.id = $1 AND (s.user_id = $2 OR EXISTS ("
-                "  SELECT 1 FROM organization_members m1 "
-                "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
-                "  WHERE m1.user_id = s.user_id AND m2.user_id = $2))",
-                    envConfig.remoteConnectionId,
-                    userId
-                );
-                if (envRemoteRows.empty()) {
+                if (!isSshConnectionAccessible(txn, envConfig.remoteConnectionId, userId, targetOrgId, isPersonalProject)) {
                     Json::Value err; err["error"] = "Environment remote execution connection not found";
                     auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                     resp->setStatusCode(drogon::k404NotFound);
@@ -1579,16 +1621,22 @@ void ProjectController::createProject(
             }
         }
 
+        if (!organizationId.empty()) {
+            if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kMember)) {
+                Json::Value err; err["error"] = "You do not have permission to create projects in this organization";
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+                resp->setStatusCode(drogon::k403Forbidden);
+                callback(resp); return;
+            }
+        }
+
         const std::string encryptedGithubPat = TokenCrypto::encrypt(githubPat);
 
         auto result = txn.exec_params(
-            "INSERT INTO projects (organization_id, user_id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, application_template_id, application_config) "
-            // New projects land in the caller's personal organization. A future
-            // "create in org X" flow would pass the id explicitly; until then this
-            // keeps organization_id NOT NULL satisfiable without a second round trip.
-            "VALUES ((SELECT o.id FROM organizations o JOIN organization_members m ON m.organization_id = o.id WHERE m.user_id = $1 AND o.is_personal LIMIT 1), $1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid, $8, $9, NULLIF($10, '')::uuid, $11, $12, $13, $14, $15, $16::jsonb) "
-            "RETURNING id, user_id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, application_template_id, application_config::text AS application_config, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, status, created_at",
-            userId, name, description, repoUrl, encryptedGithubPat, sourceType, sshConnectionId, sourcePath, executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled, applicationTemplateId, compactJson(applicationConfig)
+            "INSERT INTO projects (organization_id, user_id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, application_template_id, application_config, default_cluster_id) "
+            "VALUES (COALESCE(NULLIF($17, '')::uuid, (SELECT o.id FROM organizations o JOIN organization_members m ON m.organization_id = o.id WHERE m.user_id = $1 AND o.is_personal LIMIT 1)), $1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid, $8, $9, NULLIF($10, '')::uuid, $11, $12, $13, $14, $15, $16::jsonb, NULLIF($18, '')::uuid) "
+            "RETURNING id, user_id, organization_id, (SELECT o2.name FROM organizations o2 WHERE o2.id = projects.organization_id) AS organization_name, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, application_template_id, application_config::text AS application_config, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, default_cluster_id, status, created_at",
+            userId, name, description, repoUrl, encryptedGithubPat, sourceType, sshConnectionId, sourcePath, executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled, applicationTemplateId, compactJson(applicationConfig), organizationId, defaultClusterId
         );
         const std::string projectId = result[0]["id"].as<std::string>();
 
@@ -1689,13 +1737,31 @@ void ProjectController::listProjects(
         auto conn = db.getConnection();
         pqxx::work txn(*conn);
 
-        auto result = txn.exec_params(
-            "SELECT p.id, p.user_id, p.name, p.description, p.repo_url, p.github_pat, p.source_type, p.ssh_connection_id, p.source_path, "
-            "p.application_template_id, p.application_config::text AS application_config, "
-            "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.status, p.created_at, "
-            "(SELECT COUNT(*)::int FROM project_env_vars pe WHERE pe.project_id = p.id) AS env_var_count "
-            "FROM projects p WHERE has_project_access(p.id, $1) ORDER BY p.created_at DESC", userId
-        );
+        std::string orgFilter = req->getParameter("organization_id");
+        pqxx::result result;
+        if (!orgFilter.empty()) {
+            result = txn.exec_params(
+                "SELECT p.id, p.user_id, p.organization_id, COALESCE(o.name, '') AS organization_name, p.name, p.description, p.repo_url, p.github_pat, p.source_type, p.ssh_connection_id, p.source_path, "
+                "p.application_template_id, p.application_config::text AS application_config, "
+                "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.default_cluster_id, p.status, p.created_at, "
+                "(SELECT COUNT(*)::int FROM project_env_vars pe WHERE pe.project_id = p.id) AS env_var_count "
+                "FROM projects p "
+                "LEFT JOIN organizations o ON o.id = p.organization_id "
+                "WHERE has_project_access(p.id, $1) AND p.organization_id = $2::uuid "
+                "ORDER BY p.created_at DESC", userId, orgFilter
+            );
+        } else {
+            result = txn.exec_params(
+                "SELECT p.id, p.user_id, p.organization_id, COALESCE(o.name, '') AS organization_name, p.name, p.description, p.repo_url, p.github_pat, p.source_type, p.ssh_connection_id, p.source_path, "
+                "p.application_template_id, p.application_config::text AS application_config, "
+                "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.default_cluster_id, p.status, p.created_at, "
+                "(SELECT COUNT(*)::int FROM project_env_vars pe WHERE pe.project_id = p.id) AS env_var_count "
+                "FROM projects p "
+                "LEFT JOIN organizations o ON o.id = p.organization_id "
+                "WHERE has_project_access(p.id, $1) "
+                "ORDER BY p.created_at DESC", userId
+            );
+        }
         txn.commit();
 
         Json::Value projects(Json::arrayValue);
@@ -1736,11 +1802,13 @@ void ProjectController::getProject(
         pqxx::work txn(*conn);
 
         auto result = txn.exec_params(
-            "SELECT p.id, p.user_id, p.name, p.description, p.repo_url, p.github_pat, p.source_type, p.ssh_connection_id, p.source_path, "
+            "SELECT p.id, p.user_id, p.organization_id, COALESCE(o.name, '') AS organization_name, p.name, p.description, p.repo_url, p.github_pat, p.source_type, p.ssh_connection_id, p.source_path, "
             "p.application_template_id, p.application_config::text AS application_config, "
-            "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.status, p.created_at, p.updated_at, "
+            "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, p.default_cluster_id, p.status, p.created_at, p.updated_at, "
             "(SELECT COUNT(*)::int FROM project_env_vars pe WHERE pe.project_id = p.id) AS env_var_count "
-            "FROM projects p WHERE p.id = $1 AND has_project_access(p.id, $2)", id, userId
+            "FROM projects p "
+            "LEFT JOIN organizations o ON o.id = p.organization_id "
+            "WHERE p.id = $1 AND has_project_access(p.id, $2)", id, userId
         );
 
         if (result.empty()) {
@@ -1791,6 +1859,7 @@ void ProjectController::updateProject(
 
         std::string name = (*body).isMember("name") ? (*body)["name"].asString() : "";
         std::string description = (*body).isMember("description") ? (*body)["description"].asString() : "";
+        std::string targetOrgId = (*body).isMember("organization_id") ? trim((*body)["organization_id"].asString()) : "";
         std::string repoUrl = (*body).isMember("repo_url") ? (*body)["repo_url"].asString() : "";
         std::string githubPat = (*body).isMember("github_pat") ? (*body)["github_pat"].asString() : "";
         std::string sourceType = (*body).isMember("source_type") ? (*body)["source_type"].asString() : "";
@@ -1807,6 +1876,8 @@ void ProjectController::updateProject(
             : "";
         bool hasLocalHttpsEnabled = (*body).isMember("local_https_enabled");
         bool localHttpsEnabled = hasLocalHttpsEnabled && (*body)["local_https_enabled"].asBool();
+        bool hasDefaultClusterId = (*body).isMember("default_cluster_id");
+        std::string defaultClusterId = hasDefaultClusterId ? trim((*body)["default_cluster_id"].asString()) : "";
         const std::vector<BuildEnvVar> incomingEnvVars = parseEnvVars(*body);
         const std::string encryptedGithubPat = githubPat.empty() ? "" : TokenCrypto::encrypt(githubPat);
 
@@ -1861,9 +1932,10 @@ void ProjectController::updateProject(
         auto currentRows = txn.exec_params(
             "SELECT p.source_type, p.ssh_connection_id, p.source_path, p.repo_url, "
             "p.execution_mode, p.remote_connection_id, p.remote_runtime_type, p.remote_k8s_exposure, p.runtime_scheme, p.local_https_enabled, "
-            "p.application_template_id, u.github_access_token "
+            "p.application_template_id, p.default_cluster_id, p.organization_id, COALESCE(o.is_personal, false) AS is_personal, u.github_access_token "
             "FROM projects p "
             "JOIN users u ON p.user_id = u.id "
+            "LEFT JOIN organizations o ON o.id = p.organization_id "
             "WHERE p.id = $1 AND has_project_access(p.id, $2)",
             id,
             userId
@@ -1873,6 +1945,18 @@ void ProjectController::updateProject(
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
             resp->setStatusCode(drogon::k404NotFound);
             callback(resp); return;
+        }
+        std::string effectiveOrgId = currentRows[0]["organization_id"].is_null() ? "" : currentRows[0]["organization_id"].as<std::string>();
+        bool isPersonalProject = currentRows[0]["is_personal"].as<bool>();
+        if (!targetOrgId.empty()) {
+            effectiveOrgId = targetOrgId;
+            auto targetOrgRows = txn.exec_params(
+                "SELECT is_personal FROM organizations WHERE id = $1::uuid",
+                targetOrgId
+            );
+            if (!targetOrgRows.empty()) {
+                isPersonalProject = targetOrgRows[0]["is_personal"].as<bool>();
+            }
         }
         if (resolvedSourceType.empty()) {
             resolvedSourceType = currentRows[0]["source_type"].is_null() ? "github" : currentRows[0]["source_type"].as<std::string>();
@@ -1917,21 +2001,17 @@ void ProjectController::updateProject(
                 callback(resp); return;
             }
 
-            auto sshRows = txn.exec_params(
-                "SELECT id, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
-                "FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
-        "  SELECT 1 FROM organization_members m1 "
-        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
-        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
-                sshConnectionId,
-                userId
-            );
-            if (sshRows.empty()) {
+            if (!isSshConnectionAccessible(txn, sshConnectionId, userId, effectiveOrgId, isPersonalProject)) {
                 Json::Value err; err["error"] = "SSH connection not found";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k404NotFound);
                 callback(resp); return;
             }
+            auto sshRows = txn.exec_params(
+                "SELECT id, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
+                "FROM ssh_connections WHERE id = $1",
+                sshConnectionId
+            );
             sshConfig.connectionType = sshRows[0]["connection_type"].as<std::string>();
             sshConfig.host = sshRows[0]["host"].as<std::string>();
             sshConfig.port = sshRows[0]["port"].is_null() ? 22 : sshRows[0]["port"].as<int>();
@@ -2039,21 +2119,17 @@ void ProjectController::updateProject(
                 resp->setStatusCode(drogon::k400BadRequest);
                 callback(resp); return;
             }
-            auto remoteRows = txn.exec_params(
-                "SELECT id, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
-                "FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
-        "  SELECT 1 FROM organization_members m1 "
-        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
-        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
-                remoteConnectionId,
-                userId
-            );
-            if (remoteRows.empty()) {
+            if (!isSshConnectionAccessible(txn, remoteConnectionId, userId, effectiveOrgId, isPersonalProject)) {
                 Json::Value err; err["error"] = "Remote execution connection not found";
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
                 resp->setStatusCode(drogon::k404NotFound);
                 callback(resp); return;
             }
+            auto remoteRows = txn.exec_params(
+                "SELECT id, COALESCE(connection_type, 'ssh') AS connection_type, host, port, username, auth_type, password_encrypted, private_key_encrypted, known_hosts_entry "
+                "FROM ssh_connections WHERE id = $1",
+                remoteConnectionId
+            );
             remoteExecutionConfig.connectionType = remoteRows[0]["connection_type"].as<std::string>();
             remoteExecutionConfig.host = remoteRows[0]["host"].as<std::string>();
             remoteExecutionConfig.port = remoteRows[0]["port"].is_null() ? 22 : remoteRows[0]["port"].as<int>();
@@ -2132,10 +2208,20 @@ void ProjectController::updateProject(
             }
         }
 
+        if (!targetOrgId.empty()) {
+            if (!Authz::hasOrganizationRole(txn, targetOrgId, userId, roles::kAdmin)) {
+                Json::Value err; err["error"] = "You must be an admin or owner of the target organization to transfer this project";
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+                resp->setStatusCode(drogon::k403Forbidden);
+                callback(resp); return;
+            }
+        }
+
         auto result = txn.exec_params(
             "UPDATE projects SET "
             "name = COALESCE(NULLIF($1, ''), name), "
             "description = COALESCE(NULLIF($2, ''), description), "
+            "organization_id = COALESCE(NULLIF($16, '')::uuid, organization_id), "
             "repo_url = CASE "
             "    WHEN NULLIF($5, '') IN ('ssh', 'local', 'artifact') THEN '' "
             "    ELSE COALESCE(NULLIF($3, ''), repo_url) "
@@ -2161,11 +2247,16 @@ void ProjectController::updateProject(
             "remote_k8s_exposure = $13, "
             "runtime_scheme = $14, "
             "local_https_enabled = $15, "
+            "default_cluster_id = CASE "
+            "    WHEN $17 THEN NULLIF($18, '')::uuid "
+            "    ELSE default_cluster_id "
+            "END, "
             "updated_at = NOW() "
-            "WHERE id = $8 AND user_id = $9 "
-            "RETURNING id, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, status, updated_at",
+            "WHERE id = $8 AND has_project_access(id, $9, 'admin') "
+            "RETURNING id, user_id, organization_id, (SELECT o2.name FROM organizations o2 WHERE o2.id = projects.organization_id) AS organization_name, name, description, repo_url, github_pat, source_type, ssh_connection_id, source_path, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, local_https_enabled, default_cluster_id, status, updated_at",
             name, description, repoUrl, encryptedGithubPat, resolvedSourceType, sshConnectionId, sourcePath, id, userId,
-            executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled
+            executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme, localHttpsEnabled, targetOrgId,
+            hasDefaultClusterId, defaultClusterId
         );
 
         replaceProjectEnvVars(txn, id, plainEnvVars);
@@ -2279,7 +2370,7 @@ void ProjectController::deleteProject(
         {
             pqxx::work txn(*conn);
             auto projectRows = txn.exec_params(
-                "SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2)",
+                "SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2, 'admin')",
                 id,
                 userId
             );
@@ -2349,7 +2440,7 @@ void ProjectController::deleteProject(
 
         pqxx::work txn(*conn);
         auto result = txn.exec_params(
-            "DELETE FROM projects WHERE id = $1 AND has_project_access(id, $2) RETURNING id",
+            "DELETE FROM projects WHERE id = $1 AND has_project_access(id, $2, 'admin') RETURNING id",
             id, userId
         );
         txn.commit();

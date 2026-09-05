@@ -161,12 +161,11 @@ TEST(RunCommand, NeutralisesAHostileEnvValue) {
     EXPECT_FALSE(hasUnquotedMetacharacter(envArgs, ';'));
 }
 
-TEST(RunCommand, FlattensNewlinesInEnvValues) {
-    // A newline in a value would otherwise start a new shell command.
+TEST(RunCommand, PreservesNewlinesInEnvValues) {
+    // shellQuote preserves newlines inside single quotes so private keys and certificates are intact.
     const std::string cmd = LocalDockerRuntime::makeRunCommand(
-        "web", "img", 3000, {{"MULTILINE", "line1\nrm -rf /"}});
-    const std::string envPart = cmd.substr(cmd.find("--env"), 60);
-    EXPECT_NOT_CONTAINS(envPart, "\n");
+        "web", "img", 3000, {{"MULTILINE", "line1\nline2"}});
+    EXPECT_CONTAINS(cmd, "--env 'MULTILINE=line1\nline2'");
 }
 
 TEST(RunCommand, QuotesAHostileContainerName) {
@@ -189,6 +188,18 @@ TEST(RunCommand, BindsOnlyToLoopback) {
     // -p 127.0.0.1:: rather than -p ::  — a deployed container must not be
     // reachable from the network without an explicit exposure decision.
     EXPECT_CONTAINS(LocalDockerRuntime::makeRunCommand("web", "img", 3000, {}), "-p 127.0.0.1::");
+}
+
+TEST(RunCommand, PollsReadinessBeforeReportingHealthy) {
+    const std::string cmd = LocalDockerRuntime::makeRunCommand("web", "nginx:1.25", 8080, {});
+    EXPECT_CONTAINS(cmd, "ready=0;");
+    EXPECT_CONTAINS(cmd, "for i in $(seq 1 45); do");
+    EXPECT_CONTAINS(cmd, "Container crashed on startup:");
+    EXPECT_CONTAINS(cmd, "docker logs --tail 50 \"$container\"");
+    EXPECT_CONTAINS(cmd, "curl -s -o /dev/null");
+    EXPECT_CONTAINS(cmd, "nc -z 127.0.0.1 \"$host_port\"");
+    EXPECT_CONTAINS(cmd, "__STACKPILOT_LOCAL_DOCKER_RUNNING__");
+    EXPECT_CONTAINS(cmd, "__STACKPILOT_LOCAL_DOCKER_PORT__=$host_port");
 }
 
 // ─── makePauseCommand ───────────────────────────────────────────

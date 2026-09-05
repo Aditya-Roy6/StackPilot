@@ -1,13 +1,17 @@
 "use client";
 
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+import Link from "next/link";
 import { useTheme } from "next-themes";
-import { Check, Laptop, Moon, Palette, Sun } from "lucide-react";
+import { Check, Laptop, Moon, Palette, Sparkles, Sun } from "lucide-react";
+import api from "@/lib/api";
 
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { UI_THEME_META, useUiTheme, type UiTheme } from "@/lib/ui-theme";
+import { AppIcon, useIconSettings } from "@/lib/custom-icons";
 
 const MODES = [
   { value: "light", label: "Light", icon: Sun },
@@ -20,6 +24,7 @@ const subscribeNever = () => () => {};
 
 export function AppearanceSettings() {
   const [uiTheme, setUiTheme] = useUiTheme();
+  const [iconSettings, iconActions] = useIconSettings();
   const { theme, setTheme } = useTheme();
 
   // next-themes resolves the active mode only on the client, so the selected
@@ -29,11 +34,23 @@ export function AppearanceSettings() {
 
   const activeMode = theme === "light" || theme === "dark" || theme === "system" ? theme : "system";
 
+  useEffect(() => {
+    api
+      .get("/auth/preferences")
+      .then((res) => {
+        const mode = res.data?.color_mode;
+        if (mode && ["light", "dark", "system"].includes(mode) && mode !== theme) {
+          setTheme(mode);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   return (
     <Card>
       <CardHeader>
         <div className="flex items-center gap-2 text-foreground">
-          <Palette className="h-5 w-5 text-primary" />
+          <AppIcon name="palette" fallback={Palette} className="h-5 w-5 text-primary"  />
           <CardTitle>Appearance</CardTitle>
         </div>
         <CardDescription>
@@ -46,7 +63,7 @@ export function AppearanceSettings() {
         <div className="space-y-3">
           <div>
             <h4 className="text-sm font-medium text-foreground">Theme</h4>
-            <p className="text-xs text-muted-foreground">Applies instantly and is remembered on this device.</p>
+            <p className="text-xs text-muted-foreground">Applies instantly and is saved to your account across all devices.</p>
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -70,7 +87,7 @@ export function AppearanceSettings() {
                     // would otherwise paint over this badge. The ring keeps it
                     // legible against whichever colour sits under it.
                     <span className="absolute right-2 top-2 z-10 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground ring-2 ring-background">
-                      <Check className="h-3 w-3" />
+                      <AppIcon name="check" fallback={Check} className="h-3 w-3"  />
                     </span>
                   )}
 
@@ -125,14 +142,93 @@ export function AppearanceSettings() {
                   type="button"
                   variant={isActive ? "default" : "outline"}
                   size="sm"
-                  onClick={() => setTheme(mode.value)}
+                  onClick={() => {
+                    setTheme(mode.value);
+                    api.put("/auth/preferences", { color_mode: mode.value }).catch(() => {});
+                  }}
                   aria-pressed={isActive}
+                  className="gap-2"
                 >
-                  <Icon className="mr-2 h-4 w-4" />
-                  {mode.label}
+                  <AppIcon name={mode.value} fallback={Icon} size={16} className="h-4 w-4 shrink-0" />
+                  <span>{mode.label}</span>
                 </Button>
               );
             })}
+          </div>
+        </div>
+
+        {/* Icon Style & Customization */}
+        <div className="space-y-3 border-t border-border/60 pt-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h4 className="text-sm font-medium text-foreground">Icons & Symbols</h4>
+              <p className="text-xs text-muted-foreground">
+                Switch between standard Lucide icons and custom vector icons across the entire website.
+              </p>
+            </div>
+            <Link href="/change-icon">
+              <Button variant="outline" size="sm" className="gap-1.5 text-xs">
+                <AppIcon name="sparkles" fallback={Sparkles} className="h-3.5 w-3.5 text-primary"  />
+                <span>Open Icon Studio</span>
+              </Button>
+            </Link>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => iconActions.setMode("default")}
+              className={cn(
+                "flex flex-col gap-2 rounded-xl border p-4 text-left transition-all",
+                mounted && iconSettings.mode === "default"
+                  ? "border-primary bg-accent/40 ring-2 ring-primary/30"
+                  : "border-border hover:border-primary/40 hover:bg-accent/20"
+              )}
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-sm">Default Icons</span>
+                {mounted && iconSettings.mode === "default" && (
+                  <Badge variant="secondary" className="text-[10px]">Active</Badge>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">Standard clean Lucide stroke icons.</p>
+              <div className="mt-2 flex items-center gap-3 text-foreground">
+                <AppIcon name="layout-dashboard" size={18} forceMode="default" />
+                <AppIcon name="server" size={18} forceMode="default" />
+                <AppIcon name="activity" size={18} forceMode="default" />
+                <AppIcon name="star" size={18} forceMode="default" />
+                <AppIcon name="settings" size={18} forceMode="default" />
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => iconActions.setMode("custom")}
+              className={cn(
+                "flex flex-col gap-2 rounded-xl border p-4 text-left transition-all",
+                mounted && iconSettings.mode === "custom"
+                  ? "border-primary bg-primary/10 ring-2 ring-primary/30"
+                  : "border-border hover:border-primary/40 hover:bg-accent/20"
+              )}
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-sm flex items-center gap-1.5">
+                  <span>Custom Icons</span>
+                  <AppIcon name="sparkles" fallback={Sparkles} className="h-3.5 w-3.5 text-primary"  />
+                </span>
+                {mounted && iconSettings.mode === "custom" && (
+                  <Badge className="text-[10px]">Active</Badge>
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">Tailored duotone vector icons with active accents and custom SVG support.</p>
+              <div className="mt-2 flex items-center gap-3 text-primary">
+                <AppIcon name="layout-dashboard" size={18} forceMode="custom" />
+                <AppIcon name="server" size={18} forceMode="custom" />
+                <AppIcon name="activity" size={18} forceMode="custom" />
+                <AppIcon name="star" size={18} forceMode="custom" />
+                <AppIcon name="settings" size={18} forceMode="custom" />
+              </div>
+            </button>
           </div>
         </div>
       </CardContent>

@@ -5,13 +5,17 @@
 #include "OrganizationController.h"
 
 #include "../db/Database.h"
+#include "../services/EmailService.h"
 #include "../utils/AuditLogger.h"
 #include "../utils/Authz.h"
 #include "../utils/JwtHelper.h"
 #include "../utils/StringUtils.h"
 
+#include <iomanip>
 #include <json/json.h>
+#include <openssl/rand.h>
 #include <pqxx/pqxx>
+#include <sstream>
 #include <spdlog/spdlog.h>
 
 namespace stackpilot {
@@ -45,6 +49,18 @@ std::string requireUser(const drogon::HttpRequestPtr& req,
         return "";
     }
     return payload["user_id"].asString();
+}
+
+std::string generateRandomToken(size_t bytes = 32) {
+    std::vector<unsigned char> buf(bytes);
+    if (RAND_bytes(buf.data(), static_cast<int>(bytes)) != 1) {
+        return drogon::utils::getUuid();
+    }
+    std::ostringstream ss;
+    for (unsigned char b : buf) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
+    }
+    return ss.str();
 }
 
 Json::Value organizationRowToJson(const pqxx::row& row) {
@@ -128,8 +144,6 @@ void OrganizationController::createOrganization(const drogon::HttpRequestPtr& re
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
 
-        // Slug collisions are resolved by suffixing rather than rejected: the
-        // user picked a display name, not an identifier.
         std::string slug = slugify(name);
         const auto taken = txn.exec_params(
             "SELECT COUNT(*)::int FROM organizations WHERE slug = $1 OR slug LIKE $1 || '-%'", slug);
@@ -172,6 +186,119 @@ void OrganizationController::createOrganization(const drogon::HttpRequestPtr& re
     }
 }
 
+void OrganizationController::updateOrganization(const drogon::HttpRequestPtr& req,
+                                                std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                                std::string organizationId) {
+    const std::string userId = requireUser(req, callback);
+    if (userId.empty()) return;
+
+    const auto body = req->getJsonObject();
+    if (!body) {
+        sendError(callback, drogon::k400BadRequest, "Invalid JSON body");
+        return;
+    }
+    const std::string name = trim((*body)["name"].asString());
+    if (name.empty() || name.size() > 120) {
+        sendError(callback, drogon::k400BadRequest, "Organization name is required (max 120 characters)");
+        return;
+    }
+
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+
+        if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kAdmin)) {
+            sendError(callback, drogon::k403Forbidden, "Only admins and owners can update organization settings");
+            return;
+        }
+
+        const auto orgRow = txn.exec_params(
+            "SELECT is_personal FROM organizations WHERE id = $1", organizationId);
+        if (orgRow.empty()) {
+            sendError(callback, drogon::k404NotFound, "Organization not found");
+            return;
+        }
+        if (orgRow[0]["is_personal"].as<bool>()) {
+            sendError(callback, drogon::k400BadRequest, "Personal workspaces cannot be renamed");
+            return;
+        }
+
+        std::string slug = slugify(name);
+        const auto taken = txn.exec_params(
+            "SELECT COUNT(*)::int FROM organizations WHERE (slug = $1 OR slug LIKE $1 || '-%') AND id != $2",
+            slug, organizationId);
+        const int collisions = taken[0][0].as<int>();
+        if (collisions > 0) {
+            slug += "-" + std::to_string(collisions + 1);
+        }
+
+        txn.exec_params(
+            "UPDATE organizations SET name = $1, slug = $2, updated_at = NOW() WHERE id = $3",
+            name, slug, organizationId);
+        txn.commit();
+
+        Json::Value meta;
+        meta["id"] = organizationId;
+        meta["name"] = name;
+        meta["slug"] = slug;
+        AuditLogger::recordFromRequest(req, userId, "organization.update", "organization", organizationId, meta);
+
+        Json::Value payload;
+        payload["message"] = "Organization updated";
+        payload["organization"] = meta;
+        sendJson(callback, payload);
+    } catch (const std::exception& e) {
+        spdlog::error("updateOrganization failed: {}", e.what());
+        sendError(callback, drogon::k500InternalServerError, "Failed to update organization");
+    }
+}
+
+void OrganizationController::deleteOrganization(const drogon::HttpRequestPtr& req,
+                                                std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                                std::string organizationId) {
+    const std::string userId = requireUser(req, callback);
+    if (userId.empty()) return;
+
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+
+        if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kOwner)) {
+            sendError(callback, drogon::k403Forbidden, "Only the owner can delete an organization");
+            return;
+        }
+
+        const auto orgRow = txn.exec_params(
+            "SELECT name, is_personal FROM organizations WHERE id = $1", organizationId);
+        if (orgRow.empty()) {
+            sendError(callback, drogon::k404NotFound, "Organization not found");
+            return;
+        }
+        if (orgRow[0]["is_personal"].as<bool>()) {
+            sendError(callback, drogon::k400BadRequest, "Personal workspaces cannot be deleted");
+            return;
+        }
+
+        const std::string orgName = orgRow[0]["name"].as<std::string>();
+
+        txn.exec_params("DELETE FROM projects WHERE organization_id = $1", organizationId);
+        txn.exec_params("DELETE FROM organizations WHERE id = $1", organizationId);
+        txn.commit();
+
+        Json::Value meta;
+        meta["id"] = organizationId;
+        meta["name"] = orgName;
+        AuditLogger::recordFromRequest(req, userId, "organization.delete", "organization", organizationId, meta);
+
+        Json::Value payload;
+        payload["message"] = "Organization deleted successfully";
+        sendJson(callback, payload);
+    } catch (const std::exception& e) {
+        spdlog::error("deleteOrganization failed: {}", e.what());
+        sendError(callback, drogon::k500InternalServerError, "Failed to delete organization");
+    }
+}
+
 void OrganizationController::listMembers(const drogon::HttpRequestPtr& req,
                                          std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                          std::string organizationId) {
@@ -182,8 +309,6 @@ void OrganizationController::listMembers(const drogon::HttpRequestPtr& req,
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
 
-        // Any member may see the roster; knowing who else is on the team is
-        // not privileged, and hiding it makes the UI unusable for viewers.
         if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kViewer)) {
             sendError(callback, drogon::k404NotFound, "Organization not found");
             return;
@@ -249,8 +374,6 @@ void OrganizationController::addMember(const drogon::HttpRequestPtr& req,
         pqxx::work txn(*conn);
 
         if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kAdmin)) {
-            // 404 rather than 403 for a non-member: whether an organization
-            // exists is not information a stranger should be able to probe.
             const bool isMember = Authz::hasOrganizationRole(txn, organizationId, userId, roles::kViewer);
             sendError(callback,
                       isMember ? drogon::k403Forbidden : drogon::k404NotFound,
@@ -258,7 +381,6 @@ void OrganizationController::addMember(const drogon::HttpRequestPtr& req,
             return;
         }
 
-        // Granting a role above your own would be a privilege escalation.
         const std::string callerRole = Authz::organizationRole(txn, organizationId, userId);
         if (Authz::roleRank(role) > Authz::roleRank(callerRole)) {
             sendError(callback, drogon::k403Forbidden, "You cannot grant a role higher than your own");
@@ -273,32 +395,48 @@ void OrganizationController::addMember(const drogon::HttpRequestPtr& req,
             return;
         }
 
-        const auto found = txn.exec_params("SELECT id FROM users WHERE LOWER(email) = $1", email);
-        if (found.empty()) {
-            // Deliberately explicit. The alternative is a silent no-op that
-            // looks like success, and the admin never learns the invite failed.
-            sendError(callback, drogon::k404NotFound, "No account exists with that email address");
-            return;
-        }
-        const std::string memberId = found[0][0].as<std::string>();
+        const auto orgRow = txn.exec_params("SELECT name FROM organizations WHERE id = $1", organizationId);
+        const std::string orgName = orgRow.empty() ? "Organization" : orgRow[0][0].as<std::string>();
+        const auto userRow = txn.exec_params("SELECT username, COALESCE(full_name, username) FROM users WHERE id = $1", userId);
+        const std::string inviterName = userRow.empty() ? "A team administrator" : userRow[0][1].as<std::string>();
 
+        const auto found = txn.exec_params("SELECT id FROM users WHERE LOWER(email) = $1", email);
+        if (!found.empty()) {
+            const std::string memberId = found[0][0].as<std::string>();
+            const auto existingMember = txn.exec_params(
+                "SELECT role FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+                organizationId, memberId
+            );
+            if (!existingMember.empty()) {
+                sendError(callback, drogon::k400BadRequest, "User is already a member of this organization");
+                return;
+            }
+        }
+
+        const std::string token = generateRandomToken(32);
         txn.exec_params(
-            "INSERT INTO organization_members (organization_id, user_id, role, invited_by) "
-            "VALUES ($1, $2, $3, $4) "
-            "ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role",
-            organizationId, memberId, role, userId
+            "INSERT INTO organization_invitations (organization_id, email, role, token, invited_by, expires_at) "
+            "VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '7 days') "
+            "ON CONFLICT (organization_id, email) DO UPDATE "
+            "SET role = EXCLUDED.role, token = EXCLUDED.token, expires_at = NOW() + INTERVAL '7 days'",
+            organizationId, email, role, token, userId
         );
         txn.commit();
 
-        Json::Value meta;
-        meta["organization_id"] = organizationId;
-        meta["member_user_id"] = memberId;
-        meta["role"] = role;
-        AuditLogger::recordFromRequest(req, userId, "organization.member.add", "organization", organizationId, meta);
+        const std::string frontendUrl = strings::trim(std::getenv("FRONTEND_PUBLIC_URL") ? std::getenv("FRONTEND_PUBLIC_URL") : "http://localhost:3000");
+        const std::string inviteUrl = frontendUrl + "/invite/" + token;
+        std::thread([email, inviterName, orgName, role, inviteUrl]() {
+            try {
+                EmailService::sendOrganizationInvitation(email, inviterName, orgName, role, inviteUrl);
+            } catch (const std::exception& e) {
+                spdlog::warn("Failed to send invitation email to {}: {}", email, e.what());
+            }
+        }).detach();
 
         Json::Value payload;
-        payload["message"] = "Member added";
-        payload["member"] = meta;
+        payload["message"] = "Invitation sent to " + email + ".";
+        payload["invited"] = true;
+        payload["token"] = token;
         sendJson(callback, payload, drogon::k201Created);
     } catch (const std::exception& e) {
         spdlog::error("addMember failed: {}", e.what());
@@ -339,15 +477,12 @@ void OrganizationController::updateMemberRole(const drogon::HttpRequestPtr& req,
             sendError(callback, drogon::k404NotFound, "That user is not a member of this organization");
             return;
         }
-        // An admin must not be able to demote an owner, nor promote anyone
-        // past their own level.
         if (Authz::roleRank(targetRole) > Authz::roleRank(callerRole) ||
             Authz::roleRank(role) > Authz::roleRank(callerRole)) {
             sendError(callback, drogon::k403Forbidden, "You cannot change a role at or above your own level");
             return;
         }
 
-        // Removing the last owner would leave the organization unmanageable.
         if (targetRole == roles::kOwner && role != roles::kOwner) {
             const auto owners = txn.exec_params(
                 "SELECT COUNT(*)::int FROM organization_members WHERE organization_id = $1 AND role = 'owner'",
@@ -393,7 +528,6 @@ void OrganizationController::removeMember(const drogon::HttpRequestPtr& req,
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
 
-        // Leaving is always allowed; removing someone else needs admin.
         const bool isSelf = (memberUserId == userId);
         if (!isSelf && !Authz::hasOrganizationRole(txn, organizationId, userId, roles::kAdmin)) {
             sendError(callback, drogon::k403Forbidden, "Only admins and owners can remove members");
@@ -454,6 +588,189 @@ void OrganizationController::removeMember(const drogon::HttpRequestPtr& req,
     } catch (const std::exception& e) {
         spdlog::error("removeMember failed: {}", e.what());
         sendError(callback, drogon::k500InternalServerError, "Failed to remove member");
+    }
+}
+
+void OrganizationController::listInvitations(const drogon::HttpRequestPtr& req,
+                                             std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                             std::string organizationId) {
+    const std::string userId = requireUser(req, callback);
+    if (userId.empty()) return;
+
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+
+        if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kAdmin)) {
+            sendError(callback, drogon::k403Forbidden, "Only admins and owners can view pending invitations");
+            return;
+        }
+
+        const auto rows = txn.exec_params(
+            "SELECT i.id, i.organization_id, i.email, i.role, i.token, i.created_at::text AS created_at, "
+            "i.expires_at::text AS expires_at, (i.expires_at < NOW()) AS is_expired, "
+            "u.username AS inviter_username "
+            "FROM organization_invitations i "
+            "LEFT JOIN users u ON u.id = i.invited_by "
+            "WHERE i.organization_id = $1 "
+            "ORDER BY i.created_at DESC",
+            organizationId
+        );
+        txn.commit();
+
+        Json::Value list(Json::arrayValue);
+        for (const auto& row : rows) {
+            Json::Value inv(Json::objectValue);
+            inv["id"] = row["id"].as<std::string>();
+            inv["organization_id"] = row["organization_id"].as<std::string>();
+            inv["email"] = row["email"].as<std::string>();
+            inv["role"] = row["role"].as<std::string>();
+            inv["token"] = row["token"].as<std::string>();
+            inv["created_at"] = row["created_at"].as<std::string>();
+            inv["expires_at"] = row["expires_at"].as<std::string>();
+            inv["is_expired"] = row["is_expired"].as<bool>();
+            inv["inviter_username"] = row["inviter_username"].is_null() ? "" : row["inviter_username"].as<std::string>();
+            list.append(inv);
+        }
+
+        Json::Value payload;
+        payload["invitations"] = list;
+        sendJson(callback, payload);
+    } catch (const std::exception& e) {
+        spdlog::error("listInvitations failed: {}", e.what());
+        sendError(callback, drogon::k500InternalServerError, "Failed to load invitations");
+    }
+}
+
+void OrganizationController::createInvitation(const drogon::HttpRequestPtr& req,
+                                              std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                              std::string organizationId) {
+    addMember(req, std::move(callback), organizationId);
+}
+
+void OrganizationController::revokeInvitation(const drogon::HttpRequestPtr& req,
+                                              std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                              std::string organizationId,
+                                              std::string invitationId) {
+    const std::string userId = requireUser(req, callback);
+    if (userId.empty()) return;
+
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+
+        if (!Authz::hasOrganizationRole(txn, organizationId, userId, roles::kAdmin)) {
+            sendError(callback, drogon::k403Forbidden, "Only admins and owners can revoke invitations");
+            return;
+        }
+
+        txn.exec_params(
+            "DELETE FROM organization_invitations WHERE organization_id = $1 AND id = $2",
+            organizationId, invitationId
+        );
+        txn.commit();
+
+        Json::Value payload;
+        payload["message"] = "Invitation revoked";
+        sendJson(callback, payload);
+    } catch (const std::exception& e) {
+        spdlog::error("revokeInvitation failed: {}", e.what());
+        sendError(callback, drogon::k500InternalServerError, "Failed to revoke invitation");
+    }
+}
+
+void OrganizationController::getInviteInfo(const drogon::HttpRequestPtr&,
+                                           std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                           std::string token) {
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+
+        const auto rows = txn.exec_params(
+            "SELECT i.id, i.organization_id, i.email, i.role, i.expires_at::text AS expires_at, "
+            "o.name AS organization_name, o.slug AS organization_slug, "
+            "u.username AS inviter_username "
+            "FROM organization_invitations i "
+            "JOIN organizations o ON o.id = i.organization_id "
+            "LEFT JOIN users u ON u.id = i.invited_by "
+            "WHERE i.token = $1 AND i.expires_at > NOW()",
+            token
+        );
+        txn.commit();
+
+        if (rows.empty()) {
+            sendError(callback, drogon::k404NotFound, "Invitation not found or expired");
+            return;
+        }
+
+        Json::Value payload;
+        payload["valid"] = true;
+        payload["organization_id"] = rows[0]["organization_id"].as<std::string>();
+        payload["organization_name"] = rows[0]["organization_name"].as<std::string>();
+        payload["organization_slug"] = rows[0]["organization_slug"].as<std::string>();
+        payload["email"] = rows[0]["email"].as<std::string>();
+        payload["role"] = rows[0]["role"].as<std::string>();
+        payload["expires_at"] = rows[0]["expires_at"].as<std::string>();
+        payload["inviter_username"] = rows[0]["inviter_username"].is_null() ? "" : rows[0]["inviter_username"].as<std::string>();
+        sendJson(callback, payload);
+    } catch (const std::exception& e) {
+        spdlog::error("getInviteInfo failed: {}", e.what());
+        sendError(callback, drogon::k500InternalServerError, "Failed to retrieve invitation info");
+    }
+}
+
+void OrganizationController::joinOrganization(const drogon::HttpRequestPtr& req,
+                                              std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                              std::string token) {
+    const std::string userId = requireUser(req, callback);
+    if (userId.empty()) return;
+
+    try {
+        auto conn = Database::getInstance().getConnection();
+        pqxx::work txn(*conn);
+
+        const auto rows = txn.exec_params(
+            "SELECT i.id, i.organization_id, i.role, i.invited_by, o.name AS organization_name "
+            "FROM organization_invitations i "
+            "JOIN organizations o ON o.id = i.organization_id "
+            "WHERE i.token = $1 AND i.expires_at > NOW()",
+            token
+        );
+
+        if (rows.empty()) {
+            sendError(callback, drogon::k404NotFound, "Invitation not found or expired");
+            return;
+        }
+
+        const std::string orgId = rows[0]["organization_id"].as<std::string>();
+        const std::string role = rows[0]["role"].as<std::string>();
+        const std::string orgName = rows[0]["organization_name"].as<std::string>();
+        const std::string invitedBy = rows[0]["invited_by"].is_null() ? "" : rows[0]["invited_by"].as<std::string>();
+
+        txn.exec_params(
+            "INSERT INTO organization_members (organization_id, user_id, role, invited_by) "
+            "VALUES ($1, $2, $3, NULLIF($4, '')::uuid) "
+            "ON CONFLICT (organization_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+            orgId, userId, role, invitedBy
+        );
+
+        txn.exec_params("DELETE FROM organization_invitations WHERE token = $1", token);
+        txn.commit();
+
+        Json::Value meta;
+        meta["organization_id"] = orgId;
+        meta["role"] = role;
+        AuditLogger::recordFromRequest(req, userId, "organization.member.join", "organization", orgId, meta);
+
+        Json::Value payload;
+        payload["message"] = "Joined " + orgName + " successfully";
+        payload["organization_id"] = orgId;
+        payload["organization_name"] = orgName;
+        payload["role"] = role;
+        sendJson(callback, payload);
+    } catch (const std::exception& e) {
+        spdlog::error("joinOrganization failed: {}", e.what());
+        sendError(callback, drogon::k500InternalServerError, "Failed to join organization");
     }
 }
 

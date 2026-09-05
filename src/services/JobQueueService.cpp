@@ -370,9 +370,7 @@ std::string makeLocalDockerRunCommand(const std::string& containerName,
         if (!isValidRuntimeEnvKey(envVar.key)) {
             continue;
         }
-        std::string value = envVar.value;
-        std::replace(value.begin(), value.end(), '\n', ' ');
-        envArgs += " --env " + shellQuote(envVar.key + "=" + value);
+        envArgs += " --env " + shellQuote(envVar.key + "=" + envVar.value);
     }
 
     const std::string container = shellQuote(containerName);
@@ -390,14 +388,47 @@ std::string makeLocalDockerRunCommand(const std::string& containerName,
         "container_port=$(docker image inspect --format '{{range $p, $_ := .Config.ExposedPorts}}{{println $p}}{{end}}' " + image + " 2>/dev/null | sed -n 's#/tcp$##p' | head -n 1); "
         "[ -n \"$container_port\" ] || container_port=3000; "
         "fi; "
+        "container=" + container + "; "
         "docker rm -f " + container + " >/dev/null 2>&1 || true; "
         "docker run -d --restart unless-stopped --name " + container + envArgs +
         " -p 127.0.0.1::$container_port " + image + " >/tmp/stackpilot-local-container-id; "
         "host_port=$(docker port " + container + " $container_port/tcp 2>/dev/null | awk -F: 'NF {print $NF; exit}'); "
         "[ -n \"$host_port\" ] || { echo __STACKPILOT_PORT_MISSING__; docker logs --tail 80 " + container + " || true; exit 13; }; "
-        "status=$(docker inspect --format '{{.State.Status}}' " + container + "); "
-        "running=$(docker inspect --format '{{.State.Running}}' " + container + "); "
+        "ready=0; "
+        "for i in $(seq 1 15); do "
+        "status=$(docker inspect --format '{{.State.Status}}' \"$container\" 2>/dev/null || echo \"exited\"); "
+        "if [ \"$status\" = \"exited\" ] || [ \"$status\" = \"dead\" ]; then "
+        "echo \"Container crashed on startup:\"; "
+        "docker logs --tail 50 \"$container\" 2>&1; "
+        "exit 1; "
+        "fi; "
+        "if [ -n \"$host_port\" ]; then "
+        "if curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$host_port/\" >/dev/null 2>&1 || "
+        "curl -s -o /dev/null -w \"%{http_code}\" \"http://host.docker.internal:$host_port/\" >/dev/null 2>&1 || "
+        "nc -z 127.0.0.1 \"$host_port\" >/dev/null 2>&1 || "
+        "[ \"$status\" = \"running\" ]; then "
+        "ready=1; "
+        "break; "
+        "fi; "
+        "else "
+        "if [ \"$status\" = \"running\" ]; then ready=1; break; fi; "
+        "fi; "
+        "sleep 1; "
+        "done; "
+        "status=$(docker inspect --format '{{.State.Status}}' \"$container\" 2>/dev/null || echo \"exited\"); "
+        "if [ \"$status\" = \"exited\" ] || [ \"$status\" = \"dead\" ]; then "
+        "echo \"Container crashed on startup:\"; "
+        "docker logs --tail 50 \"$container\" 2>&1; "
+        "exit 1; "
+        "fi; "
+        "if [ \"$ready\" -ne 1 ]; then "
+        "echo \"Container readiness probe failed or timed out:\"; "
+        "docker logs --tail 50 \"$container\" 2>&1 || true; "
+        "exit 1; "
+        "fi; "
+        "running=$(docker inspect --format '{{.State.Running}}' \"$container\" 2>/dev/null || echo \"true\"); "
         "echo __STACKPILOT_LOCAL_DOCKER_RUNNING__; "
+        "echo __STACKPILOT_LOCAL_DOCKER_PORT__=$host_port; "
         "echo container_name=" + containerName + "; "
         "echo container_port=$container_port; "
         "echo host_port=$host_port; "
@@ -406,7 +437,7 @@ std::string makeLocalDockerRunCommand(const std::string& containerName,
         "echo running=$running; "
         "echo image=" + imageName + "; "
         "echo __STACKPILOT_LOCAL_LOG_TAIL__; "
-        "docker logs --tail 80 " + container + " 2>&1 || true";
+        "docker logs --tail 80 \"$container\" 2>&1 || true";
 }
 
 struct GitHubCheckProbe {
@@ -647,16 +678,13 @@ void JobQueueService::recoverInterruptedJobs() {
     try {
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
-        // Only reclaim this instance's own jobs, plus jobs whose lock has gone
-        // stale. Reclaiming every running job meant a second backend instance
-        // (or a rolling restart) re-queued another instance's in-flight builds,
-        // producing two workers building the same deployment concurrently.
+        // On startup, only recover jobs locked by this worker's instance or jobs
+        // whose lock has expired (>15 minutes old). This prevents newly starting
+        // pods from stealing active jobs running on other pods in the cluster.
         txn.exec_params(
             "UPDATE deployment_jobs "
             "SET status = 'queued', locked_by = '', locked_at = NULL, next_run_at = NOW(), updated_at = NOW() "
-            "WHERE status = 'running' "
-            "  AND (locked_by = $1 OR locked_by = '' OR locked_by IS NULL "
-            "       OR locked_at IS NULL OR locked_at < NOW() - INTERVAL '15 minutes')",
+            "WHERE status = 'running' AND (locked_by = $1 OR locked_at < NOW() - INTERVAL '15 minutes')",
             workerId_
         );
         txn.exec(
@@ -665,7 +693,17 @@ void JobQueueService::recoverInterruptedJobs() {
             "logs = COALESCE(NULLIF(logs, ''), 'Deployment recovered from interrupted worker.') "
             "       || E'\\nDeployment re-queued after backend restart.\\n', "
             "updated_at = NOW() "
-            "WHERE status = 'building' AND job_id IS NOT NULL"
+            "WHERE status = 'building' AND job_id IN ("
+            "    SELECT id FROM deployment_jobs WHERE status = 'queued' AND (locked_by = '' OR locked_by IS NULL)"
+            ")"
+        );
+        txn.exec(
+            "UPDATE deployments "
+            "SET status = 'failed', "
+            "    logs = COALESCE(NULLIF(logs, ''), '') "
+            "           || E'\\nDeployment interrupted: backend restarted while deployment was in progress.\\n', "
+            "    updated_at = NOW() "
+            "WHERE status = 'deploying' AND updated_at < NOW() - INTERVAL '3 minutes'"
         );
         txn.commit();
     } catch (const std::exception& e) {
@@ -778,6 +816,7 @@ void JobQueueService::workerLoop(int workerIndex) {
             std::optional<std::string> redisJobId = popRedisJob(5);
             auto job = redisJobId ? claimJob(*redisJobId) : claimNextDbJob();
             if (!job) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                 continue;
             }
             executeDeploymentBuildJob(*job);
@@ -837,7 +876,7 @@ void JobQueueService::failJob(const DeploymentJobRecord& job, const std::string&
         txn.exec_params(
             "UPDATE deployment_jobs "
             "SET status = 'failed', last_error = $2, completed_at = NOW(), locked_by = '', locked_at = NULL, updated_at = NOW() "
-            "WHERE id = $1",
+            "WHERE id = $1 AND status <> 'canceled'",
             job.id,
             error
         );
@@ -1241,7 +1280,46 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
         KubernetesRuntimeInfo localK8sRuntime;
         bool hasRemoteK8sRuntime = false;
         bool hasLocalK8sRuntime = false;
-        if (executionMode == "remote_host") {
+
+        // Check if this is an AI repair rebuild (skip re-clone, use modified source)
+        bool isAiRepair = false;
+        try {
+            auto metaConn = Database::getInstance().getConnection();
+            pqxx::work metaTxn(*metaConn);
+            auto metaRows = metaTxn.exec_params(
+                "SELECT COALESCE(dj.metadata->>'ai_repair', 'false') AS ai_repair, "
+                "COALESCE(d.trigger_source, '') AS trigger_source "
+                "FROM deployment_jobs dj "
+                "LEFT JOIN deployments d ON d.id = dj.deployment_id "
+                "WHERE dj.id = $1",
+                job.id);
+            metaTxn.commit();
+            if (!metaRows.empty()) {
+                std::string flag = metaRows[0]["ai_repair"].as<std::string>();
+                std::string trig = metaRows[0]["trigger_source"].as<std::string>();
+                if (flag == "true" || trig == "ai_repair") {
+                    isAiRepair = true;
+                }
+            }
+        } catch (const std::exception& e) {
+            spdlog::warn("Job {}: failed to query ai_repair metadata: {}", job.id, e.what());
+        }
+
+        if (isAiRepair) {
+            const std::filesystem::path deploymentDir = std::filesystem::path("uploads/builds") / job.deploymentId;
+            const std::filesystem::path aiSourceDir = deploymentDir / "source";
+            const std::filesystem::path aiLogFile = deploymentDir / "build.log";
+            if (std::filesystem::exists(aiSourceDir)) {
+                logSink("AI Repair: Rebuilding from modified source (no re-clone)");
+                buildResult = buildService.buildFromPreparedSource(
+                    job.deploymentId, aiSourceDir, aiLogFile, version, envVars, logSink);
+            } else {
+                logSink("AI Repair: Source directory not found, falling back to normal build");
+                isAiRepair = false; // fall through to normal dispatch
+            }
+        }
+
+        if (!isAiRepair && executionMode == "remote_host") {
             if (sourceType == "github") {
                 buildResult = buildService.buildRepositoryAndRunOnRemoteDocker(
                     job.deploymentId,
@@ -1371,7 +1449,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                         : remoteK8sRuntime.error;
                 }
             }
-        } else if (sourceType == "ssh") {
+        } else if (!isAiRepair && sourceType == "ssh") {
             buildResult = buildService.buildFromSshSource(
                 job.deploymentId,
                 sshConfig,
@@ -1380,7 +1458,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 envVars,
                 logSink
             );
-        } else if (sourceType == "local") {
+        } else if (!isAiRepair && sourceType == "local") {
             buildResult = buildService.buildFromLocalSource(
                 job.deploymentId,
                 sourcePath,
@@ -1388,7 +1466,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 envVars,
                 logSink
             );
-        } else if (sourceType == "artifact") {
+        } else if (!isAiRepair && sourceType == "artifact") {
             buildResult = buildService.buildFromArtifact(
                 job.deploymentId,
                 artifactStoragePath,
@@ -1396,7 +1474,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 envVars,
                 logSink
             );
-        } else if (sourceType == "application") {
+        } else if (!isAiRepair && sourceType == "application") {
             auto generatedSource = ApplicationCatalog::materializeSource(
                 job.deploymentId,
                 projectName,
@@ -1412,7 +1490,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 envVars,
                 logSink
             );
-        } else {
+        } else if (!isAiRepair) {
             buildResult = buildService.buildFromRepository(
                 job.deploymentId,
                 repoUrl,
@@ -1723,12 +1801,16 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
             }
             updateTxn.exec_params(
                 "UPDATE deployments "
-                "SET status = 'failed', logs = $1, artifact_available = FALSE, updated_at = NOW() "
-                "WHERE id = $2",
+                "SET status = 'failed', logs = $1, remote_container_name = COALESCE(NULLIF($2, ''), remote_container_name), artifact_available = FALSE, updated_at = NOW() "
+                "WHERE id = $3 AND status <> 'canceled'",
                 failureLogs,
+                buildResult.remoteContainerName,
                 job.deploymentId
             );
-            LogWebSocketController::broadcastStatus(job.deploymentId, "failed");
+            auto statusCheck = updateTxn.exec_params("SELECT status FROM deployments WHERE id = $1", job.deploymentId);
+            if (!statusCheck.empty() && statusCheck[0][0].as<std::string>() == "failed") {
+                LogWebSocketController::broadcastStatus(job.deploymentId, "failed");
+            }
         }
         updateTxn.commit();
         DeploymentJournal::broadcastSummary(job.deploymentId);

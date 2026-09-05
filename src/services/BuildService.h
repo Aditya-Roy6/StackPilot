@@ -9,6 +9,10 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <sys/types.h>
 
 namespace stackpilot {
 
@@ -37,7 +41,11 @@ typedef std::function<void(const std::string&)> LogCallback;
 
 class BuildService {
 public:
+    static BuildService& getInstance();
     BuildService();
+
+    bool cancelBuild(const std::string& deploymentId);
+    bool isBuildCanceled(const std::string& deploymentId) const;
 
     BuildResult buildFromRepository(const std::string& deploymentId,
                                     const std::string& repoUrl,
@@ -107,6 +115,13 @@ public:
                                                          const std::vector<BuildEnvVar>& envVars = {},
                                                          LogCallback onLogLine = nullptr) const;
 
+    BuildResult buildFromPreparedSource(const std::string& deploymentId,
+                                        const std::filesystem::path& sourceDir,
+                                        const std::filesystem::path& logFile,
+                                        const std::string& version,
+                                        const std::vector<BuildEnvVar>& envVars = {},
+                                        LogCallback onLogLine = nullptr) const;
+
 private:
     std::filesystem::path workspaceRoot_;
     int maxLogBytes_;
@@ -129,7 +144,8 @@ private:
                           const std::filesystem::path& outputFile,
                           bool append,
                           int timeoutSeconds,
-                          LogCallback onLogLine = nullptr) const;
+                          LogCallback onLogLine = nullptr,
+                          const std::string& deploymentId = "") const;
 
     Json::Value collectSourceContext(const std::filesystem::path& sourceDir) const;
     bool tryGenerateDockerfileWithAi(const std::filesystem::path& sourceDir,
@@ -140,12 +156,10 @@ private:
                           const std::filesystem::path& logFile,
                           std::string& reason,
                           LogCallback onLogLine) const;
-    BuildResult buildFromPreparedSource(const std::string& deploymentId,
-                                        const std::filesystem::path& sourceDir,
-                                        const std::filesystem::path& logFile,
-                                        const std::string& version,
-                                        const std::vector<BuildEnvVar>& envVars,
-                                        LogCallback onLogLine) const;
+
+    static std::mutex buildPidsMutex_;
+    static std::unordered_map<std::string, pid_t> activeBuildPids_;
+    static std::unordered_set<std::string> canceledBuilds_;
 };
 
 } // namespace stackpilot

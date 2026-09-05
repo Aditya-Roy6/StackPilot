@@ -11,6 +11,7 @@ import {
   RefreshCw,
   Trash2,
 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 
 import api from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -77,7 +78,7 @@ export default function AiHistoryPage() {
         <div className="flex min-w-0 items-center gap-3">
           <Link href="/dashboard/ai">
             <Button variant="ghost" size="icon" className="h-9 w-9">
-              <ArrowLeft className="h-4 w-4" />
+              <AppIcon name="arrow-left" fallback={ArrowLeft} className="h-4 w-4"  />
             </Button>
           </Link>
           <div className="min-w-0">
@@ -87,12 +88,12 @@ export default function AiHistoryPage() {
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" onClick={() => sessionsQuery.refetch()} disabled={sessionsQuery.isFetching}>
-            {sessionsQuery.isFetching ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            {sessionsQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-4 w-4"  />}
             Refresh
           </Button>
           <Link href="/dashboard/ai">
             <Button size="sm">
-              <Plus className="h-4 w-4" />
+              <AppIcon name="plus" fallback={Plus} className="h-4 w-4"  />
               New chat
             </Button>
           </Link>
@@ -102,21 +103,21 @@ export default function AiHistoryPage() {
       <div className="grid gap-4 sm:grid-cols-3">
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <MessageSquare className="h-4 w-4" />
+            <AppIcon name="message-square" fallback={MessageSquare} className="h-4 w-4"  />
             Chats
           </div>
           <p className="mt-2 text-3xl font-semibold">{sessions.length}</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Clock className="h-4 w-4" />
+            <AppIcon name="clock" fallback={Clock} className="h-4 w-4"  />
             Messages
           </div>
           <p className="mt-2 text-3xl font-semibold">{totalMessages}</p>
         </div>
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <MessageSquare className="h-4 w-4" />
+            <AppIcon name="message-square" fallback={MessageSquare} className="h-4 w-4"  />
             Memory
           </div>
           <p className="mt-2 text-3xl font-semibold">{rememberedChats}</p>
@@ -126,12 +127,12 @@ export default function AiHistoryPage() {
 
       {sessionsQuery.isLoading || (sessionsQuery.isFetching && !sessionsQuery.isFetchedAfterMount) ? (
         <div className="flex items-center justify-center rounded-xl border border-border bg-card py-20 text-muted-foreground">
-          <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+          <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-5 w-5 animate-spin"  />
           Loading conversations...
         </div>
       ) : sessions.length === 0 ? (
         <div className="rounded-xl border border-dashed border-border bg-card p-14 text-center">
-          <MessageSquare className="mx-auto h-9 w-9 text-muted-foreground/60" />
+          <AppIcon name="message-square" fallback={MessageSquare} className="mx-auto h-9 w-9 text-muted-foreground/60"  />
           <p className="mt-4 text-sm text-muted-foreground">No chats yet. Start a conversation with the agent.</p>
           <Link href="/dashboard/ai">
             <Button className="mt-5" variant="outline">
@@ -170,7 +171,7 @@ export default function AiHistoryPage() {
                     disabled={deleteSessionMutation.isPending}
                     onClick={() => deleteSessionMutation.mutate(session.id)}
                   >
-                    <Trash2 className="h-4 w-4" />
+                    <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
                   </Button>
                 </div>
               </div>

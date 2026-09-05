@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <functional>
 #include <vector>
+#include <chrono>
 
 namespace stackpilot {
 
@@ -48,6 +49,11 @@ public:
     // Released automatically when the handle goes out of scope.
     ConnectionHandle getConnection();
 
+    // ─── Active ping check ──────────────────────────────────
+    // Executes SELECT 1 with a connection from the pool. Result is cached
+    // for 2 seconds to avoid overloading PostgreSQL on frequent health probes.
+    bool ping();
+
     // ─── Check if connected ─────────────────────────────────
     bool isConnected() const { return m_initialized; }
 
@@ -64,6 +70,10 @@ private:
     std::string m_connString;
     bool m_initialized = false;
     std::mutex m_mutex;  // Thread safety for initialization
+
+    std::mutex m_pingMutex;
+    std::chrono::steady_clock::time_point m_lastPingTime;
+    bool m_lastPingResult = false;
 
     // ─── Connection pool ────────────────────────────────────
     std::vector<std::unique_ptr<pqxx::connection>> m_idle;

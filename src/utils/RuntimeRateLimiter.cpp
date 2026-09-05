@@ -33,13 +33,16 @@ std::string RuntimeRateLimiter::clientAddress(const drogon::HttpRequestPtr& req)
         return "unknown";
     }
 
-    const std::string forwarded = trim(req->getHeader("X-Forwarded-For"));
-    if (!forwarded.empty()) {
-        const auto comma = forwarded.find(',');
-        return toLower(trim(forwarded.substr(0, comma)));
+    const std::string peerIp = toLower(req->peerAddr().toIp());
+    if (strings::isTrustedProxy(peerIp)) {
+        const std::string forwarded = trim(req->getHeader("X-Forwarded-For"));
+        if (!forwarded.empty()) {
+            const auto comma = forwarded.find(',');
+            return toLower(trim(forwarded.substr(0, comma)));
+        }
     }
 
-    return toLower(req->peerAddr().toIp());
+    return peerIp;
 }
 
 std::string RuntimeRateLimiter::makeKey(const std::string& scope,

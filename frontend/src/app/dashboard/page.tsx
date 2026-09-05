@@ -7,13 +7,16 @@ import { Badge } from "@/components/ui/badge";
 import { CreateProjectDialog } from "@/components/CreateProjectDialog";
 import { EditProjectDialog } from "@/components/EditProjectDialog";
 import { DeleteProjectDialog } from "@/components/DeleteProjectDialog";
-import { ExternalLink, Code2, Loader2, Play, CheckCircle, Clock, Server, Search, Boxes } from "lucide-react";
+import { useWorkspace } from "@/context/WorkspaceContext";
+import { Building2, ExternalLink, Code2, Loader2, Play, CheckCircle, Clock, Server, Search, Boxes } from "lucide-react";
 import Link from "next/link";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Input } from "@/components/ui/input";
+import { AppIcon } from "@/lib/custom-icons";
+import { toast } from "sonner";
 
 interface Project {
   id: string;
@@ -22,6 +25,8 @@ interface Project {
   repo_url: string;
   source_type: "github" | "ssh" | "local" | "application";
   source_path?: string;
+  organization_id?: string;
+  organization_name?: string;
   application_template_id?: string;
   application_config?: {
     template_name?: string;
@@ -72,13 +77,16 @@ function displayProjectName(project: Project) {
 export default function DashboardPage() {
   const router = useRouter();
   const queryClient = useQueryClient();
+  const { activeWorkspaceId, activeWorkspace } = useWorkspace();
   const [deployingId, setDeployingId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
 
   const { data, isLoading } = useQuery({
-    queryKey: ["projects"],
+    queryKey: ["projects", activeWorkspaceId],
     queryFn: async () => {
-      const res = await api.get("/projects");
+      const res = await api.get("/projects", {
+        params: activeWorkspaceId ? { organization_id: activeWorkspaceId } : undefined,
+      });
       return res.data;
     },
     refetchInterval: 5000, // Poll every 5 seconds
@@ -146,6 +154,9 @@ export default function DashboardPage() {
       router.push("/dashboard/deployments");
       queryClient.invalidateQueries({ queryKey: ["deployments"] });
     },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.error || "Deployment failed");
+    },
     onSettled: () => {
       setDeployingId(null);
     }
@@ -160,7 +171,7 @@ export default function DashboardPage() {
   if (isLoading) {
     return (
       <div className="flex h-64 items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        <AppIcon name="loader2" fallback={Loader2} className="h-8 w-8 animate-spin text-primary"  />
       </div>
     );
   }
@@ -176,12 +187,12 @@ export default function DashboardPage() {
         </div>
         <div className="flex items-center gap-3">
           <div className="relative w-64">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <AppIcon name="search" fallback={Search} size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <Input 
               placeholder="Search projects..." 
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="pl-9 bg-card"
+              className="pl-10 bg-card"
             />
           </div>
           <CreateProjectDialog />
@@ -191,7 +202,7 @@ export default function DashboardPage() {
       {projects.length === 0 ? (
         <Card className="border-dashed border-border/80 ring-0 flex flex-col items-center justify-center py-20 bg-card">
           <div className="w-12 h-12 bg-muted rounded-full flex items-center justify-center mb-4">
-            <Server className="w-6 h-6 text-muted-foreground" />
+            <AppIcon name="server" fallback={Server} size={24} className="w-6 h-6 text-muted-foreground" />
           </div>
           <CardTitle className="text-foreground">No projects yet</CardTitle>
           <CardDescription className="mb-6">Create your first project to start deploying.</CardDescription>
@@ -207,9 +218,11 @@ export default function DashboardPage() {
                     <CardTitle className="text-lg font-bold text-foreground group-hover:text-primary transition-colors">
                       {displayProjectName(project)}
                     </CardTitle>
-                    <div className="flex items-center text-xs text-muted-foreground">
-                      <Clock className="w-3.5 h-3.5 mr-1" />
-                      {new Date(project.created_at).toLocaleDateString()}
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <span className="flex items-center">
+                        <AppIcon name="clock" fallback={Clock} size={14} className="w-3.5 h-3.5 mr-1" />
+                        {new Date(project.created_at).toLocaleDateString()}
+                      </span>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
@@ -218,7 +231,7 @@ export default function DashboardPage() {
                     <DeleteProjectDialog projectId={project.id} projectName={project.name} />
                   </div>
                     <Badge variant="outline" className="bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30">
-                      <CheckCircle className="w-3 h-3 mr-1" />
+                      <AppIcon name="check-circle-2" fallback={CheckCircle} size={12} className="w-3 h-3 mr-1" />
                       Active
                     </Badge>
                   </div>
@@ -232,9 +245,9 @@ export default function DashboardPage() {
                 {projectSourceLabel(project) && (
                   <div className="flex items-center text-[11px] font-mono text-muted-foreground bg-muted/50 p-2 rounded border border-border/50 overflow-hidden">
                     {project.source_type === "application" ? (
-                      <Boxes className="h-3 w-3 mr-2 text-muted-foreground/70 flex-shrink-0" />
+                      <AppIcon name="boxes" fallback={Boxes} size={14} className="h-3.5 w-3.5 mr-2 text-muted-foreground/70 flex-shrink-0" />
                     ) : (
-                      <Code2 className="h-3 w-3 mr-2 text-muted-foreground/70 flex-shrink-0" />
+                      <AppIcon name="code-2" fallback={Code2} size={14} className="h-3.5 w-3.5 mr-2 text-muted-foreground/70 flex-shrink-0" />
                     )}
                     <span className="truncate">{projectSourceLabel(project)}</span>
                   </div>
@@ -253,7 +266,7 @@ export default function DashboardPage() {
                     "text-muted-foreground hover:text-foreground"
                   )}
                 >
-                  <ExternalLink className="h-4 w-4 mr-2" />
+                  <AppIcon name="external-link" fallback={ExternalLink} size={16} className="h-4 w-4 mr-2" />
                   Details
                 </Link>
                 
@@ -263,9 +276,9 @@ export default function DashboardPage() {
                   disabled={deployingId === project.id || !projectCanDeploy(project)}
                 >
                   {deployingId === project.id ? (
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    <AppIcon name="loader2" fallback={Loader2} className="w-4 h-4 mr-2 animate-spin"  />
                   ) : (
-                    <Play className="w-4 h-4 mr-2 fill-current" />
+                    <AppIcon name="play" fallback={Play} size={14} className="w-3.5 h-3.5 mr-2 fill-current" />
                   )}
                   {projectCanDeploy(project) ? "Deploy" : "Connect Source"}
                 </Button>

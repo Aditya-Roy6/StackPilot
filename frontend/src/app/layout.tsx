@@ -1,8 +1,10 @@
 import type { Metadata } from "next";
 import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
+import Script from "next/script";
 import "./globals.css";
 import Providers from "@/lib/providers";
 import { UI_THEME_INIT_SCRIPT } from "@/lib/ui-theme";
+import { ICON_INIT_SCRIPT } from "@/lib/custom-icons";
 import { Toaster } from "@/components/ui/sonner";
 
 const plusJakartaSans = Plus_Jakarta_Sans({
@@ -34,9 +36,13 @@ export default function RootLayout({
       suppressHydrationWarning
     >
       <head>
-        {/* Sets data-ui-theme before first paint so a non-default theme never
-            flashes the default palette. Mirrors how next-themes avoids FOUC. */}
-        <script dangerouslySetInnerHTML={{ __html: UI_THEME_INIT_SCRIPT }} />
+        <Script
+          id="stackpilot-theme-init"
+          strategy="beforeInteractive"
+          dangerouslySetInnerHTML={{
+            __html: `${UI_THEME_INIT_SCRIPT}\n${ICON_INIT_SCRIPT}`,
+          }}
+        />
       </head>
       <body className="min-h-full flex flex-col">
         <Providers>

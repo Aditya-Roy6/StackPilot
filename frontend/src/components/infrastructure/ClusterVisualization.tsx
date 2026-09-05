@@ -29,6 +29,7 @@ import {
   Square,
   type LucideIcon,
 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 import api from "@/lib/api";
@@ -962,7 +963,7 @@ export function ClusterVisualization() {
       setYamlResourceKey(resource.resource_key);
       setActionOutput("");
     },
-    onError: () => toast.error("Failed to load Kubernetes YAML"),
+    onError: (error: any) => toast.error(error.response?.data?.error || "Failed to load Kubernetes YAML"),
   });
 
   const inspectMutation = useMutation({
@@ -971,7 +972,7 @@ export function ClusterVisualization() {
       return response.data;
     },
     onSuccess: (data) => setActionOutput(data.output || JSON.stringify(data, null, 2)),
-    onError: () => toast.error("Inspect failed. Claim the resource first."),
+    onError: (error: any) => toast.error(error.response?.data?.error || "Inspect failed. Claim the resource first."),
   });
 
   const restartMutation = useMutation({
@@ -988,7 +989,7 @@ export function ClusterVisualization() {
       setActionOutput(data.output || data.status || "Restart requested");
       inventoryQuery.refetch();
     },
-    onError: () => toast.error("Restart failed. Claim the resource first."),
+    onError: (error: any) => toast.error(error.response?.data?.error || "Restart failed. Claim the resource first."),
   });
 
   const scaleMutation = useMutation({
@@ -1006,7 +1007,7 @@ export function ClusterVisualization() {
       setActionOutput(data.output || data.status || "Scale operation completed");
       inventoryQuery.refetch();
     },
-    onError: () => toast.error("Scale failed. Claim the deployment first."),
+    onError: (error: any) => toast.error(error.response?.data?.error || "Scale failed. Claim the deployment first."),
   });
 
   const dockerStateMutation = useMutation({
@@ -1024,7 +1025,7 @@ export function ClusterVisualization() {
       setActionOutput(data.output || data.status || "Docker action completed");
       inventoryQuery.refetch();
     },
-    onError: () => toast.error("Docker action failed. Claim the container first."),
+    onError: (error: any) => toast.error(error.response?.data?.error || "Docker action failed. Claim the container first."),
   });
 
   const nodeControlMutation = useMutation({
@@ -1043,7 +1044,7 @@ export function ClusterVisualization() {
       setActionOutput(data.output || data.status || "Node action completed");
       inventoryQuery.refetch();
     },
-    onError: () => toast.error("Node action failed. Claim the node first."),
+    onError: (error: any) => toast.error(error.response?.data?.error || "Node action failed. Claim the node first."),
   });
 
   const applyYamlMutation = useMutation({
@@ -1063,7 +1064,7 @@ export function ClusterVisualization() {
       setActionOutput([data.output, data.restart_output].filter(Boolean).join("\n\n"));
       inventoryQuery.refetch();
     },
-    onError: () => toast.error("YAML apply failed. Claim the resource first and check the manifest."),
+    onError: (error: any) => toast.error(error.response?.data?.error || "YAML apply failed. Claim the resource first and check the manifest."),
   });
 
   const generateYamlMutation = useMutation({
@@ -1157,7 +1158,7 @@ export function ClusterVisualization() {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div className="space-y-2">
           <div className="inline-flex items-center gap-2 rounded-full border border-border bg-muted/30 px-3 py-1 text-xs font-medium text-muted-foreground">
-            <Activity className="h-3.5 w-3.5" />
+            <AppIcon name="activity" fallback={Activity} className="h-3.5 w-3.5"  />
             Draggable topology and runtime signals
           </div>
           <h1 className="text-4xl font-extrabold tracking-tight">Visualization Layer</h1>
@@ -1180,11 +1181,11 @@ export function ClusterVisualization() {
             </SelectContent>
           </Select>
           <Button variant="outline" onClick={() => inventoryQuery.refetch()} disabled={inventoryQuery.isFetching}>
-            {inventoryQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+            {inventoryQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />}
             Refresh
           </Button>
           <Link href="/dashboard/logging-monitoring/infrastructure" className={buttonVariants({ variant: "outline" })}>
-            <Network className="mr-2 h-4 w-4" />
+            <AppIcon name="network" fallback={Network} className="mr-2 h-4 w-4"  />
             Open Monitor
           </Link>
         </div>
@@ -1216,7 +1217,7 @@ export function ClusterVisualization() {
             <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
               <div>
                 <CardTitle className="flex items-center gap-2">
-                  <Gauge className="h-5 w-5 text-primary" />
+                  <AppIcon name="gauge" fallback={Gauge} className="h-5 w-5 text-primary"  />
                   Cluster Graph
                 </CardTitle>
                 <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -1254,13 +1255,13 @@ export function ClusterVisualization() {
                 <Legend color={KIND_COLORS.container} label="Container" />
                 <div className="ml-0 flex items-center gap-1 rounded-lg border border-border bg-muted/20 p-1 xl:ml-2">
                   <Button size="icon-sm" variant="ghost" onClick={() => zoomBy(1.15)} title="Zoom in">
-                    <Plus className="h-4 w-4" />
+                    <AppIcon name="plus" fallback={Plus} className="h-4 w-4"  />
                   </Button>
                   <Button size="icon-sm" variant="ghost" onClick={() => zoomBy(0.85)} title="Zoom out">
-                    <Minus className="h-4 w-4" />
+                    <AppIcon name="minus" fallback={Minus} className="h-4 w-4"  />
                   </Button>
                   <Button size="icon-sm" variant="ghost" onClick={resetView} title="Fit to content">
-                    <Focus className="h-4 w-4" />
+                    <AppIcon name="focus" fallback={Focus} className="h-4 w-4"  />
                   </Button>
                   <Button
                     size="icon-sm"
@@ -1269,7 +1270,7 @@ export function ClusterVisualization() {
                     title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
                     aria-pressed={isFullscreen}
                   >
-                    {isFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+                    {isFullscreen ? <AppIcon name="minimize2" fallback={Minimize2} className="h-4 w-4"  /> : <AppIcon name="maximize2" fallback={Maximize2} className="h-4 w-4"  />}
                   </Button>
                 </div>
               </div>
@@ -1297,7 +1298,7 @@ export function ClusterVisualization() {
               {inventoryQuery.isLoading ? (
                 <div className="absolute inset-0 flex items-center justify-center bg-background/60 backdrop-blur-sm">
                   <div className="flex items-center rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                     Loading topology...
                   </div>
                 </div>
@@ -1309,7 +1310,7 @@ export function ClusterVisualization() {
         <Card className="self-start overflow-hidden 2xl:sticky 2xl:top-20">
           <CardHeader className="border-b border-border">
             <CardTitle className="flex items-center gap-2">
-              <Settings2 className="h-5 w-5 text-primary" />
+              <AppIcon name="settings2" fallback={Settings2} className="h-5 w-5 text-primary"  />
               Resource Inspector
             </CardTitle>
             <CardDescription>
@@ -1345,30 +1346,30 @@ export function ClusterVisualization() {
 
             <div className="flex flex-wrap gap-2">
               <Link href={selectedMonitorHref} className={buttonVariants({ variant: "outline", size: "sm" })}>
-                <Network className="h-4 w-4" />
+                <AppIcon name="network" fallback={Network} className="h-4 w-4"  />
                 {selectedResource && !selectedResource.claimed_by_StackPilot ? "Claim resource" : "Open monitor"}
               </Link>
               {selectedResource?.claimed_by_StackPilot ? (
                 <Button size="sm" variant="outline" onClick={() => inspectMutation.mutate(selectedResource)} disabled={inspectMutation.isPending}>
-                  {inspectMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
+                  {inspectMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
                   Inspect
                 </Button>
               ) : null}
               {canUseYaml && selectedResource ? (
                 <Button size="sm" variant="outline" onClick={() => yamlResourceMutation.mutate(selectedResource)} disabled={yamlResourceMutation.isPending}>
-                  {yamlResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Code2 className="h-4 w-4" />}
+                  {yamlResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="code2" fallback={Code2} className="h-4 w-4"  />}
                   YAML
                 </Button>
               ) : null}
               {canUseYaml && selectedResource ? (
                 <Button size="sm" variant="outline" onClick={() => generateYamlMutation.mutate(selectedResource)} disabled={generateYamlMutation.isPending}>
-                  {generateYamlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                  {generateYamlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="sparkles" fallback={Sparkles} className="h-4 w-4"  />}
                   Generate YAML
                 </Button>
               ) : null}
               {selectedResource?.claimed_by_StackPilot && selectedResource.resource_type === "deployment" ? (
                 <Button size="sm" variant="outline" onClick={() => restartMutation.mutate(selectedResource)} disabled={restartMutation.isPending}>
-                  {restartMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
+                  {restartMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="rotate-cw" fallback={RotateCw} className="h-4 w-4"  />}
                   Restart
                 </Button>
               ) : null}
@@ -1403,7 +1404,7 @@ export function ClusterVisualization() {
               <div className="grid gap-2 sm:grid-cols-2 2xl:grid-cols-1">
                 <Button size="sm" variant="outline" onClick={() => dockerStateMutation.mutate({ resource: selectedResource as DockerContainer, action: "start" })}>Start</Button>
                 <Button size="sm" variant="outline" onClick={() => dockerStateMutation.mutate({ resource: selectedResource as DockerContainer, action: "stop" })}>
-                  <Square className="h-4 w-4" />
+                  <AppIcon name="square" fallback={Square} className="h-4 w-4"  />
                   Stop
                 </Button>
               </div>
@@ -1427,7 +1428,7 @@ export function ClusterVisualization() {
                     Dry-run apply
                   </Button>
                   <Button size="sm" onClick={() => applyYamlMutation.mutate({ resource: selectedResource, dryRun: false })} disabled={!canApplyYaml || applyYamlMutation.isPending}>
-                    {applyYamlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                    {applyYamlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="shield-check" fallback={ShieldCheck} className="h-4 w-4"  />}
                     Apply + restart
                   </Button>
                 </div>

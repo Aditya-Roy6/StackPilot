@@ -2,6 +2,7 @@
 
 import { ChangeEvent, useEffect, useRef } from "react";
 import { Plus, Trash2, Upload } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -126,7 +127,7 @@ export function ProjectEnvEditor({
             className="min-w-[132px] justify-center"
             onClick={() => fileInputRef.current?.click()}
           >
-            <Upload className="mr-2 h-4 w-4" />
+            <AppIcon name="upload" fallback={Upload} className="mr-2 h-4 w-4"  />
             Upload Env File
           </Button>
           <Button
@@ -136,7 +137,7 @@ export function ProjectEnvEditor({
             className="min-w-[132px] justify-center"
             onClick={addRow}
           >
-            <Plus className="mr-2 h-4 w-4" />
+            <AppIcon name="plus" fallback={Plus} className="mr-2 h-4 w-4"  />
             Add Variable
           </Button>
         </div>
@@ -175,7 +176,7 @@ export function ProjectEnvEditor({
                 className="justify-self-start md:justify-self-end"
                 onClick={() => removeRow(index)}
               >
-                <Trash2 className="h-4 w-4" />
+                <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
               </Button>
             </div>
           ))

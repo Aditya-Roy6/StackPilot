@@ -317,8 +317,12 @@ const ApplicationTemplate* ApplicationCatalog::findTemplate(const std::string& t
     return nullptr;
 }
 
+bool isDockerHubTemplate(const std::string& templateId) {
+    return templateId == "dockerhub" || templateId.rfind("dockerhub:", 0) == 0 || templateId == "custom_image";
+}
+
 bool ApplicationCatalog::isSupportedTemplate(const std::string& templateId) {
-    return findTemplate(templateId) != nullptr;
+    return isDockerHubTemplate(templateId) || findTemplate(templateId) != nullptr;
 }
 
 Json::Value ApplicationCatalog::templatesJson() {
@@ -349,6 +353,27 @@ Json::Value ApplicationCatalog::templatesJson() {
 }
 
 Json::Value ApplicationCatalog::sanitizedConfig(const std::string& templateId, const Json::Value& config) {
+    if (isDockerHubTemplate(templateId)) {
+        Json::Value out(Json::objectValue);
+        out["template_id"] = templateId;
+        std::string name = config.isMember("name") && config["name"].isString() && !config["name"].asString().empty()
+            ? config["name"].asString()
+            : (templateId.rfind("dockerhub:", 0) == 0 ? templateId.substr(10) : "Docker Hub Application");
+        out["template_name"] = name;
+        out["image"] = config.isMember("image") && config["image"].isString() ? config["image"].asString() : "";
+        out["fields"] = Json::Value(Json::objectValue);
+        if (config.isObject()) {
+            for (const auto& key : config.getMemberNames()) {
+                Json::Value fieldState(Json::objectValue);
+                fieldState["env_key"] = key;
+                fieldState["configured"] = true;
+                fieldState["value"] = config[key].asString();
+                out["fields"][key] = fieldState;
+            }
+        }
+        return out;
+    }
+
     const auto* tmpl = findTemplate(templateId);
     if (!tmpl) {
         return Json::Value(Json::objectValue);
@@ -371,6 +396,18 @@ Json::Value ApplicationCatalog::sanitizedConfig(const std::string& templateId, c
 }
 
 std::vector<std::string> ApplicationCatalog::missingRequiredFields(const std::string& templateId, const Json::Value& config) {
+    if (isDockerHubTemplate(templateId)) {
+        std::vector<std::string> missing;
+        std::string image = config.isMember("image") && config["image"].isString() ? trim(config["image"].asString()) : "";
+        if (image.empty() && templateId.rfind("dockerhub:", 0) == 0) {
+            image = templateId.substr(10);
+        }
+        if (image.empty()) {
+            missing.push_back("Docker Image");
+        }
+        return missing;
+    }
+
     std::vector<std::string> missing;
     const auto* tmpl = findTemplate(templateId);
     if (!tmpl) {
@@ -385,6 +422,19 @@ std::vector<std::string> ApplicationCatalog::missingRequiredFields(const std::st
 }
 
 std::vector<BuildEnvVar> ApplicationCatalog::envVarsForConfig(const std::string& templateId, const Json::Value& config) {
+    if (isDockerHubTemplate(templateId)) {
+        std::vector<BuildEnvVar> envVars;
+        if (config.isObject()) {
+            if (config.isMember("public_port") && !config["public_port"].asString().empty()) {
+                envVars.push_back({"APP_PUBLIC_PORT", config["public_port"].asString()});
+            }
+            if (config.isMember("image") && !config["image"].asString().empty()) {
+                envVars.push_back({"APP_IMAGE", config["image"].asString()});
+            }
+        }
+        return envVars;
+    }
+
     std::vector<BuildEnvVar> envVars;
     const auto* tmpl = findTemplate(templateId);
     if (!tmpl) {
@@ -400,6 +450,10 @@ std::vector<BuildEnvVar> ApplicationCatalog::envVarsForConfig(const std::string&
 }
 
 std::vector<std::string> ApplicationCatalog::secretEnvKeys(const std::string& templateId) {
+    if (isDockerHubTemplate(templateId)) {
+        return {};
+    }
+
     std::vector<std::string> keys;
     const auto* tmpl = findTemplate(templateId);
     if (!tmpl) {
@@ -418,6 +472,65 @@ std::filesystem::path ApplicationCatalog::materializeSource(const std::string& d
                                                             const std::string& templateId,
                                                             const Json::Value& config,
                                                             const std::filesystem::path& baseDir) {
+    if (isDockerHubTemplate(templateId)) {
+        const auto sourceDir = baseDir / ("stackpilot-application-" + slug(projectName) + "-" + slug(deploymentId));
+        std::error_code ec;
+        std::filesystem::remove_all(sourceDir, ec);
+        std::filesystem::create_directories(sourceDir, ec);
+        if (ec) {
+            throw std::runtime_error("Unable to create generated application source directory");
+        }
+
+        std::string image = config.isMember("image") && config["image"].isString() ? trim(config["image"].asString()) : "";
+        if (image.empty() && templateId.rfind("dockerhub:", 0) == 0) {
+            image = templateId.substr(10);
+        }
+        if (image.empty()) {
+            image = "nginx:alpine";
+        }
+
+        std::string containerPort = "80";
+        if (config.isMember("container_port") && !config["container_port"].asString().empty()) {
+            containerPort = trim(config["container_port"].asString());
+        } else if (config.isMember("port") && !config["port"].asString().empty()) {
+            containerPort = trim(config["port"].asString());
+        }
+
+        std::string publicPort = "18080";
+        if (config.isMember("public_port") && !config["public_port"].asString().empty()) {
+            publicPort = trim(config["public_port"].asString());
+        }
+
+        std::string composeContent =
+            "services:\n"
+            "  app:\n"
+            "    image: " + yamlQuote(image) + "\n"
+            "    restart: unless-stopped\n"
+            "    env_file:\n"
+            "      - .env\n"
+            "    ports:\n"
+            "      - " + yamlQuote(localPortMapping("APP_PUBLIC_PORT", publicPort, containerPort)) + "\n";
+
+        {
+            std::ofstream compose(sourceDir / "docker-compose.prod.yml", std::ios::trunc);
+            compose << composeContent;
+        }
+        {
+            const auto envPath = sourceDir / ".env";
+            if (!std::filesystem::exists(envPath)) {
+                std::ofstream env(envPath, std::ios::trunc);
+            }
+        }
+        {
+            std::ofstream readme(sourceDir / "README.md", std::ios::trunc);
+            readme << "# " << projectName << "\n\n"
+                   << "Docker Hub Application on-demand deployment.\n\n"
+                   << "- Image: " << image << "\n"
+                   << "- Container Port: " << containerPort << "\n"
+                   << "- Public Port: " << publicPort << "\n";
+        }
+        return sourceDir;
+    }
     const auto* tmpl = findTemplate(templateId);
     if (!tmpl) {
         throw std::runtime_error("Unsupported application template");
@@ -433,6 +546,12 @@ std::filesystem::path ApplicationCatalog::materializeSource(const std::string& d
     {
         std::ofstream compose(sourceDir / "docker-compose.prod.yml", std::ios::trunc);
         compose << composeFor(*tmpl);
+    }
+    {
+        const auto envPath = sourceDir / ".env";
+        if (!std::filesystem::exists(envPath)) {
+            std::ofstream env(envPath, std::ios::trunc);
+        }
     }
     {
         std::ofstream readme(sourceDir / "README.md", std::ios::trunc);

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Maximize2, Minimize2, RefreshCw, TerminalIcon } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { readTerminalTheme, useCanvasThemeVersion } from "@/lib/canvas-theme";
@@ -221,7 +222,7 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
     >
       <div className="flex items-center justify-between border-b border-white/10 bg-zinc-950 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2 text-xs text-zinc-300">
-          <TerminalIcon className="h-4 w-4 shrink-0" />
+          <AppIcon name="terminal-icon" fallback={TerminalIcon} className="h-4 w-4 shrink-0"  />
           <span className="truncate font-mono">{cwd}</span>
           <span
             className={cn(
@@ -243,7 +244,7 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
             className="h-7 px-2 text-zinc-300 hover:bg-white/10 hover:text-white"
             onClick={() => setSessionKey((value) => value + 1)}
           >
-            <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-1.5 h-3.5 w-3.5"  />
             Reconnect
           </Button>
           <Button
@@ -255,7 +256,7 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
             title={isFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
             aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
           >
-            {isFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+            {isFullscreen ? <AppIcon name="minimize2" fallback={Minimize2} className="h-3.5 w-3.5"  /> : <AppIcon name="maximize2" fallback={Maximize2} className="h-3.5 w-3.5"  />}
           </Button>
         </div>
       </div>

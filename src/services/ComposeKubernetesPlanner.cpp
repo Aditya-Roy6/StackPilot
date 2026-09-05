@@ -721,7 +721,7 @@ ComposeKubernetesPlan ComposeKubernetesPlanner::build(const Json::Value& compose
             << "      containers:\n"
             << "        - name: " << sanitizeDnsLabel(svc.serviceName, 40) << "\n"
             << "          image: " << (options.useImagePlaceholders ? svc.imagePlaceholder : svc.imageName) << "\n"
-            << "          imagePullPolicy: " << (svc.localBuildImage ? "Never" : "IfNotPresent") << "\n";
+            << "          imagePullPolicy: IfNotPresent\n";
         writeYamlStringList(manifest, "command", detail.entrypoint, 10);
         writeYamlStringList(manifest, "args", detail.command, 10);
         if (!detail.workingDir.empty()) {

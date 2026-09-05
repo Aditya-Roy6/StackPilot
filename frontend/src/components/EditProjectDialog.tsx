@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { CheckCircle2, ChevronRight, FolderTree, GitBranch, HardDrive, Link2, Plus, RefreshCw, Server, Settings2, ShieldCheck, Trash2 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { GitHubAuthButton } from "@/components/auth/GitHubAuthButton";
 import { ProjectEnvEditor, ProjectEnvVar } from "@/components/ProjectEnvEditor";
 import { cn } from "@/lib/utils";
@@ -161,7 +162,7 @@ export function EditProjectDialog({ project }: EditProjectDialogProps) {
       <DialogTrigger
         render={
           <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground">
-            <Settings2 className="h-4 w-4" />
+            <AppIcon name="settings2" fallback={Settings2} className="h-4 w-4"  />
             <span className="sr-only">Edit project</span>
           </Button>
         }
@@ -169,7 +170,7 @@ export function EditProjectDialog({ project }: EditProjectDialogProps) {
       <DialogContent className="!flex h-[min(84vh,840px)] !w-[min(94vw,920px)] !max-w-[920px] flex-col overflow-hidden rounded-2xl p-0">
         <DialogHeader className="shrink-0 border-b border-border p-6">
           <DialogTitle className="flex items-center gap-2">
-            <Settings2 className="h-5 w-5 text-primary" />
+            <AppIcon name="settings2" fallback={Settings2} className="h-5 w-5 text-primary"  />
             Project Settings
           </DialogTitle>
           <DialogDescription>
@@ -180,7 +181,7 @@ export function EditProjectDialog({ project }: EditProjectDialogProps) {
         {projectQuery.isLoading ? (
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden scrollbar-thin p-6">
             <div className="flex items-center text-sm text-muted-foreground">
-              <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+              <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
               Loading project settings...
             </div>
           </div>
@@ -592,7 +593,7 @@ const segmentedButtonActiveClass =
                       </div>
                       {githubConnected && (
                         <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                          <CheckCircle2 className="h-3.5 w-3.5" />
+                          <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-3.5 w-3.5"  />
                           Signed in
                         </div>
                       )}
@@ -607,9 +608,9 @@ const segmentedButtonActiveClass =
                           disabled={fetchReposMutation.isPending}
                         >
                           {fetchReposMutation.isPending ? (
-                            <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                           ) : (
-                            <GitBranch className="mr-2 h-4 w-4" />
+                            <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                           )}
                           Load Repositories
                         </Button>
@@ -617,7 +618,7 @@ const segmentedButtonActiveClass =
                         <GitHubAuthButton mode="connect" enabled className="rounded-lg" />
                       ) : (
                         <div className="inline-flex items-center gap-2 rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
-                          <Link2 className="h-3.5 w-3.5" />
+                          <AppIcon name="link2" fallback={Link2} className="h-3.5 w-3.5"  />
                           GitHub OAuth not configured
                         </div>
                       )}
@@ -683,9 +684,9 @@ const segmentedButtonActiveClass =
                       className="shrink-0"
                     >
                       {fetchBranchesMutation.isPending ? (
-                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <GitBranch className="mr-2 h-4 w-4" />
+                        <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                       )}
                       Branches
                     </Button>
@@ -714,9 +715,9 @@ const segmentedButtonActiveClass =
                       className="shrink-0"
                     >
                       {fetchReposMutation.isPending ? (
-                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-4 w-4 animate-spin"  />
                       ) : (
-                        <GitBranch className="mr-2 h-4 w-4" />
+                        <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                       )}
                       Fetch
                     </Button>
@@ -739,7 +740,7 @@ const segmentedButtonActiveClass =
                         </div>
                         {activeSshConnection && (
                           <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-500">
-                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-3.5 w-3.5"  />
                             Linked
                           </span>
                         )}
@@ -762,9 +763,9 @@ const segmentedButtonActiveClass =
                           disabled={!selectedRemoteConnectionId || browseRemoteMutation.isPending}
                         >
                           {browseRemoteMutation.isPending ? (
-                            <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                           ) : (
-                            <FolderTree className="mr-2 h-4 w-4" />
+                            <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                           )}
                           Browse
                         </Button>
@@ -783,7 +784,7 @@ const segmentedButtonActiveClass =
                               className="flex w-full items-center justify-between border-b border-border/60 px-3 py-2 text-left text-sm transition-colors last:border-b-0 hover:bg-accent"
                             >
                               <span className="truncate text-foreground">{entry.name}</span>
-                              <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                              <AppIcon name="chevron-right" fallback={ChevronRight} className="h-4 w-4 shrink-0 text-muted-foreground"  />
                             </button>
                           ))}
                         </div>
@@ -832,9 +833,9 @@ const segmentedButtonActiveClass =
                     }
                   >
                     {(sourceType === "local" ? browseLocalMutation.isPending : browseRemoteMutation.isPending) ? (
-                      <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                      <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                     ) : (
-                      <FolderTree className="mr-2 h-4 w-4" />
+                      <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                     )}
                     Browse
                   </Button>
@@ -855,7 +856,7 @@ const segmentedButtonActiveClass =
                         className="justify-start"
                         onClick={() => browseLocalMutation.mutate(root.path)}
                       >
-                        <HardDrive className="mr-2 h-4 w-4" />
+                        <AppIcon name="hard-drive" fallback={HardDrive} className="mr-2 h-4 w-4"  />
                         <span className="truncate">{root.path}</span>
                       </Button>
                     ))}
@@ -883,7 +884,7 @@ const segmentedButtonActiveClass =
                         )}
                       >
                         <span className="truncate text-foreground">{entry.name}</span>
-                        <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <AppIcon name="chevron-right" fallback={ChevronRight} className="h-4 w-4 shrink-0 text-muted-foreground"  />
                       </button>
                     ))}
                   </div>
@@ -907,7 +908,7 @@ const segmentedButtonActiveClass =
                   setRemoteK8sExposure("nodeport");
                 }}
                 >
-                  <Server className="mr-2 h-4 w-4" />
+                  <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                   Remote Docker
                 </Button>
                 <Button
@@ -916,7 +917,7 @@ const segmentedButtonActiveClass =
                   className={cn(segmentedButtonClass, remoteRuntimeType === "kubernetes" && segmentedButtonActiveClass)}
                   onClick={() => setRemoteRuntimeType("kubernetes")}
                 >
-                  <Server className="mr-2 h-4 w-4" />
+                  <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                   Remote Kubernetes
                 </Button>
               </div>
@@ -992,7 +993,7 @@ const segmentedButtonActiveClass =
                 </p>
               </div>
               <Button type="button" variant="outline" size="sm" onClick={addEnvironment}>
-                <Plus className="mr-2 h-4 w-4" />
+                <AppIcon name="plus" fallback={Plus} className="mr-2 h-4 w-4"  />
                 Add
               </Button>
             </div>
@@ -1063,7 +1064,7 @@ const segmentedButtonActiveClass =
                           disabled={displayedEnvironments.length <= 1}
                           onClick={() => removeEnvironment(environment.id)}
                         >
-                          <Trash2 className="h-4 w-4" />
+                          <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
                         </Button>
                       </div>
                     </div>
@@ -1078,7 +1079,7 @@ const segmentedButtonActiveClass =
                         )}
                         onClick={() => updateEnvironment(environment.id, { auto_deploy: !environment.auto_deploy })}
                       >
-                        <GitBranch className="mr-2 h-4 w-4" />
+                        <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                         {environment.auto_deploy ? "Auto deploy on push" : "Manual deploy only"}
                       </Button>
                       <Button
@@ -1090,7 +1091,7 @@ const segmentedButtonActiveClass =
                         )}
                         onClick={() => updateEnvironment(environment.id, { require_ci: !environment.require_ci })}
                       >
-                        <ShieldCheck className="mr-2 h-4 w-4" />
+                        <AppIcon name="shield-check" fallback={ShieldCheck} className="mr-2 h-4 w-4"  />
                         {environment.require_ci ? "Require CI checks" : "Do not wait for CI"}
                       </Button>
                       <Button
@@ -1106,7 +1107,7 @@ const segmentedButtonActiveClass =
                           })
                         }
                       >
-                        <Trash2 className="mr-2 h-4 w-4" />
+                        <AppIcon name="trash2" fallback={Trash2} className="mr-2 h-4 w-4"  />
                         {environment.cleanup_previous_on_success ? "Clean old runtime" : "Keep old runtime"}
                       </Button>
                     </div>
@@ -1140,7 +1141,7 @@ const segmentedButtonActiveClass =
         <Button type="submit" disabled={updateMutation.isPending}>
           {updateMutation.isPending ? (
             <>
-              <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+              <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
               Saving...
             </>
           ) : (

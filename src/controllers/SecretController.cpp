@@ -5,6 +5,7 @@
 #include "SecretController.h"
 #include "../db/Database.h"
 #include "../utils/AuditLogger.h"
+#include "../utils/Authz.h"
 #include "../utils/JwtHelper.h"
 #include "../utils/StringUtils.h"
 #include "../utils/TokenCrypto.h"
@@ -78,14 +79,17 @@ std::string SecretController::extractUserId(const drogon::HttpRequestPtr& req) {
     return payload.isNull() ? "" : payload["user_id"].asString();
 }
 
-bool SecretController::userOwnsProject(const std::string& projectId, const std::string& userId) {
+bool SecretController::userOwnsProject(const std::string& projectId,
+                                      const std::string& userId,
+                                      const std::string& minRole) {
     try {
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
         auto rows = txn.exec_params(
-            "SELECT 1 FROM projects WHERE id = $1 AND has_project_access(id, $2)",
+            "SELECT 1 FROM projects p WHERE p.id = $1 AND has_project_access(p.id, $2, $3)",
             projectId,
-            userId
+            userId,
+            minRole
         );
         txn.commit();
         return !rows.empty();
@@ -189,7 +193,7 @@ void SecretController::upsertSecret(
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
         return;
     }
-    if (!userOwnsProject(projectId, userId)) {
+    if (!userOwnsProject(projectId, userId, roles::kMember)) {
         sendError(callback, drogon::k404NotFound, "Project not found");
         return;
     }
@@ -297,7 +301,7 @@ void SecretController::deleteSecret(
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
         return;
     }
-    if (!userOwnsProject(projectId, userId)) {
+    if (!userOwnsProject(projectId, userId, roles::kAdmin)) {
         sendError(callback, drogon::k404NotFound, "Project not found");
         return;
     }
@@ -341,7 +345,7 @@ void SecretController::revealSecret(
         sendError(callback, drogon::k401Unauthorized, "Unauthorized");
         return;
     }
-    if (!userOwnsProject(projectId, userId)) {
+    if (!userOwnsProject(projectId, userId, roles::kMember)) {
         sendError(callback, drogon::k404NotFound, "Project not found");
         return;
     }

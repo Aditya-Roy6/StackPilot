@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { AlertTriangle, ArrowLeft, Copy, RotateCcw } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 
 import { Button } from "@/components/ui/button";
 
@@ -31,7 +32,7 @@ export default function DashboardError({
       <div className="w-full max-w-xl rounded-xl border border-border bg-card p-6 text-card-foreground">
         <div className="flex items-start gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-destructive/20 bg-destructive/10">
-            <AlertTriangle className="h-5 w-5 text-destructive" />
+            <AppIcon name="alert-triangle" fallback={AlertTriangle} className="h-5 w-5 text-destructive"  />
           </div>
           <div className="min-w-0 flex-1">
             <h2 className="text-lg font-semibold">This page hit an error</h2>
@@ -45,11 +46,11 @@ export default function DashboardError({
 
             <div className="mt-4 flex flex-wrap gap-2">
               <Button type="button" onClick={() => unstable_retry()}>
-                <RotateCcw className="h-4 w-4" />
+                <AppIcon name="rotate-ccw" fallback={RotateCcw} className="h-4 w-4"  />
                 Try again
               </Button>
               <Button type="button" variant="outline" onClick={() => history.back()}>
-                <ArrowLeft className="h-4 w-4" />
+                <AppIcon name="arrow-left" fallback={ArrowLeft} className="h-4 w-4"  />
                 Back
               </Button>
               <Button
@@ -65,7 +66,7 @@ export default function DashboardError({
                   }
                 }}
               >
-                <Copy className="h-4 w-4" />
+                <AppIcon name="copy" fallback={Copy} className="h-4 w-4"  />
                 {copied ? "Copied" : "Copy details"}
               </Button>
             </div>

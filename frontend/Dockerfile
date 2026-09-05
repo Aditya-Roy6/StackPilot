@@ -1,8 +1,31 @@
-FROM node:24-alpine AS builder
+FROM node:24-alpine AS base
 
 WORKDIR /app
 
 ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY package*.json ./
+RUN npm ci --no-audit --no-fund
+
+# ─── Development Target (Live Hot-Reloading) ───────────────
+FROM base AS dev
+
+WORKDIR /app
+
+ENV NODE_ENV=development \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0 \
+    WATCHPACK_POLLING=true
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=5 \
+    CMD wget -qO- http://127.0.0.1:3000 >/dev/null || exit 1
+
+CMD ["npm", "run", "dev"]
+
+# ─── Production Builder ─────────────────────────────────────
+FROM base AS builder
 
 ARG NEXT_PUBLIC_API_BASE_URL=http://localhost:8090/api/v1
 ARG NEXT_PUBLIC_WS_BASE_URL=ws://localhost:8090
@@ -14,12 +37,10 @@ ENV NEXT_PUBLIC_WS_BASE_URL=${NEXT_PUBLIC_WS_BASE_URL}
 ENV NEXT_PUBLIC_GOOGLE_CLIENT_ID=${NEXT_PUBLIC_GOOGLE_CLIENT_ID}
 ENV NEXT_PUBLIC_GITHUB_CLIENT_ID=${NEXT_PUBLIC_GITHUB_CLIENT_ID}
 
-COPY package*.json ./
-RUN npm ci --no-audit --no-fund
-
 COPY . .
 RUN npm run build
 
+# ─── Production Runner ──────────────────────────────────────
 FROM node:24-alpine AS runner
 
 WORKDIR /app

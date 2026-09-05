@@ -5,7 +5,8 @@ import api from "@/lib/api";
 import { AxiosError } from "axios";
 import { Card, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Activity, Bot, Cpu, HardDrive, Loader2, Terminal, RefreshCw, CheckCircle, XCircle, Server, Maximize2, Minimize2, Pause, Play, Trash2, AlertTriangle, RotateCcw, Globe, Thermometer, Gauge, Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ExternalLink, Copy } from "lucide-react";
+import { Activity, Bot, Cpu, HardDrive, Loader2, Terminal, RefreshCw, CheckCircle, XCircle, Server, Maximize2, Minimize2, Pause, Play, Trash2, AlertTriangle, RotateCcw, Globe, Thermometer, Gauge, Search, SlidersHorizontal, ChevronLeft, ChevronRight, X, ExternalLink, Copy, Wand2, ArrowDown } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { Button } from "@/components/ui/button";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import {
@@ -17,6 +18,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { useRouter } from "next/navigation";
+import { useWorkspace } from "@/context/WorkspaceContext";
 
 import { useChartTheme } from "@/lib/canvas-theme";
 import {
@@ -248,6 +251,14 @@ function getWebSocketBaseUrl() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const host = window.location.hostname;
   return process.env.NEXT_PUBLIC_WS_BASE_URL || `${protocol}//${host}:8090`;
+}
+
+function getAuthToken(): string {
+  if (typeof window === "undefined") return "";
+  const localToken = localStorage.getItem("token");
+  if (localToken) return localToken;
+  const match = document.cookie.match(/(?:^|;\s*)token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : "";
 }
 
 function upsertDeployment(list: Deployment[], nextDeployment: Deployment) {
@@ -530,6 +541,8 @@ function hasRuntimeFilterMatch(deployment: Deployment, selectedRuntimes: string[
 }
 
 export default function DeploymentsPage() {
+  const router = useRouter();
+  const { activeWorkspaceId } = useWorkspace();
   const [selectedDeployment, setSelectedDeployment] = useState<string | null>(null);
   const [runtimeDeployment, setRuntimeDeployment] = useState<Deployment | null>(null);
   const [metricsDeployment, setMetricsDeployment] = useState<Deployment | null>(null);
@@ -544,7 +557,7 @@ export default function DeploymentsPage() {
   const queryClient = useQueryClient();
 
   const { data, isLoading, refetch } = useQuery({
-    queryKey: ["deployments"],
+    queryKey: ["deployments", activeWorkspaceId],
     queryFn: async () => {
       const res = await api.get("/deployments");
       return res.data;
@@ -606,9 +619,58 @@ export default function DeploymentsPage() {
       queryClient.invalidateQueries({ queryKey: ["deployment-logs", deploymentId] });
     },
     onError: (error: unknown) => {
-      const maybeError = error as { response?: { data?: { error?: string } } };
-      toast.error(maybeError.response?.data?.error || "Failed to start build");
+      const responseData = (error as { response?: { data?: { error?: string; hint?: string; details?: string } } })?.response?.data;
+      const message = responseData?.error || "Failed to start build";
+      toast.error(message, {
+        description: responseData?.hint || responseData?.details,
+      });
       queryClient.invalidateQueries({ queryKey: ["deployments"] });
+    },
+  });
+
+  const cancelDeploymentMutation = useMutation({
+    mutationFn: async (deploymentId: string) => {
+      const res = await api.post(`/deployments/${deploymentId}/cancel`);
+      return res.data;
+    },
+    onSuccess: (_data, deploymentId) => {
+      toast.success("Deployment canceled");
+      setSelectedDeployment(deploymentId);
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
+      queryClient.invalidateQueries({ queryKey: ["deployment-logs", deploymentId] });
+    },
+    onError: (error: unknown) => {
+      const responseData = (error as { response?: { data?: { error?: string; hint?: string; details?: string } } })?.response?.data;
+      const message = responseData?.error || "Failed to cancel deployment";
+      toast.error(message, {
+        description: responseData?.hint || responseData?.details,
+      });
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
+    },
+  });
+
+  const repairDeploymentMutation = useMutation({
+    mutationFn: async (deploymentId: string) => {
+      const res = await api.post(`/deployments/${deploymentId}/ai/repair`, {
+        model: "",
+        model_mode: "thinking",
+      });
+      return res.data;
+    },
+    onSuccess: (data) => {
+      if (data.status === "error") {
+        toast.warning(data.summary || "AI repair could not complete");
+      } else {
+        toast.success(data.summary || "AI repaired the project and queued a new build!");
+        queryClient.invalidateQueries({ queryKey: ["deployments"] });
+        if (data.new_deployment_id) {
+          setSelectedDeployment(data.new_deployment_id);
+        }
+      }
+    },
+    onError: (error: unknown) => {
+      const maybeError = error as { response?: { data?: { error?: string } } };
+      toast.error(maybeError.response?.data?.error || "AI project repair failed");
     },
   });
 
@@ -622,8 +684,8 @@ export default function DeploymentsPage() {
     onSuccess: (_data, variables) => {
       const deploymentId = variables.deploymentId;
       toast.success("Deployment deleted");
-      queryClient.setQueryData(
-        ["deployments"],
+      queryClient.setQueriesData(
+        { queryKey: ["deployments"] },
         (current: { deployments?: Deployment[]; count?: number } | undefined) => {
           const filtered = (current?.deployments || []).filter((deployment) => deployment.id !== deploymentId);
           return {
@@ -656,57 +718,91 @@ export default function DeploymentsPage() {
   });
 
   useEffect(() => {
-    const wsBaseUrl = getWebSocketBaseUrl();
-    const socket = new WebSocket(`${wsBaseUrl}/ws/logs?stream=deployments`);
+    let isUnmounted = false;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let socket: WebSocket | null = null;
+    let backoffDelay = 1000;
 
-    socket.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data) as DeploymentSocketMessage;
+    const connect = () => {
+      if (isUnmounted) return;
+      const wsBaseUrl = getWebSocketBaseUrl();
+      const token = getAuthToken();
+      socket = new WebSocket(`${wsBaseUrl}/ws/logs?stream=deployments${token ? `&token=${encodeURIComponent(token)}` : ""}`);
 
-        if (message.type === "deployment_update" && message.deployment) {
-          const deployment = message.deployment as Deployment;
-          for (const adjustment of portAdjustmentMessages(deployment)) {
-            const toastKey = `${deployment.id}:${adjustment.id}`;
-            if (!shownPortAdjustmentToasts.current.has(toastKey)) {
-              shownPortAdjustmentToasts.current.add(toastKey);
-              toast.info(adjustment.message);
+      socket.onopen = () => {
+        backoffDelay = 1000;
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data) as DeploymentSocketMessage;
+
+          if (message.type === "deployment_update" && message.deployment) {
+            const deployment = message.deployment as Deployment;
+            for (const adjustment of portAdjustmentMessages(deployment)) {
+              const toastKey = `${deployment.id}:${adjustment.id}`;
+              if (!shownPortAdjustmentToasts.current.has(toastKey)) {
+                shownPortAdjustmentToasts.current.add(toastKey);
+                toast.info(adjustment.message);
+              }
             }
+            queryClient.setQueriesData(
+              { queryKey: ["deployments"] },
+              (current: { deployments?: Deployment[]; count?: number } | undefined) => {
+                const nextDeployments = upsertDeployment(current?.deployments || [], deployment);
+                return {
+                  deployments: nextDeployments,
+                  count: nextDeployments.length,
+                };
+              }
+            );
+            return;
           }
-          queryClient.setQueryData(
-            ["deployments"],
-            (current: { deployments?: Deployment[]; count?: number } | undefined) => {
-              const nextDeployments = upsertDeployment(current?.deployments || [], deployment);
-              return {
-                deployments: nextDeployments,
-                count: nextDeployments.length,
-              };
-            }
-          );
-          return;
-        }
 
-        if (message.type === "deployment_deleted" && message.deployment_id) {
-          queryClient.setQueryData(
-            ["deployments"],
-            (current: { deployments?: Deployment[]; count?: number } | undefined) => {
-              const filtered = (current?.deployments || []).filter(
-                (deployment) => deployment.id !== message.deployment_id
-              );
-              return {
-                deployments: filtered,
-                count: filtered.length,
-              };
-            }
-          );
-          return;
+          if (message.type === "deployment_deleted" && message.deployment_id) {
+            queryClient.setQueriesData(
+              { queryKey: ["deployments"] },
+              (current: { deployments?: Deployment[]; count?: number } | undefined) => {
+                const filtered = (current?.deployments || []).filter(
+                  (deployment) => deployment.id !== message.deployment_id
+                );
+                return {
+                  deployments: filtered,
+                  count: filtered.length,
+                };
+              }
+            );
+            return;
+          }
+        } catch {
+          // Ignore malformed socket messages and keep the page interactive.
         }
-      } catch {
-        // Ignore malformed socket messages and keep the page interactive.
-      }
+      };
+
+      socket.onclose = () => {
+        if (!isUnmounted) {
+          reconnectTimeout = setTimeout(() => {
+            connect();
+          }, backoffDelay);
+          backoffDelay = Math.min(backoffDelay * 1.5, 15000);
+        }
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
     };
 
+    connect();
+
     return () => {
-      socket.close();
+      isUnmounted = true;
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+      }
+      if (socket) {
+        socket.close();
+      }
     };
   }, [queryClient]);
 
@@ -715,19 +811,19 @@ export default function DeploymentsPage() {
       case "built":
         return (
           <Badge variant="outline" className="bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 gap-1">
-            <CheckCircle className="w-3 h-3" /> Built
+            <AppIcon name="check-circle" fallback={CheckCircle} className="w-3 h-3"  /> Built
           </Badge>
         );
       case "running":
         return (
           <Badge variant="outline" className="bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30 gap-1">
-            <CheckCircle className="w-3 h-3" /> Running
+            <AppIcon name="check-circle" fallback={CheckCircle} className="w-3 h-3"  /> Running
           </Badge>
         );
       case "failed":
         return (
           <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/30 gap-1">
-            <XCircle className="w-3 h-3" /> Failed
+            <AppIcon name="x-circle" fallback={XCircle} className="w-3 h-3"  /> Failed
           </Badge>
         );
       case "building":
@@ -735,7 +831,7 @@ export default function DeploymentsPage() {
       case "pending":
         return (
           <Badge variant="outline" className="bg-primary/10 text-primary border-primary/30 gap-1 capitalize">
-            <Loader2 className="w-3 h-3 animate-spin" /> {status}
+            <AppIcon name="loader2" fallback={Loader2} className="w-3 h-3 animate-spin"  /> {status}
           </Badge>
         );
       default:
@@ -759,7 +855,7 @@ export default function DeploymentsPage() {
             disabled={isLoading}
             className="bg-card"
           >
-            <RefreshCw className={cn("w-4 h-4 mr-2", isLoading && "animate-spin")} />
+            <AppIcon name="refresh-cw" fallback={RefreshCw} className={cn("w-4 h-4 mr-2", isLoading && "animate-spin")}  />
             Refresh
           </Button>
           <Button
@@ -767,7 +863,7 @@ export default function DeploymentsPage() {
             onClick={() => setIsSearchOpen((open) => !open)}
             className="bg-card"
           >
-            <Search className="mr-2 h-4 w-4" />
+            <AppIcon name="search" fallback={Search} className="mr-2 h-4 w-4"  />
             Search
           </Button>
         </div>
@@ -778,19 +874,23 @@ export default function DeploymentsPage() {
           <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
             <div className="flex-1 space-y-2">
               <Label htmlFor="deployment-search">Search deployments</Label>
-              <Input
-                id="deployment-search"
-                value={searchQuery}
-                onChange={(event) => {
-                  setSearchQuery(event.target.value);
-                  setPage(1);
-                }}
-                placeholder="Project, version, commit, image, runtime URL..."
-              />
+              <div className="relative">
+                <AppIcon name="search" fallback={Search} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Input
+                  id="deployment-search"
+                  value={searchQuery}
+                  onChange={(event) => {
+                    setSearchQuery(event.target.value);
+                    setPage(1);
+                  }}
+                  placeholder="Project, version, commit, image, runtime URL..."
+                  className="pl-10"
+                />
+              </div>
             </div>
             <div className="flex flex-wrap gap-2">
               <Button variant="outline" onClick={() => setIsFilterDialogOpen(true)} className="bg-card">
-                <SlidersHorizontal className="mr-2 h-4 w-4" />
+                <AppIcon name="sliders-horizontal" fallback={SlidersHorizontal} className="mr-2 h-4 w-4"  />
                 Filters
                 {activeFilterCount > 0 && (
                   <Badge variant="secondary" className="ml-2">
@@ -807,7 +907,7 @@ export default function DeploymentsPage() {
                     setPage(1);
                   }}
                 >
-                  <X className="mr-2 h-4 w-4" />
+                  <AppIcon name="x" fallback={X} className="mr-2 h-4 w-4"  />
                   Clear
                 </Button>
               )}
@@ -842,12 +942,12 @@ export default function DeploymentsPage() {
 
       {isLoading && !deployments.length ? (
         <div className="flex h-64 items-center justify-center bg-card border border-border rounded-xl">
-          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+          <AppIcon name="loader2" fallback={Loader2} className="h-8 w-8 animate-spin text-primary"  />
         </div>
       ) : deployments.length === 0 ? (
         <Card className="border-dashed border-border/80 ring-0 flex flex-col items-center justify-center py-20 bg-card">
           <div className="w-12 h-12 bg-muted rounded-full flex items-center justify-center mb-4">
-            <Server className="w-6 h-6 text-muted-foreground" />
+            <AppIcon name="server" fallback={Server} className="w-6 h-6 text-muted-foreground"  />
           </div>
           <CardTitle className="text-foreground">No deployments yet</CardTitle>
           <CardDescription>Trigger a build from the projects page to get started.</CardDescription>
@@ -855,7 +955,7 @@ export default function DeploymentsPage() {
       ) : filteredDeployments.length === 0 ? (
         <Card className="border-dashed border-border/80 ring-0 flex flex-col items-center justify-center py-20 bg-card">
           <div className="w-12 h-12 bg-muted rounded-full flex items-center justify-center mb-4">
-            <Search className="w-6 h-6 text-muted-foreground" />
+            <AppIcon name="search" fallback={Search} className="w-6 h-6 text-muted-foreground"  />
           </div>
           <CardTitle className="text-foreground">No matching deployments</CardTitle>
           <CardDescription>Adjust the search text or filters to widen the result set.</CardDescription>
@@ -892,7 +992,7 @@ export default function DeploymentsPage() {
                           title={`Open runtime: ${liveUrl}`}
                         >
                           <span className="min-w-0 truncate">{displayName}</span>
-                          <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                          <AppIcon name="external-link" fallback={ExternalLink} className="h-3.5 w-3.5 shrink-0"  />
                         </a>
                       ) : (
                         <div className="max-w-[28rem] truncate font-medium text-foreground" title={displayName}>
@@ -919,7 +1019,7 @@ export default function DeploymentsPage() {
                           title={commitSha}
                         >
                           {shortCommit(commitSha)}
-                          <ExternalLink className="h-3 w-3" />
+                          <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
                         </a>
                       ) : (
                         <span className="font-mono text-sm text-muted-foreground">
@@ -936,6 +1036,17 @@ export default function DeploymentsPage() {
                     <TableCell className="px-6 py-4 whitespace-nowrap">
                       <div className="ml-auto w-max max-w-full overflow-x-auto">
                         <div className="flex w-max items-center justify-end gap-2 whitespace-nowrap pb-1">
+                        {dep.status === "failed" && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => router.push(`/dashboard/ai?deploymentId=${dep.id}&command=repair`)}
+                            className="shrink-0 gap-1.5 border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
+                          >
+                            <AppIcon name="wand2" fallback={Wand2} className="h-4 w-4"  />
+                            Fix with AI
+                          </Button>
+                        )}
                         {(dep.status === "pending" || dep.status === "failed") && (
                           <Button
                             variant="outline"
@@ -945,11 +1056,27 @@ export default function DeploymentsPage() {
                             className="shrink-0 gap-2"
                           >
                             {triggerBuildMutation.isPending ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
+                              <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
                             ) : (
-                              <Play className="h-4 w-4 fill-current" />
+                              <AppIcon name="play" fallback={Play} className="h-4 w-4 fill-current"  />
                             )}
                             Build
+                          </Button>
+                        )}
+                        {(dep.status === "building" || dep.status === "queued") && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => cancelDeploymentMutation.mutate(dep.id)}
+                            disabled={cancelDeploymentMutation.isPending && cancelDeploymentMutation.variables === dep.id}
+                            className="shrink-0 gap-2 border-destructive/40 text-destructive hover:bg-destructive/10 hover:border-destructive"
+                          >
+                            {cancelDeploymentMutation.isPending && cancelDeploymentMutation.variables === dep.id ? (
+                              <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <AppIcon name="x-circle" fallback={XCircle} className="h-4 w-4" />
+                            )}
+                            Cancel
                           </Button>
                         )}
                         <Button 
@@ -958,7 +1085,7 @@ export default function DeploymentsPage() {
                           onClick={() => setSelectedDeployment(dep.id)}
                           className="shrink-0 text-muted-foreground hover:text-foreground hover:bg-muted"
                         >
-                          <Terminal className="w-4 h-4 mr-2" />
+                          <AppIcon name="terminal" fallback={Terminal} className="w-4 h-4 mr-2"  />
                           Logs
                         </Button>
                         {dep.image_name && (
@@ -968,7 +1095,7 @@ export default function DeploymentsPage() {
                             onClick={() => setRuntimeDeployment(dep)}
                             className="shrink-0 text-muted-foreground hover:text-foreground hover:bg-muted"
                           >
-                            <Server className="w-4 h-4 mr-2" />
+                            <AppIcon name="server" fallback={Server} className="w-4 h-4 mr-2"  />
                             Runtime
                           </Button>
                         )}
@@ -979,7 +1106,7 @@ export default function DeploymentsPage() {
                             onClick={() => setMetricsDeployment(dep)}
                             className="shrink-0 text-muted-foreground hover:text-foreground hover:bg-muted"
                           >
-                            <Activity className="w-4 h-4 mr-2" />
+                            <AppIcon name="activity" fallback={Activity} className="w-4 h-4 mr-2"  />
                             Metrics
                           </Button>
                         )}
@@ -989,7 +1116,7 @@ export default function DeploymentsPage() {
                           onClick={() => setDeleteDeployment(dep)}
                           className="shrink-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
                         >
-                          <Trash2 className="w-4 h-4 mr-2" />
+                          <AppIcon name="trash2" fallback={Trash2} className="w-4 h-4 mr-2"  />
                           Delete
                         </Button>
                         </div>
@@ -1013,7 +1140,7 @@ export default function DeploymentsPage() {
                 onClick={() => setPage((currentPage) => Math.max(1, currentPage - 1))}
                 disabled={currentPage <= 1}
               >
-                <ChevronLeft className="mr-2 h-4 w-4" />
+                <AppIcon name="chevron-left" fallback={ChevronLeft} className="mr-2 h-4 w-4"  />
                 Previous
               </Button>
               <Button
@@ -1024,7 +1151,7 @@ export default function DeploymentsPage() {
                 disabled={currentPage >= pageCount}
               >
                 Next
-                <ChevronRight className="ml-2 h-4 w-4" />
+                <AppIcon name="chevron-right" fallback={ChevronRight} className="ml-2 h-4 w-4"  />
               </Button>
             </div>
           </div>
@@ -1049,6 +1176,8 @@ export default function DeploymentsPage() {
           onClose={() => setSelectedDeployment(null)} 
           onStartBuild={() => triggerBuildMutation.mutate(selectedDeployment)}
           isStartingBuild={triggerBuildMutation.isPending}
+          onCancelBuild={() => cancelDeploymentMutation.mutate(selectedDeployment)}
+          isCancellingBuild={cancelDeploymentMutation.isPending && cancelDeploymentMutation.variables === selectedDeployment}
         />
       )}
 
@@ -1109,10 +1238,10 @@ function DeploymentFilterDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[560px]">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <SlidersHorizontal className="h-5 w-5" />
+      <DialogContent className="sm:max-w-3xl md:max-w-4xl max-w-[95vw] p-6">
+        <DialogHeader className="pb-2">
+          <DialogTitle className="flex items-center gap-2 text-lg">
+            <AppIcon name="sliders-horizontal" fallback={SlidersHorizontal} className="h-5 w-5 text-primary" />
             Deployment Filters
           </DialogTitle>
           <DialogDescription>
@@ -1120,63 +1249,93 @@ function DeploymentFilterDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-6">
-          <div className="space-y-3">
-            <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Status
-            </Label>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {STATUS_FILTER_OPTIONS.map((option) => (
-                <Label
-                  key={option.value}
-                  htmlFor={`status-filter-${option.value}`}
-                  className="flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2 font-normal"
-                >
-                  <Checkbox
-                    id={`status-filter-${option.value}`}
-                    checked={draftFilters.statuses.includes(option.value)}
-                    onCheckedChange={() =>
-                      setDraftFilters((current) => ({
-                        ...current,
-                        statuses: toggleListValue(current.statuses, option.value),
-                      }))
-                    }
-                  />
-                  <span>{option.label}</span>
-                </Label>
-              ))}
+        <div className="space-y-5 py-2">
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Status
+              </Label>
+              {draftFilters.statuses.length > 0 && (
+                <span className="text-xs text-primary font-medium">
+                  {draftFilters.statuses.length} selected
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
+              {STATUS_FILTER_OPTIONS.map((option) => {
+                const isChecked = draftFilters.statuses.includes(option.value);
+                return (
+                  <Label
+                    key={option.value}
+                    htmlFor={`status-filter-${option.value}`}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2.5 text-sm font-normal transition-colors select-none",
+                      isChecked
+                        ? "border-primary/50 bg-primary/10 text-foreground font-medium"
+                        : "border-border/70 bg-card hover:bg-muted/40 text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    <Checkbox
+                      id={`status-filter-${option.value}`}
+                      checked={isChecked}
+                      onCheckedChange={() =>
+                        setDraftFilters((current) => ({
+                          ...current,
+                          statuses: toggleListValue(current.statuses, option.value),
+                        }))
+                      }
+                    />
+                    <span className="truncate">{option.label}</span>
+                  </Label>
+                );
+              })}
             </div>
           </div>
 
-          <div className="space-y-3">
-            <Label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Runtime
-            </Label>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {RUNTIME_FILTER_OPTIONS.map((option) => (
-                <Label
-                  key={option.value}
-                  htmlFor={`runtime-filter-${option.value}`}
-                  className="flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-muted/20 px-3 py-2 font-normal"
-                >
-                  <Checkbox
-                    id={`runtime-filter-${option.value}`}
-                    checked={draftFilters.runtimes.includes(option.value)}
-                    onCheckedChange={() =>
-                      setDraftFilters((current) => ({
-                        ...current,
-                        runtimes: toggleListValue(current.runtimes, option.value),
-                      }))
-                    }
-                  />
-                  <span>{option.label}</span>
-                </Label>
-              ))}
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Runtime
+              </Label>
+              {draftFilters.runtimes.length > 0 && (
+                <span className="text-xs text-primary font-medium">
+                  {draftFilters.runtimes.length} selected
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
+              {RUNTIME_FILTER_OPTIONS.map((option) => {
+                const isChecked = draftFilters.runtimes.includes(option.value);
+                return (
+                  <Label
+                    key={option.value}
+                    htmlFor={`runtime-filter-${option.value}`}
+                    className={cn(
+                      "flex cursor-pointer items-center gap-2.5 rounded-lg border px-3 py-2.5 text-sm font-normal transition-colors select-none",
+                      isChecked
+                        ? "border-primary/50 bg-primary/10 text-foreground font-medium"
+                        : "border-border/70 bg-card hover:bg-muted/40 text-muted-foreground hover:text-foreground"
+                    )}
+                  >
+                    <Checkbox
+                      id={`runtime-filter-${option.value}`}
+                      checked={isChecked}
+                      onCheckedChange={() =>
+                        setDraftFilters((current) => ({
+                          ...current,
+                          runtimes: toggleListValue(current.runtimes, option.value),
+                        }))
+                      }
+                    />
+                    <span className="truncate">{option.label}</span>
+                  </Label>
+                );
+              })}
             </div>
           </div>
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="pt-2 gap-2 sm:gap-0">
           <Button
             type="button"
             variant="ghost"
@@ -1184,22 +1343,24 @@ function DeploymentFilterDialog({
           >
             Clear
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            onClick={() => {
-              onApply(draftFilters);
-              onOpenChange(false);
-            }}
-          >
-            Apply Filters
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                onApply(draftFilters);
+                onOpenChange(false);
+              }}
+            >
+              Apply Filters
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1211,15 +1372,24 @@ function DeploymentLogsDialog({
   onClose,
   onStartBuild,
   isStartingBuild,
+  onCancelBuild,
+  isCancellingBuild,
 }: {
   deploymentId: string;
   onClose: () => void;
   onStartBuild: () => void;
   isStartingBuild: boolean;
+  onCancelBuild?: () => void;
+  isCancellingBuild?: boolean;
 }) {
-  const [liveLogs, setLiveLogs] = useState<string | null>(null);
+  const [logs, setLogs] = useState<string>("");
+  const hasReceivedWsLog = useRef(false);
   const [liveStatus, setLiveStatus] = useState<string | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [isWsConnected, setIsWsConnected] = useState(false);
+  const [isWsConnecting, setIsWsConnecting] = useState(false);
+  const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
+  const isUserScrolledUpRef = useRef(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1233,17 +1403,32 @@ function DeploymentLogsDialog({
     enabled: !!deploymentId,
   });
 
+  useEffect(() => {
+    setLogs("");
+    hasReceivedWsLog.current = false;
+    setIsUserScrolledUp(false);
+    isUserScrolledUpRef.current = false;
+  }, [deploymentId]);
+
+  useEffect(() => {
+    const historicalLogs = initialData?.deployment?.logs;
+    if (historicalLogs && !hasReceivedWsLog.current) {
+      setLogs(historicalLogs);
+    }
+  }, [initialData]);
+
   const initialLogs = initialData?.deployment?.logs || "";
   const initialDeployment = initialData?.deployment as Partial<Deployment> | undefined;
   const logCommitSha = initialDeployment ? realCommitSha(initialDeployment) : "";
   const logCommitUrl = initialDeployment ? githubCommitUrl(initialDeployment) : "";
-  const hasCapturedFailureReason =
-    initialLogs.includes("failed with exit code") ||
-    initialLogs.includes("timed out after") ||
-    initialLogs.includes("Failure reason") ||
-    initialLogs.includes("Command exited with status");
-  const displayLogs = liveLogs && liveLogs.length >= initialLogs.length ? liveLogs : initialLogs;
+  const displayLogs = logs || initialLogs;
   const displayStatus = liveStatus ?? initialData?.deployment?.status ?? "loading";
+  const hasCapturedFailureReason =
+    displayLogs.includes("failed with exit code") ||
+    displayLogs.includes("timed out after") ||
+    displayLogs.includes("Failure reason") ||
+    displayLogs.includes("Command exited with status");
+  const queryClient = useQueryClient();
   const displayLogTail = displayLogs.length > 5000 ? displayLogs.slice(-5000) : displayLogs;
   const buildFailureExplainPrompt = [
     "Explain this Docker/deployment build failure clearly and helpfully.",
@@ -1296,17 +1481,51 @@ function DeploymentLogsDialog({
       toast.error(message);
     },
   });
+  const buildRepairMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post(
+        `/deployments/${deploymentId}/ai/repair`,
+        {
+          model: "",
+          model_mode: "thinking",
+        },
+        { timeout: 90000 }
+      );
+      return res.data;
+    },
+    onSuccess: (result) => {
+      if (result.status === "error") {
+        toast.warning(result.summary || "AI repair could not complete");
+      } else {
+        toast.success(result.summary || "AI repaired the project and queued a new build!");
+        queryClient.invalidateQueries({ queryKey: ["deployments"] });
+        if (result.new_deployment_id) {
+          onCloseRef.current();
+        }
+      }
+    },
+    onError: (error: unknown) => {
+      const message =
+        error instanceof AxiosError
+          ? (error.response?.data as { error?: string } | undefined)?.error || "AI project repair failed"
+          : "AI project repair failed";
+      toast.error(message);
+    },
+  });
+
   const buildAnalysis = buildAnalysisMutation.data;
   const buildFixSteps = aiStringList(buildAnalysis?.structured_output, ["fix_steps", "steps", "suggested_fix", "commands"]);
   const buildRootCause = aiRootCause(buildAnalysis?.structured_output);
 
-  // Kept in refs so a changing `onClose` identity or updated `initialLogs` does
-  // not retrigger the socket effect below.
+  // Kept in refs so a changing `onClose` identity does not retrigger the socket effect below.
   const onCloseRef = useRef(onClose);
-  const initialLogsRef = useRef(initialLogs);
   useEffect(() => {
     onCloseRef.current = onClose;
-    initialLogsRef.current = initialLogs;
+  });
+
+  const displayStatusRef = useRef(displayStatus);
+  useEffect(() => {
+    displayStatusRef.current = displayStatus;
   });
 
   useEffect(() => {
@@ -1316,27 +1535,52 @@ function DeploymentLogsDialog({
 
     const connectWebSocket = () => {
       if (!isActive) return;
+      setIsWsConnecting(true);
       const wsBaseUrl = getWebSocketBaseUrl();
-      const socket = new WebSocket(`${wsBaseUrl}/ws/logs?deploymentId=${deploymentId}`);
+      const token = getAuthToken();
+      const wsUrl = `${wsBaseUrl}/ws/logs?deploymentId=${deploymentId}${token ? `&token=${encodeURIComponent(token)}` : ""}`;
+      const socket = new WebSocket(wsUrl);
       
+      socket.onopen = () => {
+        if (isActive) {
+          setIsWsConnected(true);
+          setIsWsConnecting(false);
+        }
+      };
+
       socket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data) as DeploymentSocketMessage;
           if (data.type === 'log') {
-            setLiveLogs(prev => `${prev ?? initialLogsRef.current}${data.line ?? ""}\n`);
+            hasReceivedWsLog.current = true;
+            setLogs((prev) => `${prev}${data.line ?? ""}\n`);
           } else if (data.type === 'status') {
             setLiveStatus(data.status ?? null);
           } else if (data.type === "deployment_deleted") {
             onCloseRef.current();
           }
         } catch {
-          setLiveLogs(prev => `${prev ?? initialLogsRef.current}${event.data}\n`);
+          hasReceivedWsLog.current = true;
+          setLogs((prev) => `${prev}${event.data}\n`);
         }
       };
 
       socket.onclose = () => {
         if (isActive) {
-          reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
+          setIsWsConnected(false);
+          const currentStatus = displayStatusRef.current;
+          if (currentStatus !== "built" && currentStatus !== "failed") {
+            setIsWsConnecting(true);
+            reconnectTimerRef.current = setTimeout(connectWebSocket, 3000);
+          } else {
+            setIsWsConnecting(false);
+          }
+        }
+      };
+
+      socket.onerror = () => {
+        if (isActive) {
+          setIsWsConnected(false);
         }
       };
 
@@ -1347,6 +1591,8 @@ function DeploymentLogsDialog({
 
     return () => {
       isActive = false;
+      setIsWsConnected(false);
+      setIsWsConnecting(false);
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -1358,9 +1604,26 @@ function DeploymentLogsDialog({
     };
   }, [deploymentId]);
 
-  // Auto-scroll to bottom
-  useEffect(() => {
+  const handleScroll = () => {
+    if (!scrollRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+    const isNearBottom = scrollHeight - scrollTop - clientHeight < 60;
+    const scrolledUp = !isNearBottom;
+    setIsUserScrolledUp(scrolledUp);
+    isUserScrolledUpRef.current = scrolledUp;
+  };
+
+  const scrollToBottom = () => {
     if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      setIsUserScrolledUp(false);
+      isUserScrolledUpRef.current = false;
+    }
+  };
+
+  // Smart auto-scroll to bottom only if user hasn't scrolled up
+  useEffect(() => {
+    if (scrollRef.current && !isUserScrolledUpRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [displayLogs]);
@@ -1379,7 +1642,7 @@ function DeploymentLogsDialog({
           <div className="flex items-center justify-between">
             <div className="space-y-1">
               <DialogTitle className="text-xl font-bold text-foreground flex items-center gap-2">
-                <Terminal className="w-5 h-5 text-primary" />
+                <AppIcon name="terminal" fallback={Terminal} className="w-5 h-5 text-primary"  />
                 Build Logs
               </DialogTitle>
               <DialogDescription className="text-muted-foreground font-medium flex flex-wrap items-center gap-2">
@@ -1397,7 +1660,7 @@ function DeploymentLogsDialog({
                     title={logCommitSha}
                   >
                     {shortCommit(logCommitSha)}
-                    <ExternalLink className="h-3 w-3" />
+                    <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
                   </a>
                 ) : (
                   <span className="font-mono text-xs">{logCommitSha ? shortCommit(logCommitSha) : "-"}</span>
@@ -1424,7 +1687,7 @@ function DeploymentLogsDialog({
                     onClick={() => setIsExpanded(!isExpanded)}
                     className="absolute top-4 right-12 z-50 h-8 w-8 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                   >
-                    {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+                    {isExpanded ? <AppIcon name="minimize2" fallback={Minimize2} className="w-4 h-4"  /> : <AppIcon name="maximize2" fallback={Maximize2} className="w-4 h-4"  />}
                   </Button>
                 }
               />
@@ -1433,25 +1696,40 @@ function DeploymentLogsDialog({
           </div>
         </DialogHeader>
         
-        <div 
-          ref={scrollRef}
-          className="flex-1 overflow-y-auto p-6 font-mono text-[13px] leading-relaxed bg-background text-foreground border-t border-border scrollbar-thin"
-        >
-          <pre className="whitespace-pre-wrap break-all">
-            {displayLogs || (
-              displayStatus === "queued"
-                ? "Build is queued. A background worker will start it shortly."
-                : displayStatus === "pending"
-                ? "Build has not started yet.\nClick Start build to clone the repository and build the Docker image."
-                : "Initializing build engine...\nConnecting to logs stream..."
-            )}
-            {displayStatus === "failed" && displayLogs && !hasCapturedFailureReason
-              ? "\n\nThis failed build does not include a complete failure summary. Re-run it to capture the exact exit code or timeout reason."
-              : ""}
-            {(displayStatus === 'building' || displayStatus === 'queued') && (
-              <span className="inline-block w-2 h-4 ml-1 bg-primary animate-pulse align-middle" />
-            )}
-          </pre>
+        <div className="relative flex-1 min-h-0 flex flex-col">
+          <div 
+            ref={scrollRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto p-6 font-mono text-[13px] leading-relaxed bg-background text-foreground border-t border-border scrollbar-thin"
+          >
+            <pre className="whitespace-pre-wrap break-all">
+              {displayLogs || (
+                displayStatus === "queued"
+                  ? "Build is queued. A background worker will start it shortly."
+                  : displayStatus === "pending"
+                  ? "Build has not started yet.\nClick Start build to clone the repository and build the Docker image."
+                  : "Initializing build engine...\nConnecting to logs stream..."
+              )}
+              {displayStatus === "failed" && displayLogs && !hasCapturedFailureReason
+                ? "\n\nThis failed build does not include a complete failure summary. Re-run it to capture the exact exit code or timeout reason."
+                : ""}
+              {(displayStatus === 'building' || displayStatus === 'queued') && (
+                <span className="inline-block w-2 h-4 ml-1 bg-primary animate-pulse align-middle" />
+              )}
+            </pre>
+          </div>
+
+          {isUserScrolledUp && (
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={scrollToBottom}
+              className="absolute bottom-4 right-6 shadow-lg border border-border bg-background/95 hover:bg-muted text-xs gap-1.5 backdrop-blur-sm z-10 animate-in fade-in"
+            >
+              <AppIcon name="arrow-down" fallback={ArrowDown} className="h-3.5 w-3.5" />
+              Scroll to bottom
+            </Button>
+          )}
         </div>
 
         {buildAnalysis && (
@@ -1460,7 +1738,7 @@ function DeploymentLogsDialog({
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 font-semibold text-foreground">
-                    <Bot className="h-4 w-4 text-primary" />
+                    <AppIcon name="bot" fallback={Bot} className="h-4 w-4 text-primary"  />
                     AI build diagnosis
                   </div>
                   <pre className="mt-1 whitespace-pre-wrap font-sans text-sm text-muted-foreground">
@@ -1496,31 +1774,73 @@ function DeploymentLogsDialog({
 
         <div className="p-4 border-t border-border bg-muted/40 flex items-center justify-between">
           <div className="flex items-center text-xs text-muted-foreground gap-2">
-            <div className={cn("w-2 h-2 rounded-full", displayStatus === 'building' || displayStatus === 'queued' ? 'bg-primary animate-pulse' : 'bg-muted-foreground/40')} />
-            {displayStatus === 'building'
-              ? 'Receiving real-time updates via WebSocket'
-              : displayStatus === 'queued'
-                ? 'Waiting for a background worker'
-              : displayStatus === 'pending'
-                ? 'Waiting for build trigger'
-                : 'Log history loaded from database'}
+            <div
+              className={cn(
+                "w-2 h-2 rounded-full",
+                displayStatus === "built" || displayStatus === "failed"
+                  ? "bg-muted-foreground/40"
+                  : isWsConnected
+                  ? "bg-emerald-500 animate-pulse"
+                  : isWsConnecting
+                  ? "bg-amber-500 animate-pulse"
+                  : "bg-muted-foreground/40"
+              )}
+            />
+            {displayStatus === "built" || displayStatus === "failed"
+              ? "Log history loaded from database"
+              : isWsConnected
+              ? "Receiving real-time updates via WebSocket"
+              : isWsConnecting
+              ? "Reconnecting to live stream..."
+              : displayStatus === "queued"
+              ? "Waiting for a background worker"
+              : displayStatus === "pending"
+              ? "Waiting for build trigger"
+              : "Log history loaded from database"}
           </div>
           <div className="flex items-center gap-2">
             {displayStatus === "failed" && (
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => buildAnalysisMutation.mutate()}
-                disabled={buildAnalysisMutation.isPending}
-              >
-                {buildAnalysisMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
-                Diagnose
-              </Button>
+              <>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => buildAnalysisMutation.mutate()}
+                  disabled={buildAnalysisMutation.isPending}
+                >
+                  {buildAnalysisMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="bot" fallback={Bot} className="mr-2 h-4 w-4"  />}
+                  Diagnose
+                </Button>
+                <Button
+                  size="sm"
+                  className="bg-primary hover:bg-primary/90 text-primary-foreground font-medium shadow-sm gap-1.5"
+                  onClick={() => buildRepairMutation.mutate()}
+                  disabled={buildRepairMutation.isPending}
+                >
+                  {buildRepairMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="wand2" fallback={Wand2} className="mr-2 h-4 w-4"  />}
+                  Auto-Fix & Deploy
+                </Button>
+              </>
             )}
             {displayStatus === "pending" && (
               <Button size="sm" onClick={onStartBuild} disabled={isStartingBuild}>
-                {isStartingBuild ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4 fill-current" />}
+                {isStartingBuild ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="play" fallback={Play} className="mr-2 h-4 w-4 fill-current"  />}
                 Start build
+              </Button>
+            )}
+            {(displayStatus === "building" || displayStatus === "queued") && onCancelBuild && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:border-destructive gap-1.5"
+                onClick={onCancelBuild}
+                disabled={isCancellingBuild}
+              >
+                {isCancellingBuild ? (
+                  <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <AppIcon name="x-circle" fallback={XCircle} className="mr-2 h-4 w-4" />
+                )}
+                Cancel build
               </Button>
             )}
             <Button variant="ghost" size="sm" onClick={onClose}>Close</Button>
@@ -1617,11 +1937,14 @@ function RuntimeDialog({
       onChanged();
     },
     onError: (error: unknown) => {
-      const message =
+      const responseData =
         error instanceof AxiosError
-          ? (error.response?.data as { error?: string } | undefined)?.error || "Failed to deploy runtime"
-          : "Failed to deploy runtime";
-      toast.error(message);
+          ? (error.response?.data as { error?: string; hint?: string; details?: string } | undefined)
+          : (error as { response?: { data?: { error?: string; hint?: string; details?: string } } })?.response?.data;
+      const message = responseData?.error || "Failed to deploy runtime";
+      toast.error(message, {
+        description: responseData?.hint || responseData?.details,
+      });
     },
   });
 
@@ -1763,16 +2086,20 @@ function RuntimeDialog({
   const commitSha = realCommitSha(deployment);
   const commitUrl = githubCommitUrl(deployment);
 
+  const runtimeQueryRef = useRef(runtimeQuery);
+  runtimeQueryRef.current = runtimeQuery;
+
   useEffect(() => {
     const wsBaseUrl = getWebSocketBaseUrl();
-    const socket = new WebSocket(`${wsBaseUrl}/ws/logs?deploymentId=${deployment.id}`);
+    const token = getAuthToken();
+    const socket = new WebSocket(`${wsBaseUrl}/ws/logs?deploymentId=${deployment.id}${token ? `&token=${encodeURIComponent(token)}` : ""}`);
     socketRef.current = socket;
 
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data) as DeploymentSocketMessage;
         if (message.type === "status" || message.type === "deployment_update") {
-          runtimeQuery.refetch();
+          runtimeQueryRef.current.refetch();
           queryClient.invalidateQueries({ queryKey: ["deployments"] });
         }
         if (message.type === "deployment_deleted") {
@@ -1787,7 +2114,7 @@ function RuntimeDialog({
       socket.close();
       socketRef.current = null;
     };
-  }, [deployment.id, onClose, queryClient, runtimeQuery]);
+  }, [deployment.id, onClose, queryClient]);
 
   return (
     <Dialog open={!!deployment} onOpenChange={(open) => !open && onClose()}>
@@ -1796,7 +2123,7 @@ function RuntimeDialog({
           <div className="flex items-start justify-between gap-4 pr-10">
             <div className="min-w-0">
               <DialogTitle className="flex items-center gap-2">
-                <Server className="h-5 w-5 text-primary" />
+                <AppIcon name="server" fallback={Server} className="h-5 w-5 text-primary"  />
                 {isRemoteDocker ? "Remote Runtime" : isLocalDocker ? "Local Docker Runtime" : "Kubernetes Runtime"}
               </DialogTitle>
               <DialogDescription className="mt-2">
@@ -1808,16 +2135,16 @@ function RuntimeDialog({
               </DialogDescription>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={() => onViewLogs(deployment.id)} className="shrink-0">
-              <Terminal className="mr-2 h-4 w-4" />
+              <AppIcon name="terminal" fallback={Terminal} className="mr-2 h-4 w-4"  />
               View logs
             </Button>
           </div>
         </DialogHeader>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-6 pb-0">
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4 space-y-4">
           {!isRemoteDocker && !isLocalDocker && (
-            <>
-              <div className="grid shrink-0 gap-3 pt-3 md:grid-cols-3">
+            <div className="space-y-3 rounded-xl border border-border/70 bg-muted/20 p-4">
+              <div className="grid gap-3 md:grid-cols-3">
                 <div className="min-w-0 space-y-1.5">
                   <Label htmlFor="runtime-namespace">Namespace</Label>
                   <Input
@@ -1850,7 +2177,7 @@ function RuntimeDialog({
                 </div>
               </div>
 
-              <div className="mt-2 shrink-0 space-y-1.5">
+              <div className="space-y-1.5">
                 <Label>Exposure Mode</Label>
                 <div className="grid grid-cols-2 gap-2 rounded-xl border border-border bg-muted/30 p-1">
                   <Button
@@ -1861,7 +2188,7 @@ function RuntimeDialog({
                     title={!canUseIngress ? "Ingress is available only for prepared remote Kubernetes runtimes" : undefined}
                     onClick={() => setExposureMode("ingress")}
                   >
-                    <Globe className="mr-2 h-4 w-4" />
+                    <AppIcon name="globe" fallback={Globe} className="mr-2 h-4 w-4"  />
                     Ingress
                   </Button>
                   <Button
@@ -1871,7 +2198,7 @@ function RuntimeDialog({
                     disabled={isDeployed}
                     onClick={() => setExposureMode("nodeport")}
                   >
-                    <Server className="mr-2 h-4 w-4" />
+                    <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                     NodePort
                   </Button>
                 </div>
@@ -1887,7 +2214,7 @@ function RuntimeDialog({
               </div>
 
               {!isDeployed && (
-                <div className="mt-2 grid shrink-0 gap-3 md:grid-cols-[1fr_1.4fr]">
+                <div className="grid gap-3 md:grid-cols-[1fr_1.4fr]">
                   <div className="space-y-1.5">
                     <Label>Resource Preset</Label>
                     <div className="grid grid-cols-3 gap-2 rounded-xl border border-border bg-muted/30 p-1">
@@ -1915,13 +2242,11 @@ function RuntimeDialog({
                   </div>
                 </div>
               )}
-            </>
+            </div>
           )}
 
-          <div className="min-h-[420px] flex-1 overflow-y-auto py-4 pr-1">
-            <div className="grid gap-4">
-              <div className="min-w-0 rounded-xl border border-border bg-muted/30 p-4 text-sm">
-                <div className="grid gap-3.5">
+          <div className="min-w-0 rounded-xl border border-border bg-muted/30 p-4 text-sm">
+            <div className="grid gap-3.5">
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="min-w-0">
                       <span className="text-muted-foreground">Branch</span>
@@ -1939,7 +2264,7 @@ function RuntimeDialog({
                             title={commitSha}
                           >
                             {shortCommit(commitSha)}
-                            <ExternalLink className="h-3 w-3" />
+                            <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
                           </a>
                         ) : (
                           <span className="font-mono text-xs text-foreground">{commitSha ? shortCommit(commitSha) : "-"}</span>
@@ -1984,7 +2309,7 @@ function RuntimeDialog({
                   <div className="min-w-0">
                     <span className="text-muted-foreground">{isRemoteDocker ? "Runtime provider" : "Exposure"}</span>
                     <div className="flex items-center gap-2 text-foreground">
-                      <Globe className="h-3.5 w-3.5 text-primary" />
+                      <AppIcon name="globe" fallback={Globe} className="h-3.5 w-3.5 text-primary"  />
                       {formatRuntimeStatus(isRemoteDocker ? "remote_docker" : isLocalDocker ? "local_docker" : activeExposureMode)}
                     </div>
                   </div>
@@ -2072,7 +2397,7 @@ function RuntimeDialog({
                   <div className="mt-4 rounded-lg border border-border bg-background/70 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2 font-medium text-foreground">
-                        <Bot className="h-4 w-4 text-primary" />
+                        <AppIcon name="bot" fallback={Bot} className="h-4 w-4 text-primary"  />
                         AI runtime diagnosis
                       </div>
                       <Badge variant={runtimeAnalysis.status === "error" ? "destructive" : "outline"}>
@@ -2116,7 +2441,7 @@ function RuntimeDialog({
                         }}
                         disabled={eventsQuery.isFetching}
                       >
-                        {eventsQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Activity className="mr-2 h-4 w-4" />}
+                        {eventsQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="activity" fallback={Activity} className="mr-2 h-4 w-4"  />}
                         Events
                       </Button>
                     </div>
@@ -2129,17 +2454,15 @@ function RuntimeDialog({
                 </div>
               </div>
             </div>
-          </div>
-        </div>
 
-        <DialogFooter className="!mx-5 !mb-5 mt-0 shrink-0 rounded-xl border border-border bg-muted/40 p-3">
+        <DialogFooter className="shrink-0 border-t border-border bg-muted/30 px-6 py-3.5 flex flex-wrap items-center justify-end gap-2">
               <Button
                 type="button"
                 variant="outline"
                 onClick={() => runtimeQuery.refetch()}
                 disabled={runtimeQuery.isFetching}
           >
-            {runtimeQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            {runtimeQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : null}
             Refresh
           </Button>
           {canPauseResume && isDeployed && (
@@ -2150,11 +2473,11 @@ function RuntimeDialog({
               disabled={pauseResumeMutation.isPending}
             >
               {pauseResumeMutation.isPending ? (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
               ) : isPaused ? (
-                <Play className="mr-2 h-4 w-4" />
+                <AppIcon name="play" fallback={Play} className="mr-2 h-4 w-4"  />
               ) : (
-                <Pause className="mr-2 h-4 w-4" />
+                <AppIcon name="pause" fallback={Pause} className="mr-2 h-4 w-4"  />
               )}
               {isPaused ? "Resume Runtime" : "Pause Runtime"}
             </Button>
@@ -2166,7 +2489,7 @@ function RuntimeDialog({
               onClick={() => runtimeAnalysisMutation.mutate()}
               disabled={runtimeAnalysisMutation.isPending}
             >
-              {runtimeAnalysisMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Bot className="mr-2 h-4 w-4" />}
+              {runtimeAnalysisMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="bot" fallback={Bot} className="mr-2 h-4 w-4"  />}
               Diagnose
             </Button>
           )}
@@ -2176,7 +2499,7 @@ function RuntimeDialog({
               onClick={() => deployMutation.mutate()}
               disabled={deployMutation.isPending || !deployment.image_name}
             >
-              {deployMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Server className="mr-2 h-4 w-4" />}
+              {deployMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />}
               {wantsLocalDocker ? "Deploy to Docker" : "Deploy to Kubernetes"}
             </Button>
           )}
@@ -2188,7 +2511,7 @@ function RuntimeDialog({
                 onClick={() => rollbackMutation.mutate()}
                 disabled={rollbackMutation.isPending || isPaused}
               >
-                {rollbackMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}
+                {rollbackMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="rotate-ccw" fallback={RotateCcw} className="mr-2 h-4 w-4"  />}
                 Rollback
               </Button>
               <Button
@@ -2197,18 +2520,21 @@ function RuntimeDialog({
                 onClick={() => scaleMutation.mutate()}
                 disabled={scaleMutation.isPending || !canScale}
               >
-                {scaleMutation.isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                {scaleMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : null}
                 Scale to {requestedReplicas}
               </Button>
             </>
           )}
+          <Button type="button" variant="ghost" onClick={onClose}>
+            Close
+          </Button>
         </DialogFooter>
       </DialogContent>
       <Dialog open={eventsOpen} onOpenChange={setEventsOpen}>
         <DialogContent className="!flex !w-[min(92vw,56rem)] !max-w-[min(92vw,56rem)] !max-h-[82dvh] !flex-col overflow-hidden rounded-xl border-border bg-card p-0">
           <DialogHeader className="shrink-0 border-b border-border px-6 py-5">
             <DialogTitle className="flex items-center gap-2">
-              <Activity className="h-5 w-5 text-primary" />
+              <AppIcon name="activity" fallback={Activity} className="h-5 w-5 text-primary"  />
               Kubernetes Events
             </DialogTitle>
             <DialogDescription>
@@ -2224,7 +2550,7 @@ function RuntimeDialog({
           </div>
           <DialogFooter className="!mx-0 !mb-0 shrink-0 border-t border-border px-6 pt-4 pb-14">
             <Button type="button" variant="outline" onClick={() => eventsQuery.refetch()} disabled={eventsQuery.isFetching}>
-              {eventsQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+              {eventsQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />}
               Refresh
             </Button>
             <Button type="button" variant="ghost" onClick={() => setEventsOpen(false)}>
@@ -2249,7 +2575,6 @@ function MetricsDialog({
   const chart = useChartTheme();
 
   const [history, setHistory] = useState<RuntimeMetricPoint[]>([]);
-  const [browserGpuName] = useState(() => detectBrowserGpuName());
   const displayName = deploymentDisplayName(deployment);
 
   const metricsQuery = useQuery({
@@ -2288,7 +2613,7 @@ function MetricsDialog({
   const series = metrics?.series || [];
   const memoryPercent = summary?.memory_percent;
   const cpuName = host?.cpu_name || "Unavailable";
-  const gpuName = host?.gpu_name || browserGpuName || "Unavailable";
+  const gpuName = host?.gpu_name || (typeof host?.gpu_usage_percent === "number" ? "Host GPU" : "No host GPU detected");
   const memoryLimitBytes = summary?.memory_limit_bytes;
   const networkTotalBytes = metricValue(summary?.network_rx_bytes) + metricValue(summary?.network_tx_bytes);
   const diskTotalBytes = metricValue(summary?.block_read_bytes) + metricValue(summary?.block_write_bytes);
@@ -2332,7 +2657,7 @@ function MetricsDialog({
           <div className="flex items-start justify-between gap-4 pr-10">
             <div className="min-w-0">
               <DialogTitle className="flex items-center gap-2">
-                <Activity className="h-5 w-5 text-primary" />
+                <AppIcon name="activity" fallback={Activity} className="h-5 w-5 text-primary"  />
                 Runtime Metrics
               </DialogTitle>
               <DialogDescription className="mt-2">
@@ -2348,13 +2673,13 @@ function MetricsDialog({
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           <div className="grid gap-4 md:grid-cols-4">
             <MetricCard
-              icon={<Cpu className="h-4 w-4" />}
+              icon={<AppIcon name="cpu" fallback={Cpu} className="h-4 w-4"  />}
               label="CPU"
               value={metricsQuery.isLoading ? "Checking..." : formatMetricNumber(summary?.cpu_percent, "%")}
               detail={summary?.cpu_millicores ? `${summary.cpu_millicores}m cores` : truncateMiddle(cpuName, 34)}
             />
             <MetricCard
-              icon={<HardDrive className="h-4 w-4" />}
+              icon={<AppIcon name="hard-drive" fallback={HardDrive} className="h-4 w-4"  />}
               label="Memory"
               value={metricsQuery.isLoading ? "Checking..." : formatGigabytes(summary?.memory_bytes)}
               detail={
@@ -2366,13 +2691,13 @@ function MetricsDialog({
               }
             />
             <MetricCard
-              icon={<Thermometer className="h-4 w-4" />}
+              icon={<AppIcon name="thermometer" fallback={Thermometer} className="h-4 w-4"  />}
               label="CPU Temp"
               value={formatMetricNumber(host?.cpu_temperature_celsius, " C")}
               detail={host?.cpu_temperature_celsius ? truncateMiddle(cpuName, 34) : "Host sensor hidden"}
             />
             <MetricCard
-              icon={<Gauge className="h-4 w-4" />}
+              icon={<AppIcon name="gauge" fallback={Gauge} className="h-4 w-4"  />}
               label="GPU"
               value={formatMetricNumber(host?.gpu_usage_percent, "%")}
               detail={
@@ -2385,25 +2710,25 @@ function MetricsDialog({
 
           <div className="mt-4 grid gap-4 md:grid-cols-4">
             <MetricCard
-              icon={<Server className="h-4 w-4" />}
+              icon={<AppIcon name="server" fallback={Server} className="h-4 w-4"  />}
               label="Ready"
               value={`${readyUnits || 0}/${totalUnits || 0}`}
               detail="Runtime units"
             />
             <MetricCard
-              icon={<HardDrive className="h-4 w-4" />}
+              icon={<AppIcon name="hard-drive" fallback={HardDrive} className="h-4 w-4"  />}
               label="Limit"
               value={formatGigabytes(memoryLimitBytes)}
               detail="Configured memory cap"
             />
             <MetricCard
-              icon={<Activity className="h-4 w-4" />}
+              icon={<AppIcon name="activity" fallback={Activity} className="h-4 w-4"  />}
               label="Network"
               value={formatBytes(networkTotalBytes)}
               detail={`Rx ${formatBytes(summary?.network_rx_bytes)} / Tx ${formatBytes(summary?.network_tx_bytes)}`}
             />
             <MetricCard
-              icon={<Gauge className="h-4 w-4" />}
+              icon={<AppIcon name="gauge" fallback={Gauge} className="h-4 w-4"  />}
               label="Disk I/O"
               value={formatGigabytes(diskTotalBytes)}
               detail={`Read ${formatGigabytes(summary?.block_read_bytes)} / Write ${formatGigabytes(summary?.block_write_bytes)}`}
@@ -2434,10 +2759,10 @@ function MetricsDialog({
                   <h3 className="font-semibold text-foreground">CPU Trend</h3>
                   <p className="text-xs text-muted-foreground">Percent over the live sampling window</p>
                 </div>
-                {metricsQuery.isFetching ? <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" /> : null}
+                {metricsQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin text-muted-foreground"  /> : null}
               </div>
               <div className="h-56">
-                <ResponsiveContainer width="100%" height="100%">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
                   <AreaChart data={chartHistory} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
                     <defs>
                       <linearGradient id="cpuGradient" x1="0" y1="0" x2="0" y2="1">
@@ -2474,7 +2799,7 @@ function MetricsDialog({
                 <p className="text-xs text-muted-foreground">Memory usage in gigabytes</p>
               </div>
               <div className="h-56">
-                <ResponsiveContainer width="100%" height="100%">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
                   <AreaChart data={memoryChart} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
                     <defs>
                       <linearGradient id="memoryGradient" x1="0" y1="0" x2="0" y2="1">
@@ -2524,8 +2849,8 @@ function MetricsDialog({
                 </thead>
                 <tbody>
                   {series.length > 0 ? (
-                    series.map((item) => (
-                      <tr key={item.name} className="border-b border-border/60 last:border-0">
+                    series.map((item, index) => (
+                      <tr key={`${item.name || "metric"}-${index}`} className="border-b border-border/60 last:border-0">
                         <td className="max-w-[20rem] break-all py-2 pr-4 font-mono text-xs">{item.name}</td>
                         <td className="py-2 pr-4">{formatMetricNumber(item.cpu_percent, "%")}</td>
                         <td className="py-2 pr-4">{formatGigabytes(item.memory_bytes)} / {formatGigabytes(item.memory_limit_bytes)}</td>
@@ -2548,9 +2873,9 @@ function MetricsDialog({
           </div>
         </div>
 
-        <DialogFooter className="mx-6 mb-5 shrink-0 rounded-xl border border-border bg-muted/30 px-4 py-4">
+        <DialogFooter className="shrink-0 border-t border-border bg-muted/30 px-6 py-3.5 flex items-center justify-end gap-2">
           <Button type="button" variant="outline" onClick={() => metricsQuery.refetch()} disabled={metricsQuery.isFetching}>
-            {metricsQuery.isFetching ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+            {metricsQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />}
             Refresh
           </Button>
           <Button type="button" variant="ghost" onClick={onClose}>Close</Button>
@@ -2632,7 +2957,7 @@ function DeleteDeploymentDialog({
         <div className="min-w-0 space-y-4 px-5 pt-5">
           <DialogHeader className="gap-1.5">
             <div className="mx-auto mb-1 flex h-10 w-10 items-center justify-center rounded-full border border-destructive/20 bg-destructive/10">
-              <AlertTriangle className="h-5 w-5 text-destructive" />
+              <AppIcon name="alert-triangle" fallback={AlertTriangle} className="h-5 w-5 text-destructive"  />
             </div>
             <DialogTitle className="text-center text-base font-bold text-foreground">Delete Deployment?</DialogTitle>
             <DialogDescription className="mx-auto max-w-[58ch] text-center text-xs leading-relaxed">
@@ -2686,7 +3011,7 @@ function DeleteDeploymentDialog({
               Type <span className="break-words font-semibold text-foreground">{expectedText}</span> to confirm
             </Label>
             <Button type="button" variant="outline" size="sm" onClick={copyConfirmationText} className="shrink-0">
-              <Copy className="mr-2 h-3.5 w-3.5" />
+              <AppIcon name="copy" fallback={Copy} className="mr-2 h-3.5 w-3.5"  />
               Copy
             </Button>
           </div>
@@ -2711,7 +3036,7 @@ function DeleteDeploymentDialog({
             disabled={!canDelete}
             className="w-full min-w-0"
           >
-            {isDeleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
+            {isDeleting ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="trash2" fallback={Trash2} className="mr-2 h-4 w-4"  />}
             Delete
           </Button>
         </DialogFooter>
@@ -2719,3 +3044,6 @@ function DeleteDeploymentDialog({
     </Dialog>
   );
 }
+
+// Force Next.js recompile
+

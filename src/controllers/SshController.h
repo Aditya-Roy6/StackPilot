@@ -21,6 +21,8 @@ public:
     ADD_METHOD_TO(SshController::initializeKubernetesCluster, "/api/v1/ssh/connections/{id}/cluster/init", drogon::Post);
     ADD_METHOD_TO(SshController::joinKubernetesCluster, "/api/v1/ssh/connections/{id}/cluster/join", drogon::Post);
     ADD_METHOD_TO(SshController::inspectKubernetesCluster, "/api/v1/ssh/connections/{id}/cluster/status", drogon::Get);
+    ADD_METHOD_TO(SshController::deleteKubernetesCluster, "/api/v1/ssh/clusters/{id}", drogon::Delete);
+    ADD_METHOD_TO(SshController::wipeConnection, "/api/v1/ssh/connections/{id}/wipe", drogon::Post);
     ADD_METHOD_TO(SshController::removeKubernetesNode, "/api/v1/ssh/connections/{id}/cluster/nodes/{node}", drogon::Delete);
     ADD_METHOD_TO(SshController::browseConnection, "/api/v1/ssh/connections/{id}/browse", drogon::Post);
     ADD_METHOD_TO(SshController::executeCommand, "/api/v1/ssh/connections/{id}/command", drogon::Post);
@@ -62,6 +64,12 @@ public:
     void inspectKubernetesCluster(const drogon::HttpRequestPtr& req,
                                   std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                                   const std::string& id);
+    void deleteKubernetesCluster(const drogon::HttpRequestPtr& req,
+                                 std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                                 const std::string& id);
+    void wipeConnection(const drogon::HttpRequestPtr& req,
+                        std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                        const std::string& id);
     void browseConnection(const drogon::HttpRequestPtr& req,
                           std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                           const std::string& id);

@@ -90,8 +90,7 @@ std::string LocalDockerRuntime::makeRunCommand(const std::string& containerName,
         if (!isValidRuntimeEnvKey(envVar.first)) {
             continue;
         }
-        std::string value = envVar.second;
-        std::replace(value.begin(), value.end(), '\n', ' ');
+        const std::string& value = envVar.second;
         envArgs += " --env " + shellQuote(envVar.first + "=" + value);
     }
 
@@ -110,14 +109,47 @@ std::string LocalDockerRuntime::makeRunCommand(const std::string& containerName,
         "container_port=$(docker image inspect --format '{{range $p, $_ := .Config.ExposedPorts}}{{println $p}}{{end}}' " + image + " 2>/dev/null | sed -n 's#/tcp$##p' | head -n 1); "
         "[ -n \"$container_port\" ] || container_port=3000; "
         "fi; "
+        "container=" + container + "; "
         "docker rm -f " + container + " >/dev/null 2>&1 || true; "
         "docker run -d --restart unless-stopped --name " + container + envArgs +
         " -p 127.0.0.1::$container_port " + image + " >/tmp/stackpilot-local-container-id; "
         "host_port=$(docker port " + container + " $container_port/tcp 2>/dev/null | awk -F: 'NF {print $NF; exit}'); "
         "[ -n \"$host_port\" ] || { echo __STACKPILOT_PORT_MISSING__; docker logs --tail 80 " + container + " || true; exit 13; }; "
-        "status=$(docker inspect --format '{{.State.Status}}' " + container + "); "
-        "running=$(docker inspect --format '{{.State.Running}}' " + container + "); "
+        "ready=0; "
+        "for i in $(seq 1 45); do "
+        "status=$(docker inspect --format '{{.State.Status}}' \"$container\" 2>/dev/null || echo \"exited\"); "
+        "if [ \"$status\" = \"exited\" ] || [ \"$status\" = \"dead\" ]; then "
+        "echo \"Container crashed on startup:\"; "
+        "docker logs --tail 50 \"$container\" 2>&1; "
+        "exit 1; "
+        "fi; "
+        "if [ -n \"$host_port\" ]; then "
+        "if curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:$host_port/\" >/dev/null 2>&1 || "
+        "curl -s -o /dev/null -w \"%{http_code}\" \"http://host.docker.internal:$host_port/\" >/dev/null 2>&1 || "
+        "nc -z 127.0.0.1 \"$host_port\" >/dev/null 2>&1 || "
+        "[ \"$status\" = \"running\" ]; then "
+        "ready=1; "
+        "break; "
+        "fi; "
+        "else "
+        "if [ \"$status\" = \"running\" ]; then ready=1; break; fi; "
+        "fi; "
+        "sleep 1; "
+        "done; "
+        "status=$(docker inspect --format '{{.State.Status}}' \"$container\" 2>/dev/null || echo \"exited\"); "
+        "if [ \"$status\" = \"exited\" ] || [ \"$status\" = \"dead\" ]; then "
+        "echo \"Container crashed on startup:\"; "
+        "docker logs --tail 50 \"$container\" 2>&1; "
+        "exit 1; "
+        "fi; "
+        "if [ \"$ready\" -ne 1 ]; then "
+        "echo \"Container readiness probe failed or timed out:\"; "
+        "docker logs --tail 50 \"$container\" 2>&1 || true; "
+        "exit 1; "
+        "fi; "
+        "running=$(docker inspect --format '{{.State.Running}}' \"$container\" 2>/dev/null || echo \"true\"); "
         "echo __STACKPILOT_LOCAL_DOCKER_RUNNING__; "
+        "echo __STACKPILOT_LOCAL_DOCKER_PORT__=$host_port; "
         "echo container_name=" + containerName + "; "
         "echo container_port=$container_port; "
         "echo host_port=$host_port; "
@@ -126,7 +158,7 @@ std::string LocalDockerRuntime::makeRunCommand(const std::string& containerName,
         "echo running=$running; "
         "echo image=" + imageName + "; "
         "echo __STACKPILOT_LOCAL_LOG_TAIL__; "
-        "docker logs --tail 80 " + container + " 2>&1 || true";
+        "docker logs --tail 80 \"$container\" 2>&1 || true";
 }
 
 std::string LocalDockerRuntime::makePauseCommand(const std::string& containerName, bool paused) {

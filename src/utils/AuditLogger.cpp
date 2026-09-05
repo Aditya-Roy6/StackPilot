@@ -40,13 +40,16 @@ std::string AuditLogger::clientIp(const drogon::HttpRequestPtr& req) {
         return "unknown";
     }
 
-    const std::string forwarded = trim(req->getHeader("X-Forwarded-For"));
-    if (!forwarded.empty()) {
-        const auto comma = forwarded.find(',');
-        return lower(trim(forwarded.substr(0, comma)));
+    const std::string peer = lower(req->peerAddr().toIp());
+    if (strings::isTrustedProxy(peer)) {
+        const std::string forwarded = trim(req->getHeader("X-Forwarded-For"));
+        if (!forwarded.empty()) {
+            const auto comma = forwarded.find(',');
+            return lower(trim(forwarded.substr(0, comma)));
+        }
     }
 
-    return lower(req->peerAddr().toIp());
+    return peer;
 }
 
 std::string AuditLogger::userAgent(const drogon::HttpRequestPtr& req) {

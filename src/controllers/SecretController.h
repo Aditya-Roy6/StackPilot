@@ -41,7 +41,7 @@ public:
 
 private:
     std::string extractUserId(const drogon::HttpRequestPtr& req);
-    bool userOwnsProject(const std::string& projectId, const std::string& userId);
+    bool userOwnsProject(const std::string& projectId, const std::string& userId, const std::string& minRole = "viewer");
 };
 
 } // namespace stackpilot

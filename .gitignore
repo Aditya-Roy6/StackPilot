@@ -92,10 +92,7 @@ deployment-create.json
 
 # Local MCP staging and generated deployment workspaces
 local-projects/
-uploads/builds/
-uploads/source-artifacts/
-uploads/ssh/
-uploads/tmp/
+uploads/
 
 # TypeScript incremental build caches — machine-specific, regenerated on build
 *.tsbuildinfo

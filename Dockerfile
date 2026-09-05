@@ -120,6 +120,13 @@ RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release
     -o /usr/local/bin/kubectl \
     && chmod +x /usr/local/bin/kubectl
 
+RUN curl -fsSL https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb \
+    && dpkg -i /tmp/packages-microsoft-prod.deb \
+    && rm /tmp/packages-microsoft-prod.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends powershell nodejs npm python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
 # Run as an unprivileged user instead of root. Note this does NOT neutralise the
 # mounted docker socket — see docker-compose.yml, where group_add grants access to
 # it. Dropping root still removes the ability to write system paths, install

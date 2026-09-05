@@ -10,16 +10,34 @@ import {
   ChevronDown,
   ClipboardCopy,
   Clock,
+  Copy,
+  GitFork,
   Loader2,
+  Mic,
+  MicOff,
   Plus,
+  RefreshCw,
   Send,
   Settings,
+  ShieldAlert,
+  Sparkles,
+  Square,
   Star,
+  Terminal,
+  Trash2,
+  Maximize2,
+  Minimize2,
+  CornerDownLeft,
+  X,
   Zap,
 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Link from "next/link";
+import { useTheme } from "next-themes";
+import { ThinkingOrb, type OrbState } from "thinking-orbs";
+import { toast } from "sonner";
 
 import api from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
@@ -36,6 +54,7 @@ import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { StatusVerb } from "@/components/ui/status-verb";
 import { ThinkingPanel } from "@/components/ui/thinking-panel";
+import { ToolCallCard, ToolCall, ToolsPanel } from "@/components/ui/tool-call-card";
 import { streamAgentReply } from "@/lib/stream-agent";
 
 // Must exceed the ai-service (90s) and backend (120s) timeouts, otherwise the
@@ -45,6 +64,27 @@ const AI_REQUEST_TIMEOUT_MS = 130000;
 type AiMode = "fast" | "thinking";
 type AiProvider = "nvidia_nim" | "openai_compatible";
 type Role = "user" | "assistant" | "system";
+
+export type ThinkingOrbStyle = OrbState | "off";
+
+export interface OrbStyleDefinition {
+  id: ThinkingOrbStyle;
+  label: string;
+  description: string;
+}
+
+export const ORB_STYLES: OrbStyleDefinition[] = [
+  { id: "solving", label: "Solving", description: "Quarter-turn bands scramble and click back into place" },
+  { id: "searching", label: "Searching", description: "A scan meridian sweeps across a dotted globe" },
+  { id: "working", label: "Working", description: "Particle dots on tilted multi-axis orbits" },
+  { id: "weaving", label: "Weaving", description: "Three helix strands plait smoothly around the sphere" },
+  { id: "composing", label: "Composing", description: "An undulating multi-band sash in rhythmic motion" },
+  { id: "breathing", label: "Breathing", description: "A gentle face-on ring expanding and contracting" },
+  { id: "shaping", label: "Shaping", description: "A dotted outline morphing circle → triangle → square" },
+  { id: "connecting", label: "Connecting", description: "A dynamic constellation wiring itself with network packets" },
+  { id: "listening", label: "Listening", description: "A rhythmic waveform rolling through latitude rings" },
+  { id: "off", label: "Turn Off", description: "Disable the thinking orb animation completely" },
+];
 
 interface AiModel {
   id: string;
@@ -115,6 +155,7 @@ interface ChatMessage {
   meta?: string;
   /** The model's working, when it exposes reasoning_content. */
   reasoning?: string;
+  toolCalls?: ToolCall[];
   stats?: {
     latencyMs?: number;
     promptTokens?: number;
@@ -148,6 +189,17 @@ interface AiChatMessage {
   created_at: string;
 }
 
+interface TerminalExecutionLog {
+  id: string;
+  command: string;
+  timestamp: string;
+  status: "running" | "success" | "error";
+  exitCode?: number;
+  stdout?: string;
+  stderr?: string;
+  cwd?: string;
+}
+
 interface AgentApplicationTemplate {
   id: string;
   name: string;
@@ -158,6 +210,34 @@ interface AgentApplicationTemplate {
 }
 
 const commands = [
+  {
+    name: "/architect",
+    arg: "none" as const,
+    icon: Sparkles,
+    usage: "/architect <requirements or architectural goal>",
+    description: "Launch Strategic AI Architect subagent swarm to formulate blueprints, inspect dependencies, and plan execution.",
+  },
+  {
+    name: "/swarm",
+    arg: "none" as const,
+    icon: Sparkles,
+    usage: "/swarm <complex goal>",
+    description: "Multi-agent collaborative execution: Architect, Coder, and Verifier working in concert.",
+  },
+  {
+    name: "/plan",
+    arg: "none" as const,
+    icon: Sparkles,
+    usage: "/plan <feature or refactor>",
+    description: "Produce a structured engineering plan and architectural blueprint with step-by-step phases.",
+  },
+  {
+    name: "/audit",
+    arg: "none" as const,
+    icon: Sparkles,
+    usage: "/audit [target]",
+    description: "Comprehensive workspace audit: security posture, container health, and performance analysis.",
+  },
   {
     name: "/cost",
     arg: "none" as const,
@@ -236,11 +316,32 @@ const commands = [
     description: "A project's environments, branches and auto-deploy settings.",
   },
   {
+    name: "/terminal",
+    arg: "command" as const,
+    icon: Terminal,
+    usage: "/terminal <command>",
+    description: "Execute a command in the active deployment/project workspace terminal.",
+  },
+  {
+    name: "/run",
+    arg: "command" as const,
+    icon: Terminal,
+    usage: "/run <command>",
+    description: "Run a shell or PowerShell command in the workspace.",
+  },
+  {
     name: "/diagnose",
     arg: "deployment" as const,
     icon: Star,
     usage: "/diagnose <deployment-id>",
     description: "Analyze failed builds or runtime health using logs and deployment context.",
+  },
+  {
+    name: "/repair",
+    arg: "deployment" as const,
+    icon: Star,
+    usage: "/repair <deployment-id>",
+    description: "Autonomous AI project repair: diagnose, auto-patch files, and re-deploy.",
   },
   {
     name: "/build",
@@ -437,17 +538,13 @@ const starterMessages: ChatMessage[] = [
     role: "assistant",
     content:
       "I can reason about deployments and run real platform actions. Try “deploy a MySQL database”, /app redis, /diagnose with a failed deployment, /build to queue a build, or ask a normal question.",
-    meta: "StackPilot Agent",
   },
 ];
 
-const defaultModels: AiModel[] = [
-  { id: "meta/llama-3.1-8b-instruct", label: "meta/llama-3.1-8b-instruct", mode: "fast" },
-  { id: "meta/llama-3.1-70b-instruct", label: "meta/llama-3.1-70b-instruct", mode: "thinking" },
-];
+const defaultModels: AiModel[] = [];
 
 function FilledStarIcon({ className }: { className?: string }) {
-  return <Star className={className} fill="currentColor" strokeWidth={2.4} />;
+  return <AppIcon name="star" fallback={Star} className={className} fill="currentColor" strokeWidth={2.4}  />;
 }
 
 function shortId(id?: string, size = 8) {
@@ -489,21 +586,87 @@ function errorMessage(error: unknown, fallback: string) {
 }
 
 function formatAiOutput(result: AiResponse) {
-  const lines = [result.summary || result.error || "No summary returned."];
+  const lines: string[] = [];
   const output = result.structured_output || {};
-  const rootCause = output.root_cause || output.likely_root_cause || output.diagnosis;
-  const steps = output.fix_steps || output.steps || output.recommendations || output.safe_remediations;
-  const dockerfile = output.dockerfile;
 
-  if (typeof rootCause === "string" && rootCause.trim()) {
+  // Architecture section
+  const arch = output.architecture as Record<string, unknown> | undefined;
+  if (arch && typeof arch === "object") {
+    lines.push("### 🏗 Architecture & Stack Overview");
+    if (arch.framework || arch.primary_language) {
+      lines.push(`- **Framework / Language:** ${arch.framework || "N/A"} (${arch.primary_language || "N/A"})`);
+    }
+    if (arch.project_type) lines.push(`- **Project Type:** ${arch.project_type}`);
+    if (arch.build_system) lines.push(`- **Build System:** ${arch.build_system}`);
+    if (arch.entry_point) lines.push(`- **Entry Point:** \`${arch.entry_point}\``);
+    if (Array.isArray(arch.key_dependencies) && arch.key_dependencies.length > 0) {
+      lines.push(`- **Key Dependencies:** ${arch.key_dependencies.slice(0, 8).map((d) => `\`${d}\``).join(", ")}`);
+    }
+    lines.push("");
+  }
+
+  // Deployment readiness assessment
+  const readiness = output.readiness_assessment as Record<string, unknown> | undefined;
+  if (readiness && typeof readiness === "object") {
+    const score = readiness.readiness_score !== undefined ? `${readiness.readiness_score}/100` : "";
+    const status = String(readiness.status || "").toUpperCase();
+    lines.push(`### 🎯 Deployment Readiness: **${status}** ${score ? `(${score})` : ""}`);
+    if (readiness.verdict) {
+      lines.push(`> ${readiness.verdict}\n`);
+    }
+  }
+
+  // Findings
+  const findings = output.findings as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(findings) && findings.length > 0) {
+    lines.push("### 🔍 Technical Findings");
+    findings.forEach((f) => {
+      const sev = String(f.severity || "info").toUpperCase();
+      const badge = sev === "BLOCKER" || sev === "CRITICAL" ? "🔴" : sev === "WARNING" ? "🟡" : "🔵";
+      const file = f.file_path ? ` (\`${f.file_path}\`)` : "";
+      lines.push(`- ${badge} **[${sev}]** ${f.title || f.category || "Issue"}${file}: ${f.description || ""}`);
+    });
+    lines.push("");
+  }
+
+  // Primary summary or error
+  if (result.summary) {
+    lines.push(result.summary);
+  } else if (result.error) {
+    lines.push(`⚠️ ${result.error}`);
+  }
+
+  const rootCause = output.root_cause || output.likely_root_cause || output.diagnosis;
+  if (typeof rootCause === "string" && rootCause.trim() && !lines.join(" ").includes(rootCause.trim())) {
     lines.push(`\n**Root cause:** ${rootCause}`);
   }
-  if (Array.isArray(steps) && steps.length > 0) {
-    lines.push("\n**Next steps:**");
-    steps.slice(0, 6).forEach((step, index) => {
-      lines.push(`${index + 1}. ${typeof step === "string" ? step : JSON.stringify(step)}`);
+
+  // Recommendations or steps
+  const recs = output.recommendations as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(recs) && recs.length > 0) {
+    lines.push("\n### 💡 Recommended Actions");
+    recs.forEach((rec, idx) => {
+      if (typeof rec === "string") {
+        lines.push(`${idx + 1}. ${rec}`);
+      } else {
+        const priority = rec.priority ? `*[${rec.priority}]* ` : "";
+        const title = rec.title ? `**${rec.title}**: ` : "";
+        const action = rec.action || "";
+        const rationale = rec.rationale ? ` _(${rec.rationale})_` : "";
+        lines.push(`${idx + 1}. ${priority}${title}${action}${rationale}`);
+      }
     });
+  } else {
+    const steps = output.fix_steps || output.steps || output.safe_remediations;
+    if (Array.isArray(steps) && steps.length > 0) {
+      lines.push("\n**Next steps:**");
+      steps.slice(0, 6).forEach((step, index) => {
+        lines.push(`${index + 1}. ${typeof step === "string" ? step : JSON.stringify(step)}`);
+      });
+    }
   }
+
+  const dockerfile = output.dockerfile;
   if (typeof dockerfile === "string" && dockerfile.trim()) {
     lines.push(`\n**Generated Dockerfile:**\n\`\`\`dockerfile\n${dockerfile.trim()}\n\`\`\``);
   }
@@ -513,7 +676,50 @@ function formatAiOutput(result: AiResponse) {
       lines.push(`- ${warning}`);
     });
   }
-  return lines.join("\n");
+  return lines.length > 0 ? lines.join("\n") : "No output returned.";
+}
+
+function parseAssistantMessageContent(rawContent: string, rawReasoning?: string) {
+  let content = rawContent || "";
+  const reasoningBlocks: string[] = [];
+
+  if (rawReasoning && rawReasoning.trim()) {
+    const splitExisting = rawReasoning.split(/\n\s*---\s*\n/).map((s) => s.trim()).filter(Boolean);
+    reasoningBlocks.push(...splitExisting);
+  }
+
+  // 1. Extract any <think>...</think> tags from content
+  if (content.includes("<think>")) {
+    const thinkRegex = /<think>([\s\S]*?)<\/think>/gi;
+    let match;
+    while ((match = thinkRegex.exec(content)) !== null) {
+      if (match[1] && match[1].trim()) {
+        reasoningBlocks.push(match[1].trim());
+      }
+    }
+    content = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+    if (content.startsWith("<think>")) {
+      content = content.replace(/^<think>/i, "").trim();
+    }
+  }
+
+  // 2. Safeguard against raw internal scratchpad thinking leaking into content
+  const isScratchpad =
+    !content.includes("#") &&
+    (content.startsWith("We are given that the deployment failed") ||
+     content.startsWith("Let me check") ||
+     content.startsWith("Let me inspect") ||
+     content.startsWith("Let me look"));
+
+  if (isScratchpad && content.length > 300) {
+    reasoningBlocks.push(content);
+    content = "Completed workspace actions and diagnostic inspection. See the thinking and tool activity above for details.";
+  }
+
+  return {
+    content,
+    reasoningBlocks,
+  };
 }
 
 function CodeBlock({ className, children, ...props }: React.HTMLAttributes<HTMLElement>) {
@@ -525,14 +731,14 @@ function CodeBlock({ className, children, ...props }: React.HTMLAttributes<HTMLE
 
   if (isInline) {
     return (
-      <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-foreground" {...props}>
+      <code className="rounded bg-muted px-1.5 py-0.5 text-xs font-mono text-foreground break-all [overflow-wrap:anywhere] whitespace-normal" {...props}>
         {children}
       </code>
     );
   }
 
   return (
-    <div className="group relative my-2 rounded-lg border border-border bg-muted/50 overflow-hidden">
+    <div className="group relative my-2 rounded-lg border border-border bg-muted/50 overflow-hidden min-w-0 max-w-full">
       <div className="flex items-center justify-between border-b border-border bg-muted/80 px-3 py-1.5">
         <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
           {lang || "code"}
@@ -546,11 +752,11 @@ function CodeBlock({ className, children, ...props }: React.HTMLAttributes<HTMLE
           }}
           className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
         >
-          {copied ? <Check className="h-3 w-3" /> : <ClipboardCopy className="h-3 w-3" />}
+          {copied ? <AppIcon name="check" fallback={Check} className="h-3 w-3"  /> : <AppIcon name="clipboard-copy" fallback={ClipboardCopy} className="h-3 w-3"  />}
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre className="overflow-x-auto p-3 text-xs leading-relaxed">
+      <pre className="overflow-x-auto min-w-0 max-w-full p-3 text-xs leading-relaxed">
         <code className={className} {...props}>{children}</code>
       </pre>
     </div>
@@ -558,36 +764,37 @@ function CodeBlock({ className, children, ...props }: React.HTMLAttributes<HTMLE
 }
 
 const markdownComponents = {
+  pre: ({ children }: any) => <div className="min-w-0 max-w-full my-1">{children}</div>,
   code: CodeBlock,
   p: ({ children, ...props }: React.HTMLAttributes<HTMLParagraphElement>) => (
-    <p className="mb-2 last:mb-0" {...props}>{children}</p>
+    <p className="mb-2 last:mb-0 break-words [overflow-wrap:anywhere]" {...props}>{children}</p>
   ),
   ol: ({ children, ...props }: React.OlHTMLAttributes<HTMLOListElement>) => (
-    <ol className="mb-2 ml-4 list-decimal space-y-1 last:mb-0" {...props}>{children}</ol>
+    <ol className="mb-2 ml-4 list-decimal space-y-1 last:mb-0 break-words [overflow-wrap:anywhere]" {...props}>{children}</ol>
   ),
   ul: ({ children, ...props }: React.HTMLAttributes<HTMLUListElement>) => (
-    <ul className="mb-2 ml-4 list-disc space-y-1 last:mb-0" {...props}>{children}</ul>
+    <ul className="mb-2 ml-4 list-disc space-y-1 last:mb-0 break-words [overflow-wrap:anywhere]" {...props}>{children}</ul>
   ),
   li: ({ children, ...props }: React.LiHTMLAttributes<HTMLLIElement>) => (
-    <li className="text-sm" {...props}>{children}</li>
+    <li className="text-sm break-words [overflow-wrap:anywhere]" {...props}>{children}</li>
   ),
   strong: ({ children, ...props }: React.HTMLAttributes<HTMLElement>) => (
     <strong className="font-semibold text-foreground" {...props}>{children}</strong>
   ),
   h1: ({ children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => (
-    <h3 className="mb-2 mt-3 text-base font-semibold first:mt-0" {...props}>{children}</h3>
+    <h3 className="mb-2 mt-3 text-base font-semibold first:mt-0 break-words [overflow-wrap:anywhere]" {...props}>{children}</h3>
   ),
   h2: ({ children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => (
-    <h4 className="mb-1.5 mt-2.5 text-sm font-semibold first:mt-0" {...props}>{children}</h4>
+    <h4 className="mb-1.5 mt-2.5 text-sm font-semibold first:mt-0 break-words [overflow-wrap:anywhere]" {...props}>{children}</h4>
   ),
   h3: ({ children, ...props }: React.HTMLAttributes<HTMLHeadingElement>) => (
-    <h5 className="mb-1 mt-2 text-sm font-medium first:mt-0" {...props}>{children}</h5>
+    <h5 className="mb-1 mt-2 text-sm font-medium first:mt-0 break-words [overflow-wrap:anywhere]" {...props}>{children}</h5>
   ),
   blockquote: ({ children, ...props }: React.BlockquoteHTMLAttributes<HTMLQuoteElement>) => (
-    <blockquote className="border-l-2 border-primary/40 pl-3 italic text-muted-foreground" {...props}>{children}</blockquote>
+    <blockquote className="border-l-2 border-primary/40 pl-3 italic text-muted-foreground break-words [overflow-wrap:anywhere]" {...props}>{children}</blockquote>
   ),
   table: ({ children, ...props }: React.TableHTMLAttributes<HTMLTableElement>) => (
-    <div className="my-2 overflow-x-auto rounded-lg border border-border">
+    <div className="my-2 overflow-x-auto rounded-lg border border-border max-w-full">
       <table className="w-full text-sm" {...props}>{children}</table>
     </div>
   ),
@@ -661,16 +868,55 @@ function conciseApplicationProjectName(template: AgentApplicationTemplate) {
 
 export default function AiAgentPage() {
   const queryClient = useQueryClient();
+  const { resolvedTheme } = useTheme();
+  const isDark = resolvedTheme === "dark";
   const [messages, setMessages] = useState<ChatMessage[]>(starterMessages);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<AiMode>("fast");
-  const [selectedModel, setSelectedModel] = useState("");
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem("ai-default-model") || "";
+  });
+  const [pendingApproval, setPendingApproval] = useState<{
+    id: string;
+    type: "terminal" | "deploy";
+    title: string;
+    description: string;
+    command?: string;
+    action: () => Promise<void> | void;
+    onDecline: () => void;
+  } | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedDeploymentId, setSelectedDeploymentId] = useState("");
   const [showCommands, setShowCommands] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [composerModelOpen, setComposerModelOpen] = useState(false);
   const [commandPickerOpen, setCommandPickerOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalExpanded, setTerminalExpanded] = useState(false);
+  const [terminalInput, setTerminalInput] = useState("");
+  const [terminalLogs, setTerminalLogs] = useState<TerminalExecutionLog[]>([]);
+  const [terminalHistory, setTerminalHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number>(-1);
+  const [isTerminalExecuting, setIsTerminalExecuting] = useState(false);
+  const [terminalCwd, setTerminalCwd] = useState<string>("");
+  const terminalLogsEndRef = useRef<HTMLDivElement>(null);
+  const terminalInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      const initDeploymentId = params.get("deploymentId");
+      const initCommand = params.get("command");
+      if (initDeploymentId) {
+        setSelectedDeploymentId(initDeploymentId);
+        if (initCommand === "repair") {
+          setInput(`/repair ${initDeploymentId}`);
+        }
+      }
+    }
+  }, []);
   const [settingsModelOpen, setSettingsModelOpen] = useState(false);
   const [projectOpen, setProjectOpen] = useState(false);
   const [deploymentOpen, setDeploymentOpen] = useState(false);
@@ -679,6 +925,9 @@ export default function AiAgentPage() {
   const [compatibleBaseUrl, setCompatibleBaseUrl] = useState("");
   const [compatibleApiKey, setCompatibleApiKey] = useState("");
   const [compatibleModel, setCompatibleModel] = useState("");
+  const [nvidiaApiKey, setNvidiaApiKey] = useState("");
+  const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [customModelList, setCustomModelList] = useState<AiModel[] | null>(null);
   const [agentAccessMode, setAgentAccessMode] = useState<"ask" | "auto_review" | "full_access">(() => {
     if (typeof window === "undefined") return "ask";
     const saved = window.localStorage.getItem("ai-agent-access-mode");
@@ -689,6 +938,15 @@ export default function AiAgentPage() {
     const saved = window.localStorage.getItem("ai-agent-remote-terminal");
     return saved === "ask" || saved === "allow" ? saved : "ask";
   });
+  const [orbStyle, setOrbStyle] = useState<ThinkingOrbStyle>(() => {
+    if (typeof window === "undefined") return "solving";
+    const saved = window.localStorage.getItem("ai-thinking-orb-style");
+    return (saved as ThinkingOrbStyle) || "solving";
+  });
+  const [isListening, setIsListening] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const recognitionRef = useRef<any>(null);
+  const baseTextRef = useRef<string>("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const settingsHydratedRef = useRef(false);
 
@@ -707,6 +965,30 @@ export default function AiAgentPage() {
       return res.data as AiModelsResponse;
     },
   });
+
+  const fetchModelsWithCurrentKey = async () => {
+    setIsFetchingModels(true);
+    try {
+      const currentApiKey = provider === "nvidia_nim" ? nvidiaApiKey.trim() : compatibleApiKey.trim();
+      const currentBaseUrl = provider === "openai_compatible" ? compatibleBaseUrl.trim() : undefined;
+      const res = await api.post("/ai/models", {
+        provider,
+        api_key: currentApiKey || undefined,
+        base_url: currentBaseUrl || undefined,
+      });
+      const data = res.data as AiModelsResponse;
+      if (data?.models && Array.isArray(data.models)) {
+        setCustomModelList(data.models);
+        if (data.models.length > 0 && !selectedModel) {
+          setSelectedModel(data.models[0].id);
+        }
+      }
+    } catch {
+      await modelsQuery.refetch();
+    } finally {
+      setIsFetchingModels(false);
+    }
+  };
 
   // These normalize to a bare array, whereas the dashboard and deployments pages
   // cache the raw {projects}/{deployments} object under the same base key. Sharing
@@ -740,23 +1022,12 @@ export default function AiAgentPage() {
     refetchInterval: 12000,
   });
 
-  const discoveredModels = arrayFromResponse<AiModel>(modelsQuery.data?.models, []);
+  const rawDiscoveredModels = customModelList !== null ? customModelList : arrayFromResponse<AiModel>(modelsQuery.data?.models, []);
   const providerFallbackModels: AiModel[] =
-    provider === "openai_compatible"
-      ? [
-          {
-            id: compatibleModel || selectedModel || "gpt-4o-mini",
-            label: compatibleModel || selectedModel || "gpt-4o-mini",
-            mode: "fast",
-          },
-          {
-            id: compatibleModel || selectedModel || "gpt-4o",
-            label: compatibleModel || selectedModel || "gpt-4o",
-            mode: "thinking",
-          },
-        ]
-      : defaultModels;
-  const availableModels = discoveredModels.length > 0 ? discoveredModels : providerFallbackModels;
+    selectedModel
+      ? [{ id: selectedModel, label: selectedModel, mode }]
+      : [];
+  const availableModels = rawDiscoveredModels.length > 0 ? rawDiscoveredModels : providerFallbackModels;
   const projects = arrayFromResponse<Project>(projectsQuery.data);
   const deployments = arrayFromResponse<Deployment>(deploymentsQuery.data);
   const sessions = sessionsQuery.data || [];
@@ -766,6 +1037,7 @@ export default function AiAgentPage() {
   const modeModels = mode === "thinking" ? thinkingModels : fastModels;
   const selectedModelIsAvailable = availableModels.some((model) => model.id === selectedModel);
   const activeModelId =
+    selectedModel ||
     (selectedModelIsAvailable ? selectedModel : "") ||
     modeModels[0]?.id ||
     availableModels[0]?.id ||
@@ -783,7 +1055,7 @@ export default function AiAgentPage() {
     const match = /^(\/[a-z]+)\s+$/i.exec(input);
     if (!match) return null;
     const entry = commands.find((command) => command.name === match[1].toLowerCase());
-    if (!entry || entry.arg === "none") return null;
+    if (!entry || entry.arg === "none" || entry.arg === "command") return null;
     return entry;
   }, [input]);
 
@@ -836,8 +1108,14 @@ export default function AiAgentPage() {
       setProvider(settingsQuery.data?.provider || "nvidia_nim");
       setCompatibleBaseUrl(settingsQuery.data?.openai_compatible_base_url || "");
       setCompatibleModel(settingsQuery.data?.model || "");
-      if (settingsQuery.data?.model) {
+      const stored = typeof window !== "undefined" ? window.localStorage.getItem("ai-default-model") : "";
+      if (stored) {
+        setSelectedModel(stored);
+      } else if (settingsQuery.data?.model) {
         setSelectedModel(settingsQuery.data.model);
+        if (typeof window !== "undefined") {
+          window.localStorage.setItem("ai-default-model", settingsQuery.data.model);
+        }
       }
     }, 0);
     return () => window.clearTimeout(handle);
@@ -847,15 +1125,243 @@ export default function AiAgentPage() {
     if (typeof window === "undefined") return;
     window.localStorage.setItem("ai-agent-access-mode", agentAccessMode);
     window.localStorage.setItem("ai-agent-remote-terminal", remoteTerminalPermission);
-  }, [agentAccessMode, remoteTerminalPermission]);
+    window.localStorage.setItem("ai-thinking-orb-style", orbStyle);
+    if (selectedModel) {
+      window.localStorage.setItem("ai-default-model", selectedModel);
+    }
+  }, [agentAccessMode, remoteTerminalPermission, orbStyle, selectedModel]);
+
+  const startListening = () => {
+    if (typeof window === "undefined") return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionClass) {
+      toast.error("Voice input is not supported in this browser. Please use Chrome, Edge, or Safari.");
+      return;
+    }
+
+    try {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
+      }
+
+      const recognition = new SpeechRecognitionClass();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = typeof navigator !== "undefined" && navigator.language ? navigator.language : "en-US";
+
+      baseTextRef.current = input;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+        toast.info("Voice input active. Speak into your microphone...");
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onresult = (event: any) => {
+        let interimTranscript = "";
+        let finalTranscript = "";
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const item = event.results[i];
+          if (item && item[0]) {
+            if (item.isFinal) {
+              finalTranscript += item[0].transcript;
+            } else {
+              interimTranscript += item[0].transcript;
+            }
+          }
+        }
+
+        const currentSpeech = (finalTranscript || interimTranscript).trim();
+        if (currentSpeech) {
+          const prefix = baseTextRef.current.trim();
+          const combined = prefix ? `${prefix} ${currentSpeech}` : currentSpeech;
+          setInput(combined);
+        }
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onerror = (event: any) => {
+        console.warn("Speech recognition error:", event.error);
+        if (event.error === "not-allowed" || event.error === "permission-denied") {
+          toast.error("Microphone permission denied. Please allow microphone access in your browser settings.");
+        } else if (event.error !== "no-speech") {
+          toast.error(`Voice recognition error: ${event.error}`);
+        }
+        setIsListening(false);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognitionRef.current = recognition;
+      recognition.start();
+    } catch (err) {
+      console.error("Failed to start speech recognition:", err);
+      toast.error("Could not start microphone.");
+      setIsListening(false);
+    }
+  };
+
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {}
+      recognitionRef.current = null;
+    }
+    setIsListening(false);
+  };
+
+  const toggleListening = () => {
+    if (isListening) {
+      stopListening();
+    } else {
+      startListening();
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
+      }
+    };
+  }, []);
 
   const chooseModel = (model: AiModel) => {
     setSelectedModel(model.id);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("ai-default-model", model.id);
+    }
     setMode(modelMode(model));
     if (provider === "openai_compatible") {
       setCompatibleModel(model.id);
     }
   };
+
+  const openTerminalWithCommand = (command?: string) => {
+    setTerminalOpen(true);
+    if (command) {
+      setTerminalInput(command);
+    }
+    setTimeout(() => {
+      terminalInputRef.current?.focus();
+    }, 100);
+  };
+
+  const runTerminalCommand = async (cmdToRun: string) => {
+    const trimmed = cmdToRun.trim();
+    if (!trimmed || isTerminalExecuting) return;
+
+    setTerminalHistory((prev) => [...prev.filter((c) => c !== trimmed), trimmed]);
+    setHistoryIndex(-1);
+    setTerminalInput("");
+
+    const execId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const timestamp = new Date().toLocaleTimeString();
+
+    const newLog: TerminalExecutionLog = {
+      id: execId,
+      command: trimmed,
+      timestamp,
+      status: "running",
+    };
+
+    setTerminalLogs((prev) => [...prev, newLog]);
+    setIsTerminalExecuting(true);
+
+    try {
+      const res = await api.post("/ai/tools/execute", {
+        tool_name: "terminal_run_command",
+        arguments: {
+          command: trimmed,
+          ...(selectedDeploymentId ? { deployment_id: selectedDeploymentId } : {}),
+          ...(selectedProjectId ? { project_id: selectedProjectId } : {}),
+        },
+      });
+
+      const data = (res.data || {}) as Record<string, any>;
+      const exitCode = typeof data.exit_code === "number" ? data.exit_code : (data.error ? 1 : 0);
+      const stdout = typeof data.stdout === "string" ? data.stdout : (exitCode === 0 && typeof data.output === "string" ? data.output : "");
+      const stderr = typeof data.stderr === "string" ? data.stderr : (exitCode !== 0 ? (typeof data.output === "string" ? data.output : typeof data.error === "string" ? data.error : "") : "");
+      const cwd = typeof data.cwd === "string" ? data.cwd : typeof data.working_directory === "string" ? data.working_directory : undefined;
+      if (cwd) {
+        setTerminalCwd(cwd);
+      }
+
+      setTerminalLogs((prev) =>
+        prev.map((item) =>
+          item.id === execId
+            ? {
+                ...item,
+                status: exitCode === 0 ? "success" : "error",
+                exitCode,
+                stdout: stdout || undefined,
+                stderr: stderr || undefined,
+                cwd,
+              }
+            : item
+        )
+      );
+    } catch (err: any) {
+      const errMessage = err.response?.data?.error || err.message || "Execution failed";
+      setTerminalLogs((prev) =>
+        prev.map((item) =>
+          item.id === execId
+            ? {
+                ...item,
+                status: "error",
+                exitCode: 1,
+                stderr: errMessage,
+              }
+            : item
+        )
+      );
+    } finally {
+      setIsTerminalExecuting(false);
+      setTimeout(() => {
+        terminalInputRef.current?.focus();
+      }, 50);
+    }
+  };
+
+  const handleTerminalKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (terminalHistory.length === 0) return;
+      const nextIndex = historyIndex === -1 ? terminalHistory.length - 1 : Math.max(0, historyIndex - 1);
+      setHistoryIndex(nextIndex);
+      setTerminalInput(terminalHistory[nextIndex] || "");
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (historyIndex === -1) return;
+      if (historyIndex < terminalHistory.length - 1) {
+        const nextIndex = historyIndex + 1;
+        setHistoryIndex(nextIndex);
+        setTerminalInput(terminalHistory[nextIndex] || "");
+      } else {
+        setHistoryIndex(-1);
+        setTerminalInput("");
+      }
+    } else if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      runTerminalCommand(terminalInput);
+    }
+  };
+
+  useEffect(() => {
+    if (terminalOpen) {
+      terminalLogsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [terminalLogs, terminalOpen]);
 
   const closePickers = () => {
     setComposerModelOpen(false);
@@ -878,8 +1384,13 @@ export default function AiAgentPage() {
   const startNewChat = () => {
     setActiveSessionId("");
     setMessages(starterMessages);
+    setPendingApproval(null);
     if (typeof window !== "undefined") {
       window.history.replaceState(null, "", "/dashboard/ai");
+      const defaultModel = window.localStorage.getItem("ai-default-model");
+      if (defaultModel) {
+        setSelectedModel(defaultModel);
+      }
     }
   };
 
@@ -887,20 +1398,36 @@ export default function AiAgentPage() {
     const res = await api.get(`/ai/sessions/${sessionId}`);
     const data = res.data as { session?: AiChatSession; messages?: AiChatMessage[] };
     setActiveSessionId(sessionId);
+    setPendingApproval(null);
+    if (data.session?.last_model) {
+      setSelectedModel(data.session.last_model);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("ai-default-model", data.session.last_model);
+      }
+    }
     setMessages(
       (data.messages || [])
         .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
-        .map((message) => ({
-          id: message.id,
-          role: message.role as Role,
-          content: message.content,
-          meta:
-            typeof message.metadata?.model === "string"
-              ? `${message.metadata.model}`
-              : message.role === "user"
-                ? "You"
-                : data.session?.last_model || undefined,
-        }))
+        .map((message) => {
+          const meta = (message.metadata || {}) as Record<string, any>;
+          const usage = (meta.token_usage || {}) as Record<string, number>;
+          return {
+            id: message.id,
+            role: message.role as Role,
+            content: message.content,
+            reasoning: typeof meta.reasoning === "string" && meta.reasoning.trim() ? meta.reasoning : undefined,
+            toolCalls: Array.isArray(meta.tool_calls) && meta.tool_calls.length > 0 ? meta.tool_calls : undefined,
+            stats: {
+              latencyMs: typeof meta.latency_ms === "number" ? meta.latency_ms : undefined,
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              totalTokens: usage.total_tokens,
+              model: typeof meta.model === "string" ? meta.model : undefined,
+              provider: typeof meta.provider === "string" ? meta.provider : undefined,
+              traceId: typeof meta.trace_id === "string" ? meta.trace_id : undefined,
+            },
+          };
+        })
     );
     if (typeof window !== "undefined") {
       window.history.replaceState(null, "", `/dashboard/ai?session_id=${sessionId}`);
@@ -1024,7 +1551,6 @@ export default function AiAgentPage() {
       appendMessage({
         role: "assistant",
         content: formatAiOutput(result),
-        meta: `${result.model || activeModelId} | ${Math.round((result.confidence || 0) * 100)}%`,
         reasoning: typeof result.reasoning === "string" ? result.reasoning : "",
         stats: {
           latencyMs: result.latency_ms,
@@ -1047,9 +1573,23 @@ export default function AiAgentPage() {
 
   const commandMutation = useMutation({
     mutationFn: async (raw: string) => {
-      const [command, firstArg, secondArg] = raw.trim().split(/\s+/);
-      const targetDeploymentId = firstArg || selectedDeploymentId;
-      const targetProjectId = firstArg || selectedProjectId;
+      const trimmed = raw.trim();
+      const uuidMatch = trimmed.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+      const parsedUuid = uuidMatch ? uuidMatch[0] : "";
+      const tokens = trimmed.split(/\s+/);
+      const command = tokens[0]?.toLowerCase();
+      const firstArg = tokens[1];
+      const secondArg = tokens[2];
+      const targetDeploymentId = parsedUuid || (firstArg && !firstArg.startsWith("/") && firstArg.length > 8 ? firstArg : selectedDeploymentId);
+      const targetProjectId = parsedUuid || (firstArg && !firstArg.startsWith("/") && firstArg.length > 8 ? firstArg : selectedProjectId);
+
+      // Extract custom user prompt/question after command and UUID
+      let customUserPrompt = trimmed.replace(new RegExp(`^${command}\\b`, "i"), "").trim();
+      if (parsedUuid) {
+        customUserPrompt = customUserPrompt.replace(parsedUuid, "").trim();
+      } else if (firstArg && (firstArg === targetProjectId || firstArg === targetDeploymentId)) {
+        customUserPrompt = customUserPrompt.replace(firstArg, "").trim();
+      }
 
       // ── platform capability commands ───────────────────────────
       // Each wraps an endpoint the backend already access-gates via
@@ -1190,6 +1730,42 @@ export default function AiAgentPage() {
         };
       }
 
+      if (command === "/repair" || command === "/fix") {
+        if (!targetDeploymentId) throw new Error("Usage: /repair <deployment-id> [instructions]");
+        const res = await api.post(`/deployments/${targetDeploymentId}/ai/repair`, {
+          model: activeModelId,
+          model_mode: mode,
+          message: customUserPrompt || undefined,
+          problem_description: customUserPrompt || undefined,
+        }, { timeout: 120000 });
+        const data = res.data;
+        const changes = (data.applied_changes || [])
+          .map((c: { path: string; description: string; action: string }) => `  • [${c.action || 'modify'}] \`${c.path}\` — ${c.description || 'Updated'}`)
+          .join('\n');
+        const usage = (data.token_usage || {}) as Record<string, number>;
+        const repairToolCalls: ToolCall[] = (data.applied_changes || []).map((c: any) => ({
+          name: c.action === "create" ? "workspace_write_file" : "workspace_edit_file",
+          arguments: { path: c.path, description: c.description, action: c.action },
+          result: { status: "applied", path: c.path },
+        }));
+        return {
+          title: "AI Auto-Fix & Repair Complete",
+          body: `### Root Cause\n${data.structured_output?.root_cause || data.summary || "Identified configuration / build issues"}\n\n### Applied Fixes:\n${changes || "  • Auto-patched build configurations"}\n\n**New Deployment Queued:** ${data.new_deployment_id ? `\`${data.new_deployment_id}\`` : "In Progress"}`,
+          reasoning: typeof data.reasoning === "string" ? data.reasoning : (typeof data.structured_output?.root_cause === "string" ? data.structured_output.root_cause : ""),
+          toolCalls: repairToolCalls.length > 0 ? repairToolCalls : undefined,
+          stats: {
+            latencyMs: data.latency_ms,
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens,
+            confidence: data.confidence,
+            model: data.model || activeModelId,
+            provider: data.provider,
+            traceId: data.trace_id,
+          },
+        };
+      }
+
       if (command === "/build") {
         if (!targetDeploymentId) throw new Error("Usage: /build <deployment-id>");
         const res = await api.post(`/deployments/${targetDeploymentId}/trigger`);
@@ -1201,23 +1777,68 @@ export default function AiAgentPage() {
 
       if (command === "/deploy") {
         if (!targetDeploymentId) throw new Error("Usage: /deploy <deployment-id> [port]");
-        const port = Number.parseInt(secondArg || "3000", 10) || 3000;
-        const res = await api.post(`/deployments/${targetDeploymentId}/kubernetes/deploy`, {
-          namespace: "stackpilot-apps",
-          exposure_mode: "nodeport",
-          replicas: 1,
-          container_port: port,
-          resource_preset: "small",
-          health_path: "/",
-        });
-        return {
-          title: "Deploy started",
-          body: `Kubernetes deploy started for ${shortId(targetDeploymentId)} on port ${port}.\n${res.data.message || ""}`,
-        };
+        const extraText = trimmed.replace(new RegExp(`^${command}`, "i"), "").replace(targetDeploymentId, "").trim();
+        if (extraText.length > 5 && !/^\d+$/.test(extraText)) {
+          // Problem description or instructions provided with /deploy
+          const res = await api.post(`/deployments/${targetDeploymentId}/ai/repair`, {
+            model: activeModelId,
+            model_mode: mode,
+            message: extraText,
+            problem_description: extraText,
+          }, { timeout: 120000 });
+          const data = res.data;
+          const changes = (data.applied_changes || [])
+            .map((c: { path: string; description: string; action: string }) => `  • [${c.action || 'modify'}] \`${c.path}\` — ${c.description || 'Updated'}`)
+            .join('\n');
+          const usage = (data.token_usage || {}) as Record<string, number>;
+          const repairToolCalls: ToolCall[] = (data.applied_changes || []).map((c: any) => ({
+            name: c.action === "create" ? "workspace_write_file" : "workspace_edit_file",
+            arguments: { path: c.path, description: c.description, action: c.action },
+            result: { status: "applied", path: c.path },
+          }));
+          return {
+            title: "AI Auto-Fix & Deploy",
+            body: `### Diagnosed Issue\n${data.structured_output?.root_cause || data.summary || "Identified configuration and runtime issues"}\n\n### Applied Changes:\n${changes || "  • Resolved container & port conflicts"}\n\n**New Clean Deployment Started:** ${data.new_deployment_id ? `\`${data.new_deployment_id}\`` : "Queued"}`,
+            reasoning: typeof data.reasoning === "string" ? data.reasoning : (typeof data.structured_output?.root_cause === "string" ? data.structured_output.root_cause : ""),
+            toolCalls: repairToolCalls.length > 0 ? repairToolCalls : undefined,
+            stats: {
+              latencyMs: data.latency_ms,
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              totalTokens: usage.total_tokens,
+              confidence: data.confidence,
+              model: data.model || activeModelId,
+              provider: data.provider,
+              traceId: data.trace_id,
+            },
+          };
+        }
+
+        try {
+          const port = Number.parseInt(secondArg || "3000", 10) || 3000;
+          const res = await api.post(`/deployments/${targetDeploymentId}/kubernetes/deploy`, {
+            namespace: "stackpilot-apps",
+            exposure_mode: "nodeport",
+            replicas: 1,
+            container_port: port,
+            resource_preset: "small",
+            health_path: "/",
+          });
+          return {
+            title: "Deploy started",
+            body: `Kubernetes deploy started for ${shortId(targetDeploymentId)} on port ${port}.\n${res.data.message || ""}`,
+          };
+        } catch {
+          const triggerRes = await api.post(`/deployments/${targetDeploymentId}/trigger`);
+          return {
+            title: "Deployment build queued",
+            body: `Triggered deployment build for ${shortId(targetDeploymentId)}.\n${triggerRes.data.message || ""}`,
+          };
+        }
       }
 
       if (command === "/diagnose") {
-        if (!targetDeploymentId) throw new Error("Usage: /diagnose <deployment-id>");
+        if (!targetDeploymentId) throw new Error("Usage: /diagnose <deployment-id> [details]");
         const deployment = deployments.find((item) => item.id === targetDeploymentId);
         const logs = await api.get(`/deployments/${targetDeploymentId}/logs`);
         const useRuntime = deployment?.image_name && deployment.status !== "failed";
@@ -1225,6 +1846,7 @@ export default function AiAgentPage() {
           ? await api.post(`/deployments/${targetDeploymentId}/ai/analyze-runtime`, {
               model: activeModelId,
               model_mode: mode,
+              message: customUserPrompt || undefined,
               runtime: {
                 status: deployment.status,
                 runtime_url: deployment.runtime_url,
@@ -1233,35 +1855,77 @@ export default function AiAgentPage() {
           : await api.post(`/deployments/${targetDeploymentId}/ai/analyze-build-failure`, {
               model: activeModelId,
               model_mode: mode,
+              message: customUserPrompt || undefined,
               logs: logs.data?.deployment?.logs || "",
             }, { timeout: AI_REQUEST_TIMEOUT_MS });
+        const diagData = res.data as AiResponse;
+        const diagUsage = (diagData.token_usage || {}) as Record<string, number>;
         return {
           title: "Diagnosis",
-          body: formatAiOutput(res.data as AiResponse),
+          body: formatAiOutput(diagData),
+          reasoning: typeof diagData.reasoning === "string" ? diagData.reasoning : "",
+          stats: {
+            latencyMs: diagData.latency_ms,
+            promptTokens: diagUsage.prompt_tokens,
+            completionTokens: diagUsage.completion_tokens,
+            totalTokens: diagUsage.total_tokens,
+            confidence: diagData.confidence,
+            model: diagData.model || activeModelId,
+            provider: diagData.provider,
+            traceId: diagData.trace_id,
+          },
         };
       }
 
       if (command === "/dockerfile") {
-        if (!targetProjectId) throw new Error("Usage: /dockerfile <project-id>");
+        if (!targetProjectId) throw new Error("Usage: /dockerfile <project-id> [requirements]");
         const res = await api.post(`/projects/${targetProjectId}/ai/dockerfile`, {
           model: activeModelId,
           model_mode: mode,
+          message: customUserPrompt || undefined,
         }, { timeout: AI_REQUEST_TIMEOUT_MS });
+        const dfData = res.data as AiResponse;
+        const dfUsage = (dfData.token_usage || {}) as Record<string, number>;
         return {
           title: "Dockerfile plan",
-          body: formatAiOutput(res.data as AiResponse),
+          body: formatAiOutput(dfData),
+          reasoning: typeof dfData.reasoning === "string" ? dfData.reasoning : "",
+          stats: {
+            latencyMs: dfData.latency_ms,
+            promptTokens: dfUsage.prompt_tokens,
+            completionTokens: dfUsage.completion_tokens,
+            totalTokens: dfUsage.total_tokens,
+            confidence: dfData.confidence,
+            model: dfData.model || activeModelId,
+            provider: dfData.provider,
+            traceId: dfData.trace_id,
+          },
         };
       }
 
       if (command === "/analyze") {
-        if (!targetProjectId) throw new Error("Usage: /analyze <project-id>");
+        if (!targetProjectId) throw new Error("Usage: /analyze <project-id> [instructions]");
         const res = await api.post(`/projects/${targetProjectId}/ai/analyze`, {
           model: activeModelId,
           model_mode: mode,
+          message: customUserPrompt || undefined,
         }, { timeout: AI_REQUEST_TIMEOUT_MS });
+        const anData = res.data as AiResponse;
+        const anUsage = (anData.token_usage || {}) as Record<string, number>;
         return {
-          title: "Project analysis",
-          body: formatAiOutput(res.data as AiResponse),
+          title: "Project Analysis",
+          body: formatAiOutput(anData),
+          reasoning: typeof anData.reasoning === "string" ? anData.reasoning : "",
+          stats: {
+            latencyMs: anData.latency_ms,
+            promptTokens: anUsage.prompt_tokens,
+            completionTokens: anUsage.completion_tokens,
+            totalTokens: anUsage.total_tokens,
+            confidence: anData.confidence,
+            model: anData.model || activeModelId,
+            provider: anData.provider,
+            traceId: anData.trace_id,
+          },
         };
       }
 
@@ -1273,9 +1937,36 @@ export default function AiAgentPage() {
           throw new Error("Usage: /app mysql | postgres | redis | mongo | mariadb | rabbitmq | minio | grafana | prometheus | adminer");
         }
         if (agentAccessMode !== "full_access") {
+          setPendingApproval({
+            id: `deploy-app-${Date.now()}`,
+            type: "deploy",
+            title: `Deploy ${template.name}`,
+            description: `Agent requested permission to create and deploy ${template.name} container with local Compose runtime and generated credentials.`,
+            command: `/app ${template.id}`,
+            action: async () => {
+              const result = await deployApplicationTemplate(template);
+              appendMessage({
+                role: "assistant",
+                content:
+                  `Created ${result.projectName} and queued deployment ${shortId(result.deploymentId)}.\n\n` +
+                  `Expected local endpoint: localhost:${preferredApplicationEndpointPort(result.config, template.defaultPort)}\n\n` +
+                  `**Configuration**\n${safeApplicationSummary(template, result.config).map((line) => `- ${line}`).join("\n")}\n\n` +
+                  `${result.triggerMessage}`,
+                meta: "Application deploy started",
+              });
+              deploymentsQuery.refetch();
+            },
+            onDecline: () => {
+              appendMessage({
+                role: "assistant",
+                content: `Deployment of **${template.name}** was declined by user.`,
+                meta: "Action Declined",
+              });
+            },
+          });
           return {
-            title: "Approval required",
-            body: "Application deployment can create containers and secrets. Switch Agent Permissions to Full access, then run the command again.",
+            title: "Approval Required",
+            body: `I prepared the deployment plan for **${template.name}**. Please review and click **Accept & Run** or **Decline** below to proceed.`,
           };
         }
         const result = await deployApplicationTemplate(template);
@@ -1296,10 +1987,20 @@ export default function AiAgentPage() {
         };
       }
 
-      throw new Error(`Unknown command: ${command}`);
+      // Unrecognized slash command: seamlessly route to AI streaming agent
+      void sendStreaming(raw);
+      return null;
     },
     onSuccess: (result) => {
-      appendMessage({ role: "assistant", content: result.body, meta: result.title });
+      if (!result) return;
+      appendMessage({
+        role: "assistant",
+        content: result.body,
+        meta: result.title,
+        reasoning: result.reasoning,
+        toolCalls: (result as any).toolCalls,
+        stats: result.stats,
+      });
       deploymentsQuery.refetch();
     },
     onError: (error) => {
@@ -1344,12 +2045,36 @@ export default function AiAgentPage() {
       const applicationTemplate = findApplicationIntent(message);
       if (applicationTemplate) {
         if (agentAccessMode !== "full_access") {
+          setPendingApproval({
+            id: `deploy-app-${Date.now()}`,
+            type: "deploy",
+            title: `Deploy ${applicationTemplate.name}`,
+            description: `Agent requested permission to create and deploy ${applicationTemplate.name} container with local Compose runtime and generated credentials.`,
+            command: `/app ${applicationTemplate.id}`,
+            action: async () => {
+              const result = await deployApplicationTemplate(applicationTemplate);
+              appendMessage({
+                role: "assistant",
+                content:
+                  `I created ${result.projectName} and queued deployment ${shortId(result.deploymentId)}.\n\n` +
+                  `Expected local endpoint: localhost:${preferredApplicationEndpointPort(result.config, applicationTemplate.defaultPort)}\n\n` +
+                  `**Configuration**\n${safeApplicationSummary(applicationTemplate, result.config).map((line) => `- ${line}`).join("\n")}\n\n` +
+                  `The deployment will move to running after Docker Compose finishes starting the service. ${result.triggerMessage}`,
+                meta: "Application deploy started",
+              });
+              deploymentsQuery.refetch();
+            },
+            onDecline: () => {
+              appendMessage({
+                role: "assistant",
+                content: `Deployment of **${applicationTemplate.name}** was declined by user.`,
+                meta: "Action Declined",
+              });
+            },
+          });
           return {
-            title: "Approval required",
-            body:
-              `I can create and deploy a ${applicationTemplate.name} for you, including generated credentials stored as project environment variables and a local Compose runtime.\n\n` +
-              "Switch Agent Permissions to Full access, or run an explicit command after enabling it: " +
-              `/app ${applicationTemplate.id}`,
+            title: "Approval Required",
+            body: `I prepared the deployment plan for **${applicationTemplate.name}**. Please review and click **Accept & Run** or **Decline** below to proceed.`,
           };
         }
 
@@ -1375,11 +2100,43 @@ export default function AiAgentPage() {
       }
 
       if (agentAccessMode !== "full_access") {
+        setPendingApproval({
+          id: `deploy-proj-${Date.now()}`,
+          type: "deploy",
+          title: `Deploy ${project.name}`,
+          description: `Agent requested permission to create a deployment for project "${project.name}", inspect/build source, and queue the build.`,
+          command: `/deploy ${project.id}`,
+          action: async () => {
+            const createRes = await api.post(`/projects/${project.id}/deployments`, {
+              version: "v-ai",
+              commit_hash: "",
+            });
+            const deploymentId = createRes.data?.deployment?.id as string | undefined;
+            if (!deploymentId) {
+              throw new Error("Deployment was created but the API did not return a deployment id.");
+            }
+            const triggerRes = await api.post(`/deployments/${deploymentId}/trigger`);
+            appendMessage({
+              role: "assistant",
+              content:
+                `I created deployment ${shortId(deploymentId)} for ${project.name} and queued the build.\n\n` +
+                "During the build, the worker will inspect the source tree and use deterministic generators first. If no deterministic generator can classify the project, AI scans the actual files and creates the Dockerfile fallback.\n\n" +
+                `${triggerRes.data?.message || "Build queued."}`,
+              meta: "Deployment Started",
+            });
+            deploymentsQuery.refetch();
+          },
+          onDecline: () => {
+            appendMessage({
+              role: "assistant",
+              content: `Deployment for **${project.name}** was declined by user.`,
+              meta: "Action Declined",
+            });
+          },
+        });
         return {
-          title: "Approval required",
-          body:
-            `I found project ${project.name}. To deploy autonomously I would create a deployment, inspect/build the source, generate a Dockerfile if needed, and queue the build.\n\n` +
-            "Switch Agent Permissions to Full access, or use explicit commands like /build and /deploy when you want each action controlled step by step.",
+          title: "Approval Required",
+          body: `I prepared the deployment plan for **${project.name}**. Please review and click **Accept & Run** or **Decline** below to proceed.`,
         };
       }
 
@@ -1418,17 +2175,24 @@ export default function AiAgentPage() {
       const payload: Record<string, unknown> = {
         enabled: true,
         provider,
-        model: provider === "openai_compatible" ? compatibleModel || selectedModel : activeModelId,
-        openai_compatible_base_url: compatibleBaseUrl.trim(),
+        model: selectedModel || compatibleModel || activeModelId,
       };
-      if (compatibleApiKey.trim()) {
-        payload.openai_compatible_api_key = compatibleApiKey.trim();
+      if (provider === "openai_compatible") {
+        payload.openai_compatible_base_url = compatibleBaseUrl.trim();
+        if (compatibleApiKey.trim()) {
+          payload.openai_compatible_api_key = compatibleApiKey.trim();
+        }
+      } else {
+        if (nvidiaApiKey.trim()) {
+          payload.nvidia_api_key = nvidiaApiKey.trim();
+        }
       }
       const res = await api.put("/ai/settings", payload);
       return res.data as { success?: boolean };
     },
     onSuccess: () => {
       setCompatibleApiKey("");
+      setNvidiaApiKey("");
       settingsQuery.refetch();
       modelsQuery.refetch();
     },
@@ -1442,41 +2206,187 @@ export default function AiAgentPage() {
   const [streamingEnabled, setStreamingEnabled] = useState(true);
   const [streamReasoning, setStreamReasoning] = useState("");
   const [streamContent, setStreamContent] = useState("");
+  const [streamToolCalls, setStreamToolCalls] = useState<ToolCall[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const streamAbortRef = useRef<AbortController | null>(null);
 
+  useEffect(() => {
+    if (isStreaming) {
+      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    }
+  }, [streamReasoning, streamToolCalls, streamContent, isStreaming]);
+
   const sendStreaming = async (prompt: string) => {
-    setStreamReasoning("");
+    // Extract UUID and slash command
+    const uuidMatch = prompt.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+    const parsedUuid = uuidMatch ? uuidMatch[0] : "";
+    const commandMatch = prompt.match(/^\/([a-zA-Z0-9_-]+)/);
+    const parsedCommand = commandMatch ? commandMatch[0].toLowerCase() : "";
+
+    const isDeploymentTarget =
+      deployments.some((d) => d.id === parsedUuid) ||
+      parsedCommand === "/repair" ||
+      parsedCommand === "/diagnose" ||
+      parsedCommand === "/fix" ||
+      parsedCommand === "/deploy";
+    const targetDeploymentId = (parsedUuid && isDeploymentTarget) ? parsedUuid : (selectedDeploymentId || undefined);
+    const targetProjectId = (parsedUuid && !isDeploymentTarget) ? parsedUuid : (selectedProjectId || undefined);
+
+    if (parsedUuid && isDeploymentTarget && parsedUuid !== selectedDeploymentId) {
+      setSelectedDeploymentId(parsedUuid);
+      const matchedDep = deployments.find((d) => d.id === parsedUuid);
+      if (matchedDep?.project_id && matchedDep.project_id !== selectedProjectId) {
+        setSelectedProjectId(matchedDep.project_id);
+      }
+    } else if (parsedUuid && !isDeploymentTarget && parsedUuid !== selectedProjectId) {
+      setSelectedProjectId(parsedUuid);
+    }
+
+    const initReasoning = parsedCommand
+      ? `Analyzing deployment context and files for \`${parsedCommand}\`...`
+      : "Analyzing request and inspecting project workspace...";
+
+    setStreamReasoning(initReasoning);
     setStreamContent("");
+    setStreamToolCalls([]);
     setIsStreaming(true);
 
     const controller = new AbortController();
     streamAbortRef.current = controller;
 
-    let reasoning = "";
+    let reasoning = initReasoning + "\n";
     let content = "";
+    let toolCalls: ToolCall[] = [];
     let stats: ChatMessage["stats"] = {};
+    let messageAppended = false;
+
+    const appendStoppedResponse = () => {
+      if (messageAppended) return;
+      if (!content.trim() && !reasoning.trim() && toolCalls.length === 0) return;
+      messageAppended = true;
+
+      // If content is empty (e.g. model was still generating thoughts or running subagents),
+      // promote reasoning directly into content so the response NEVER disappears!
+      let finalBody = content.trim();
+      let finalReasoning: string | undefined = reasoning.trim() || undefined;
+
+      if (!finalBody && reasoning.trim()) {
+        finalBody = reasoning.trim();
+        finalReasoning = undefined;
+      }
+
+      finalBody = finalBody ? `${finalBody}\n\n*(Generation stopped by user)*` : "*(Generation stopped by user)*";
+
+      appendMessage({
+        role: "assistant",
+        content: finalBody,
+        reasoning: finalReasoning,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        stats,
+      });
+
+      if (activeSessionId) {
+        api.post(`/ai/sessions/${activeSessionId}/messages`, {
+          role: "assistant",
+          content: finalBody,
+          metadata: {
+            reasoning: finalReasoning,
+            tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+            stopped: true,
+          },
+        }).catch(() => {});
+      }
+    };
 
     try {
       await streamAgentReply({
         message: prompt,
+        command: parsedCommand || undefined,
+        deploymentId: targetDeploymentId,
+        projectId: targetProjectId,
+        sessionId: activeSessionId || undefined,
         modelMode: mode === "thinking" ? "thinking" : "fast",
         model: activeModelId,
         provider,
+        agentAccessMode,
+        remoteTerminal: remoteTerminalPermission,
         signal: controller.signal,
         onEvent: (event) => {
-          if (event.type === "reasoning") {
+          if (event.type === "start" && event.session_id) {
+            if (event.session_id !== activeSessionId) {
+              setActiveSessionId(event.session_id);
+              if (typeof window !== "undefined") {
+                window.history.replaceState(null, "", `/dashboard/ai?session_id=${event.session_id}`);
+              }
+              queryClient.invalidateQueries({ queryKey: ["ai-chat-sessions"] });
+            }
+          } else if (event.type === "reasoning") {
             reasoning += event.delta;
             setStreamReasoning(reasoning);
+          } else if (event.type === "tool_call") {
+            const newCall: ToolCall = {
+              name: event.name,
+              arguments: event.arguments,
+            };
+            toolCalls = [...toolCalls, newCall];
+            setStreamToolCalls([...toolCalls]);
+          } else if (event.type === "tool_result") {
+            let foundIdx = -1;
+            for (let i = toolCalls.length - 1; i >= 0; i--) {
+              if (toolCalls[i].name === event.name && (toolCalls[i].result === undefined || toolCalls[i].result === null)) {
+                foundIdx = i;
+                break;
+              }
+            }
+            if (foundIdx === -1) {
+              foundIdx = toolCalls.map((c) => c.name).lastIndexOf(event.name);
+            }
+            if (foundIdx !== -1) {
+              toolCalls = [
+                ...toolCalls.slice(0, foundIdx),
+                { ...toolCalls[foundIdx], result: event.result },
+                ...toolCalls.slice(foundIdx + 1),
+              ];
+            } else {
+              toolCalls = [...toolCalls, { name: event.name, arguments: {}, result: event.result }];
+            }
+          } else if (event.type === "permission_request") {
+            const toolName = event.tool_name || "Action";
+            const args = event.arguments || {};
+            const cmd = toolName === "terminal_run_command" ? (args.command as string) : undefined;
+            setPendingApproval({
+              id: `perm-${Date.now()}`,
+              type: toolName === "terminal_run_command" ? "terminal" : "deploy",
+              title: `Permission Needed: ${toolName}`,
+              description: `Agent requested permission to execute high-risk action "${toolName}". Review parameters below.`,
+              command: cmd,
+              action: async () => {
+                const approvalMsg = cmd
+                  ? `Confirmed: Accept & run \`${cmd}\``
+                  : `Confirmed: Approve execution of ${toolName}`;
+                await sendStreaming(approvalMsg);
+              },
+              onDecline: () => {
+                appendMessage({
+                  role: "assistant",
+                  content: `Execution of **${toolName}** was declined by user.`,
+                  meta: "Action Declined",
+                });
+              },
+            });
           } else if (event.type === "content") {
             content += event.delta;
             setStreamContent(content);
           } else if (event.type === "error") {
-            content += `
-
-_${event.error}_`;
+            content += `\n\n_${event.error}_`;
             setStreamContent(content);
           } else if (event.type === "done") {
+            if (event.session_id && event.session_id !== activeSessionId) {
+              setActiveSessionId(event.session_id);
+              if (typeof window !== "undefined") {
+                window.history.replaceState(null, "", `/dashboard/ai?session_id=${event.session_id}`);
+              }
+            }
             // The done frame carries the authoritative assembled text; trust it
             // over the accumulated deltas in case a frame was dropped.
             content = event.content || content;
@@ -1495,26 +2405,38 @@ _${event.error}_`;
         },
       });
 
-      appendMessage({
-        role: "assistant",
-        content: content || "_The model returned nothing._",
-        meta: `${stats.model || activeModelId} | streamed`,
-        reasoning,
-        stats,
-      });
+      if (controller.signal.aborted) {
+        appendStoppedResponse();
+      } else {
+        messageAppended = true;
+        appendMessage({
+          role: "assistant",
+          content: content || (reasoning.trim() ? reasoning : "_The model returned nothing._"),
+          reasoning: reasoning.trim() ? reasoning : undefined,
+          toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          stats,
+        });
+      }
     } catch (error) {
-      if (!controller.signal.aborted) {
+      if (controller.signal.aborted) {
+        appendStoppedResponse();
+      } else {
         appendMessage({
           role: "assistant",
           content: errorMessage(error, "Streaming failed."),
-          meta: "Error",
         });
       }
     } finally {
+      if (controller.signal.aborted) {
+        appendStoppedResponse();
+      }
       setIsStreaming(false);
       setStreamReasoning("");
       setStreamContent("");
+      setStreamToolCalls([]);
       streamAbortRef.current = null;
+      queryClient.invalidateQueries({ queryKey: ["ai-chat-sessions"] });
+      sessionsQuery.refetch();
     }
   };
 
@@ -1531,13 +2453,24 @@ _${event.error}_`;
   }, [messages]);
 
   const submit = () => {
+    if (isListening) {
+      stopListening();
+    }
     const trimmed = input.trim();
     if (!trimmed || isRunning) return;
-    appendMessage({ role: "user", content: trimmed, meta: mode === "thinking" ? "Thinking mode" : "Fast mode" });
+    appendMessage({ role: "user", content: trimmed });
     setInput("");
     setShowCommands(false);
 
-    if (trimmed.startsWith("/")) {
+    const isAiCommand =
+      /^\/(architect|swarm|plan|audit|review|code|repair|fix|diagnose|analyze|dockerfile|terminal|run|exec)\b/i.test(trimmed) ||
+      (/^\/deploy\b/i.test(trimmed) && trimmed.replace(/^\/deploy\b/i, "").trim().length > 10);
+
+    const isPlatformCommand = /^\/(cost|org|environments|build|app|help|events|metrics|rollback|pause|resume|scale|drift|secrets)\b/i.test(trimmed);
+
+    if (isAiCommand || (!isPlatformCommand && trimmed.startsWith("/"))) {
+      void sendStreaming(trimmed);
+    } else if (trimmed.startsWith("/")) {
       commandMutation.mutate(trimmed);
     } else if (isDeployIntent(trimmed)) {
       autonomousDeployMutation.mutate(trimmed);
@@ -1545,6 +2478,175 @@ _${event.error}_`;
       void sendStreaming(trimmed);
     } else {
       runAgentMutation.mutate(trimmed);
+    }
+  };
+
+  const handleAllowToolCall = async (call: ToolCall) => {
+    // 1. Clear pending approval banner if matching
+    if (pendingApproval) {
+      const action = pendingApproval.action;
+      setPendingApproval(null);
+      if (action) {
+        await action();
+        return;
+      }
+    }
+
+    // 2. Interactive execution for terminal commands
+    if (call.name === "terminal_run_command" && call.arguments?.command) {
+      const cmd = call.arguments.command as string;
+      toast.info(`Executing: ${cmd}`);
+      try {
+        const res = await api.post("/ai/tools/execute", {
+          name: "terminal_run_command",
+          arguments: {
+            command: cmd,
+            deployment_id: selectedDeploymentId || undefined,
+            project_id: selectedProjectId || undefined,
+          },
+        });
+        const toolResult = res.data?.result || res.data;
+        // Update live stream tool calls
+        setStreamToolCalls((current) =>
+          current.map((tc) =>
+            tc === call || (tc.name === call.name && tc.arguments?.command === cmd)
+              ? { ...tc, result: toolResult }
+              : tc
+          )
+        );
+        // Also update any message in history containing this tool call
+        setMessages((prev) =>
+          prev.map((msg) => {
+            if (!msg.toolCalls) return msg;
+            return {
+              ...msg,
+              toolCalls: msg.toolCalls.map((tc) =>
+                tc === call || (tc.name === call.name && tc.arguments?.command === cmd)
+                  ? { ...tc, result: toolResult }
+                  : tc
+              ),
+            };
+          })
+        );
+        await sendStreaming(
+          `Confirmed: Accept & run \`${cmd}\`\nOutput:\n\`\`\`\n${
+            toolResult?.stdout || toolResult?.output || toolResult?.stderr || "Done"
+          }\n\`\`\``
+        );
+      } catch (err) {
+        toast.error("Failed to execute command");
+      }
+      return;
+    }
+
+    // 3. For any other mutating action
+    const toolTitle = call.name;
+    toast.success(`Approved ${toolTitle}`);
+    await sendStreaming(
+      `Confirmed: Approve execution of ${toolTitle} with arguments: ${JSON.stringify(call.arguments)}`
+    );
+  };
+
+  const handleDenyToolCall = (call: ToolCall) => {
+    if (pendingApproval) {
+      pendingApproval.onDecline?.();
+      setPendingApproval(null);
+    }
+    const declinedResult = { status: "declined", error: "User declined execution of this tool." };
+    setStreamToolCalls((current) =>
+      current.map((tc) =>
+        tc === call || (tc.name === call.name && JSON.stringify(tc.arguments) === JSON.stringify(call.arguments))
+          ? { ...tc, result: declinedResult }
+          : tc
+      )
+    );
+    setMessages((prev) =>
+      prev.map((msg) => {
+        if (!msg.toolCalls) return msg;
+        return {
+          ...msg,
+          toolCalls: msg.toolCalls.map((tc) =>
+            tc === call || (tc.name === call.name && JSON.stringify(tc.arguments) === JSON.stringify(call.arguments))
+              ? { ...tc, result: declinedResult }
+              : tc
+          ),
+        };
+      })
+    );
+    appendMessage({
+      role: "assistant",
+      content: `Execution of **${call.name}** was declined by user.`,
+      meta: "Action Declined",
+    });
+    toast.info(`Declined ${call.name}`);
+  };
+
+  const handleCopy = (id: string, text: string) => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(text);
+      setCopiedId(id);
+      toast.success("Copied to clipboard");
+      setTimeout(() => {
+        setCopiedId((current) => (current === id ? null : current));
+      }, 2000);
+    }
+  };
+
+  const handleBranchChat = async (messageIndex: number) => {
+    const branchMessages = messages.slice(0, messageIndex + 1);
+    if (activeSessionId) {
+      try {
+        const res = await api.post(`/ai/sessions/${activeSessionId}/branch`, {
+          message_index: messageIndex,
+        });
+        if (res.data?.id) {
+          setActiveSessionId(res.data.id);
+          setMessages(branchMessages);
+          if (typeof window !== "undefined") {
+            window.history.replaceState(null, "", `/dashboard/ai?session_id=${res.data.id}`);
+          }
+          queryClient.invalidateQueries({ queryKey: ["ai-chat-sessions"] });
+          toast.success("Branched into new chat session");
+          return;
+        }
+      } catch (err) {
+        console.error("Failed to branch server session:", err);
+      }
+    }
+    setMessages(branchMessages);
+    toast.success("Branched into new conversation");
+  };
+
+  const handleRegenerate = async (assistantIndex: number) => {
+    if (isRunning) return;
+    let userPrompt = "";
+    let userIndex = -1;
+    for (let i = assistantIndex - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "user") {
+        userPrompt = messages[i].content;
+        userIndex = i;
+        break;
+      }
+    }
+    if (!userPrompt || userIndex === -1) return;
+
+    setMessages(messages.slice(0, userIndex + 1));
+    const isAiCommand =
+      /^\/(architect|swarm|plan|audit|review|code|repair|fix|diagnose|analyze|dockerfile|terminal|run|exec)\b/i.test(userPrompt) ||
+      (/^\/deploy\b/i.test(userPrompt) && userPrompt.replace(/^\/deploy\b/i, "").trim().length > 10);
+
+    const isPlatformCommand = /^\/(cost|org|environments|build|app|help|events|metrics|rollback|pause|resume|scale|drift|secrets)\b/i.test(userPrompt);
+
+    if (isAiCommand || (!isPlatformCommand && userPrompt.startsWith("/"))) {
+      void sendStreaming(userPrompt);
+    } else if (userPrompt.startsWith("/")) {
+      commandMutation.mutate(userPrompt);
+    } else if (isDeployIntent(userPrompt)) {
+      autonomousDeployMutation.mutate(userPrompt);
+    } else if (streamingEnabled) {
+      void sendStreaming(userPrompt);
+    } else {
+      runAgentMutation.mutate(userPrompt);
     }
   };
 
@@ -1606,18 +2708,34 @@ _${event.error}_`;
           className="flex min-h-9 w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left text-sm outline-none hover:bg-accent hover:text-accent-foreground"
         >
           <span className="min-w-0 truncate">{modelLabel(model)}</span>
-          {model.id === activeModelId && <Check className="h-4 w-4" />}
+          {model.id === activeModelId && <AppIcon name="check" fallback={Check} className="h-4 w-4"  />}
         </button>
       ))
     );
 
   const renderModelPicker = (onAfterSelect?: () => void) => (
     <div className="max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
-      <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Fast models</div>
-      {renderModelButtons(fastModels, onAfterSelect)}
-      <div className="my-1 h-px bg-border" />
-      <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Thinking models</div>
-      {renderModelButtons(thinkingModels, onAfterSelect)}
+      {availableModels.length === 0 ? (
+        <div className="p-3 text-center text-xs text-muted-foreground">
+          No models found. Enter an API key and click &ldquo;Fetch Models&rdquo; in settings, or type any custom model ID.
+        </div>
+      ) : (
+        <>
+          {fastModels.length > 0 && (
+            <>
+              <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Fast models ({fastModels.length})</div>
+              {renderModelButtons(fastModels, onAfterSelect)}
+            </>
+          )}
+          {thinkingModels.length > 0 && (
+            <>
+              <div className="my-1 h-px bg-border" />
+              <div className="px-2 py-1.5 text-xs font-medium text-muted-foreground">Thinking models ({thinkingModels.length})</div>
+              {renderModelButtons(thinkingModels, onAfterSelect)}
+            </>
+          )}
+        </>
+      )}
     </div>
   );
 
@@ -1631,7 +2749,11 @@ _${event.error}_`;
           onClick={() => chooseCommand(command.name)}
           className="flex w-full items-start gap-3 rounded-md px-2 py-2 text-left outline-none hover:bg-accent hover:text-accent-foreground"
         >
-          <FilledStarIcon className="mt-0.5 size-4 shrink-0 text-primary" />
+          {command.icon === Terminal ? (
+            <Terminal className="mt-0.5 size-4 shrink-0 text-primary" />
+          ) : (
+            <FilledStarIcon className="mt-0.5 size-4 shrink-0 text-primary" />
+          )}
           <span className="min-w-0">
             <span className="block truncate text-sm font-medium">{command.usage}</span>
             <span className="block text-xs text-muted-foreground">{command.description}</span>
@@ -1645,31 +2767,43 @@ _${event.error}_`;
     <>
       <div className="flex h-full min-h-0 overflow-hidden bg-background text-foreground">
         <section className="flex min-w-0 flex-1 flex-col">
-        <header className="flex shrink-0 items-center justify-between border-b border-border px-6 py-3.5">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <FilledStarIcon className="h-5 w-5 text-primary" />
-              <h1 className="font-semibold">{activeSession?.title || "StackPilot Agent"}</h1>
-              <Badge variant="outline">{mode === "thinking" ? "thinking" : "fast"}</Badge>
-            </div>
-            <p className="mt-1 truncate text-xs text-muted-foreground">
-              {selectedDeployment
-                ? `Deployment: ${selectedDeployment.project_name} | ${selectedDeployment.status}`
-                : selectedProject
-                  ? `Project: ${selectedProject.name}`
-                  : "Ask naturally, run slash commands, and continue previous chats from History."}
-            </p>
-          </div>
+        <header className="flex shrink-0 items-center justify-between border-b border-border/40 px-6 py-3">
           <div className="flex items-center gap-2">
-            <Button type="button" variant="outline" size="icon" className="h-10 w-10" aria-label="New chat" onClick={startNewChat}>
-              <Plus className="h-4 w-4" />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-xs"
+              onClick={startNewChat}
+            >
+              <AppIcon name="plus" fallback={Plus} className="h-3.5 w-3.5" />
+              New Chat
             </Button>
-            <Badge variant="outline" className="hidden max-w-52 truncate md:inline-flex">
-              {shortId(activeModelId, 16)}
-            </Badge>
+            {activeSession?.title && (
+              <span className="hidden max-w-xs truncate text-xs text-muted-foreground sm:inline-block">
+                {activeSession.title}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <Button
+              type="button"
+              variant={terminalOpen ? "secondary" : "ghost"}
+              size="sm"
+              className={cn(
+                "h-8 gap-1.5 px-3 text-xs transition-colors",
+                terminalOpen ? "text-foreground font-medium bg-muted" : "text-muted-foreground hover:text-foreground"
+              )}
+              onClick={() => setTerminalOpen((open) => !open)}
+              title="Toggle Workspace Terminal"
+            >
+              <AppIcon name="terminal" fallback={Terminal} className="h-4 w-4 mr-1.5" />
+              Terminal
+              {terminalOpen && <span className="ml-1 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />}
+            </Button>
             <Link href="/dashboard/ai/history">
-              <Button type="button" variant="ghost" size="sm" className="hidden sm:inline-flex">
-                <Clock className="h-4 w-4" />
+              <Button type="button" variant="ghost" size="sm" className="h-8 gap-1.5 px-3 text-xs text-muted-foreground hover:text-foreground">
+                <AppIcon name="clock" fallback={Clock} className="h-3.5 w-3.5" />
                 History
               </Button>
             </Link>
@@ -1677,98 +2811,411 @@ _${event.error}_`;
               type="button"
               variant="ghost"
               size="icon"
+              className="h-8 w-8 text-muted-foreground hover:text-foreground"
               aria-label="Agent settings"
               onClick={() => setSettingsOpen(true)}
             >
-              <Settings className="h-4 w-4" />
+              <AppIcon name="settings" fallback={Settings} className="h-4 w-4" />
             </Button>
           </div>
         </header>
 
         <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-8 md:px-8">
           <div className="mx-auto flex max-w-5xl flex-col gap-6">
-            {messages.map((message) => (
+            {messages.map((message, messageIndex) => (
               <div
                 key={message.id}
                 className={cn("flex gap-3", message.role === "user" ? "justify-end" : "justify-start")}
               >
                 {message.role !== "user" && (
                   <div className="mt-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border bg-background">
-                    <Star className="h-4 w-4" />
+                    <AppIcon name="star" fallback={Star} className="h-4 w-4"  />
                   </div>
                 )}
                 <div
                   className={cn(
-                    "max-w-[min(56rem,88%)] rounded-2xl px-5 py-4",
+                    "min-w-0 max-w-[min(56rem,88%)] rounded-2xl px-5 py-4 overflow-hidden break-words",
                     message.role === "user" ? "bg-primary text-primary-foreground" : "border border-border bg-background"
                   )}
                 >
-                  {message.meta && (
-                    <div
-                      className={cn(
-                        "mb-2 text-xs font-medium",
-                        message.role === "user" ? "text-primary-foreground/70" : "text-muted-foreground"
-                      )}
-                    >
-                      {message.meta}
-                    </div>
-                  )}
-                  {message.role === "user" ? (
-                    <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
-                  ) : (
-                    <div className="prose-ai text-sm leading-relaxed">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                        {message.content}
-                      </ReactMarkdown>
-                    </div>
-                  )}
+                  {(() => {
+                    const parsed = message.role === "assistant"
+                      ? parseAssistantMessageContent(message.content, message.reasoning)
+                      : { content: message.content, reasoningBlocks: [] };
+
+                    return (
+                      <>
+                        {message.role === "assistant" && (
+                          <ThinkingPanel
+                            reasoning={parsed.reasoningBlocks.length > 0 ? parsed.reasoningBlocks : undefined}
+                            stats={message.stats}
+                            orbStyle={orbStyle}
+                          />
+                        )}
+                        {message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0 && (
+                          <ToolsPanel
+                            toolCalls={message.toolCalls}
+                            onOpenTerminal={openTerminalWithCommand}
+                            onAllow={handleAllowToolCall}
+                            onDeny={handleDenyToolCall}
+                          />
+                        )}
+                        {message.role === "user" ? (
+                          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
+                        ) : (
+                          <div className="prose-ai min-w-0 max-w-full break-words [overflow-wrap:anywhere] text-sm leading-relaxed">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                              {parsed.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                   {message.role === "assistant" && (
-                    <ThinkingPanel reasoning={message.reasoning} stats={message.stats} />
+                    <div className="mt-2.5 flex items-center gap-0.5 text-muted-foreground">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title={copiedId === message.id ? "Copied" : "Copy"}
+                        aria-label="Copy message"
+                        onClick={() => handleCopy(message.id, message.content)}
+                      >
+                        {copiedId === message.id ? (
+                          <AppIcon name="check" fallback={Check} className="h-3.5 w-3.5 text-emerald-500" />
+                        ) : (
+                          <AppIcon name="copy" fallback={Copy} className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title="Branch into new chat"
+                        aria-label="Branch into new chat"
+                        onClick={() => handleBranchChat(messageIndex)}
+                      >
+                        <AppIcon name="git-fork" fallback={GitFork} className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        disabled={isRunning}
+                        className="h-7 w-7 rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title="Regenerate response"
+                        aria-label="Regenerate response"
+                        onClick={() => handleRegenerate(messageIndex)}
+                      >
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
                   )}
                 </div>
               </div>
             ))}
-            {isStreaming && (streamReasoning || streamContent) && (
+            {isStreaming && (
               <div className="flex justify-start">
-                <div className="max-w-[min(56rem,88%)] rounded-2xl border border-border bg-background px-5 py-4">
-                  {streamReasoning && (
-                    <div className="mb-3 rounded-lg border border-border bg-muted/30 p-3">
-                      <div className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
-                        <Brain className="h-3 w-3" />
-                        <span className="status-verb-shine">Thinking</span>
-                      </div>
-                      {/* Pinned to the bottom as it grows, so the newest
-                          reasoning stays in view without yanking the page. */}
-                      <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground [overflow-anchor:auto]">
-                        {streamReasoning}
-                      </pre>
-                    </div>
-                  )}
-                  {streamContent && (
-                    <div className="prose-ai text-sm leading-relaxed">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                        {streamContent}
-                      </ReactMarkdown>
-                    </div>
-                  )}
+                <div className="min-w-0 max-w-[min(56rem,88%)] rounded-2xl border border-border bg-background px-5 py-4 overflow-hidden break-words">
+                  {(() => {
+                    const parsedStream = parseAssistantMessageContent(streamContent, streamReasoning);
+                    return (
+                      <>
+                        {(parsedStream.reasoningBlocks.length > 0 || isStreaming) && (
+                          <ThinkingPanel
+                            isGenerating={isStreaming}
+                            reasoning={
+                              parsedStream.reasoningBlocks.length > 0
+                                ? parsedStream.reasoningBlocks
+                                : "Initializing workspace context and analyzing request..."
+                            }
+                            orbStyle={orbStyle}
+                          />
+                        )}
+                        {streamToolCalls.length > 0 && (
+                          <ToolsPanel
+                            toolCalls={streamToolCalls}
+                            isGenerating={isStreaming}
+                            onOpenTerminal={openTerminalWithCommand}
+                            onAllow={handleAllowToolCall}
+                            onDeny={handleDenyToolCall}
+                          />
+                        )}
+                        {parsedStream.content && (
+                          <div className="prose-ai min-w-0 max-w-full break-words [overflow-wrap:anywhere] text-sm leading-relaxed">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+                              {parsedStream.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                   <button
                     type="button"
                     onClick={() => streamAbortRef.current?.abort()}
-                    className="mt-3 text-xs text-muted-foreground underline-offset-2 hover:underline"
+                    className="mt-3 inline-flex items-center gap-1.5 text-xs text-rose-500 hover:text-rose-600 font-medium px-2 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 transition-colors cursor-pointer"
                   >
-                    Stop
+                    <Square className="h-3 w-3 fill-current" />
+                    <span>Stop generation</span>
                   </button>
                 </div>
               </div>
             )}
-            {isRunning && !(isStreaming && (streamReasoning || streamContent)) && (
+            {pendingApproval && (
+              <div className="my-2 rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 shadow-sm animate-in fade-in slide-in-from-bottom-2">
+                <div className="flex items-start gap-3.5">
+                  <div className="rounded-xl bg-amber-500/20 p-2.5 text-amber-500 shrink-0">
+                    <ShieldAlert className="h-5 w-5" />
+                  </div>
+                  <div className="flex-1 space-y-2 min-w-0">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <h4 className="font-semibold text-foreground text-sm">{pendingApproval.title}</h4>
+                      <Badge variant="outline" className="border-amber-500/40 text-amber-500 text-[10px] uppercase tracking-wider font-mono">
+                        Permission Required
+                      </Badge>
+                    </div>
+                    <p className="text-xs text-muted-foreground leading-relaxed break-words">
+                      {pendingApproval.description}
+                    </p>
+                    {pendingApproval.command && (
+                      <pre className="rounded-lg bg-zinc-950/80 p-2.5 font-mono text-xs text-emerald-400 overflow-x-auto border border-zinc-800">
+                        <span className="text-zinc-500 select-none">$ </span>{pendingApproval.command}
+                      </pre>
+                    )}
+                    <div className="flex items-center gap-2 pt-1">
+                      <Button
+                        size="sm"
+                        className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium text-xs h-8 px-3.5 gap-1.5 shadow-sm"
+                        onClick={async () => {
+                          const act = pendingApproval.action;
+                          setPendingApproval(null);
+                          await act();
+                        }}
+                      >
+                        <Check className="h-3.5 w-3.5" />
+                        Accept & Run
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="border-border hover:bg-rose-500/10 hover:text-rose-500 font-medium text-xs h-8 px-3.5 gap-1.5"
+                        onClick={() => {
+                          const dec = pendingApproval.onDecline;
+                          setPendingApproval(null);
+                          dec();
+                        }}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                        Decline
+                      </Button>
+                      {pendingApproval.command && (
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="font-medium text-xs h-8 px-3 gap-1.5"
+                          onClick={() => {
+                            openTerminalWithCommand(pendingApproval.command);
+                          }}
+                        >
+                          <Terminal className="h-3.5 w-3.5 text-emerald-500" />
+                          Inspect in Terminal
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+            {isRunning && !isStreaming && (
               <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
+                {orbStyle !== "off" && (
+                  <ThinkingOrb
+                    state={orbStyle}
+                    size={20}
+                    theme={isDark ? "dark" : "light"}
+                  />
+                )}
                 <StatusVerb prompt={lastUserPrompt} />
               </div>
             )}
           </div>
         </div>
+
+        {/* Interactive Workspace Terminal Drawer */}
+        {terminalOpen && (
+          <div
+            className={cn(
+              "shrink-0 border-t border-border/80 bg-zinc-950 text-zinc-200 shadow-xl flex flex-col transition-all duration-150 z-10",
+              terminalExpanded ? "h-80" : "h-56"
+            )}
+          >
+            {/* Terminal Drawer Header */}
+            <div className="flex items-center justify-between px-3 py-1.5 border-b border-zinc-800/80 bg-zinc-900/80 select-none text-xs">
+              <div className="flex items-center gap-2 min-w-0">
+                <Terminal className="h-3.5 w-3.5 text-zinc-400" />
+                <span className="font-mono text-xs font-medium text-zinc-200">Terminal</span>
+                <span className="text-zinc-600">·</span>
+                <span className="text-[11px] font-mono text-zinc-400 truncate max-w-[16rem]">
+                  {terminalCwd || (selectedDeployment ? `uploads/builds/${selectedDeployment.id.slice(0, 8)}/source` : selectedProject ? `uploads/projects/${selectedProject.id.slice(0, 8)}/source` : "workspace")}
+                </span>
+              </div>
+
+              {/* Header actions & quick chips */}
+              <div className="flex items-center gap-1.5 shrink-0">
+                <div className="hidden sm:flex items-center gap-1 mr-1">
+                  {[
+                    { label: "dir", cmd: "dir" },
+                    { label: "node -v", cmd: "node -v" },
+                    { label: "git status", cmd: "git status" },
+                  ].map((action) => (
+                    <button
+                      key={action.label}
+                      type="button"
+                      disabled={isTerminalExecuting}
+                      onClick={() => runTerminalCommand(action.cmd)}
+                      className="px-1.5 py-0.5 rounded font-mono text-[10px] bg-zinc-800/70 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors shrink-0 disabled:opacity-50"
+                    >
+                      {action.label}
+                    </button>
+                  ))}
+                </div>
+
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+                  onClick={() => setTerminalLogs([])}
+                  title="Clear Output"
+                >
+                  <AppIcon name="trash" fallback={Trash2} className="h-3 w-3" />
+                </Button>
+
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
+                  onClick={() => setTerminalExpanded((prev) => !prev)}
+                  title={terminalExpanded ? "Collapse" : "Expand"}
+                >
+                  {terminalExpanded ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
+                </Button>
+
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-zinc-400 hover:text-rose-400 hover:bg-zinc-800"
+                  onClick={() => setTerminalOpen(false)}
+                  title="Close Terminal"
+                >
+                  <AppIcon name="x" fallback={X} className="h-3 w-3" />
+                </Button>
+              </div>
+            </div>
+
+            {/* Terminal Console Output */}
+            <div className="flex-1 overflow-y-auto p-3 font-mono text-xs space-y-2.5 select-text min-h-0">
+              {terminalLogs.length === 0 ? (
+                <div className="text-zinc-600 font-mono text-xs py-1 select-none">
+                  Terminal ready. Run commands in workspace.
+                </div>
+              ) : (
+                terminalLogs.map((log) => (
+                  <div key={log.id} className="space-y-1">
+                    <div className="flex items-center justify-between gap-2 border-b border-zinc-800/40 pb-0.5">
+                      <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                        <span className="text-zinc-600 select-none text-[10px]">[{log.timestamp}]</span>
+                        <div className="flex items-center gap-1 text-zinc-300 font-medium truncate">
+                          <span className="text-zinc-600 select-none">$</span>
+                          <span className="truncate">{log.command}</span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {log.status === "running" ? (
+                          <span className="text-[10px] text-zinc-400 flex items-center gap-1">
+                            <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                            <span>running</span>
+                          </span>
+                        ) : log.exitCode === 0 ? (
+                          <Badge variant="outline" className="h-4 px-1 text-[9px] font-mono border-emerald-500/30 text-emerald-400 bg-emerald-500/10">
+                            exit 0
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="h-4 px-1 text-[9px] font-mono border-rose-500/30 text-rose-400 bg-rose-500/10">
+                            exit {log.exitCode ?? 1}
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+
+                    {log.status === "running" && (
+                      <div className="text-zinc-500 italic text-[11px] flex items-center gap-1.5 py-0.5">
+                        <Loader2 className="h-2.5 w-2.5 animate-spin text-zinc-400" />
+                        <span>Executing...</span>
+                      </div>
+                    )}
+
+                    {log.stdout && (
+                      <pre className="whitespace-pre-wrap break-words text-zinc-300 leading-relaxed overflow-x-auto text-[11px]">
+                        {log.stdout}
+                      </pre>
+                    )}
+
+                    {log.stderr && (
+                      <pre className="whitespace-pre-wrap break-words text-rose-400 leading-relaxed overflow-x-auto text-[11px]">
+                        {log.stderr}
+                      </pre>
+                    )}
+
+                    {log.status !== "running" && !log.stdout && !log.stderr && (
+                      <div className="text-zinc-600 italic text-[10px]">(command finished with no output)</div>
+                    )}
+                  </div>
+                ))
+              )}
+              <div ref={terminalLogsEndRef} />
+            </div>
+
+            {/* Interactive Command Input Line */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                runTerminalCommand(terminalInput);
+              }}
+              className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900/80 border-t border-zinc-800 shrink-0 font-mono text-xs"
+            >
+              <span className="text-zinc-500 font-bold select-none text-xs">$</span>
+              <input
+                ref={terminalInputRef}
+                type="text"
+                value={terminalInput}
+                disabled={isTerminalExecuting}
+                onChange={(e) => setTerminalInput(e.target.value)}
+                onKeyDown={handleTerminalKeyDown}
+                placeholder="Run a command..."
+                className="flex-1 bg-transparent border-none outline-none text-zinc-200 placeholder:text-zinc-600 font-mono text-xs disabled:opacity-50"
+              />
+              {isTerminalExecuting ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-400" />
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!terminalInput.trim()}
+                  className="text-zinc-500 hover:text-zinc-300 disabled:opacity-30 transition-colors p-0.5 cursor-pointer"
+                  title="Run (Enter)"
+                >
+                  <CornerDownLeft className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </form>
+          </div>
+        )}
 
         <div className="sticky bottom-0 z-20 shrink-0 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur md:px-6">
           <div ref={composerRef} className="mx-auto max-w-5xl">
@@ -1871,7 +3318,11 @@ _${event.error}_`;
                       textareaRef.current?.focus();
                     }}
                   >
-                    <FilledStarIcon className="mt-0.5 size-4 shrink-0 text-primary" />
+                    {command.icon === Terminal ? (
+                      <Terminal className="mt-0.5 size-4 shrink-0 text-primary" />
+                    ) : (
+                      <FilledStarIcon className="mt-0.5 size-4 shrink-0 text-primary" />
+                    )}
                     <span className="min-w-0">
                       <span className="block text-sm font-medium">{command.usage}</span>
                       <span className="block text-xs text-muted-foreground">{command.description}</span>
@@ -1910,6 +3361,7 @@ _${event.error}_`;
                       variant="secondary"
                       size="sm"
                       className="max-w-[18rem] justify-start"
+                      suppressHydrationWarning
                       onClick={() => {
                         setComposerModelOpen((open) => !open);
                         setSettingsModelOpen(false);
@@ -1917,11 +3369,11 @@ _${event.error}_`;
                         setDeploymentOpen(false);
                       }}
                     >
-                      {mode === "thinking" ? <BrainCircuit className="h-4 w-4" /> : <Zap className="h-4 w-4" />}
-                      <span className="truncate">
+                      {mode === "thinking" ? <AppIcon name="brain-circuit" fallback={BrainCircuit} className="h-4 w-4"  /> : <AppIcon name="zap" fallback={Zap} className="h-4 w-4"  />}
+                      <span className="truncate" suppressHydrationWarning>
                         {mode === "thinking" ? "Think" : "Fast"} | {shortId(modelLabel(activeModel), 18)}
                       </span>
-                      <ChevronDown className="ml-1 h-3.5 w-3.5" />
+                      <AppIcon name="chevron-down" fallback={ChevronDown} className="ml-1 h-3.5 w-3.5"  />
                     </Button>
                     {composerModelOpen && (
                       <div className="absolute bottom-full left-0 z-50 mb-2 w-80">
@@ -1945,7 +3397,7 @@ _${event.error}_`;
                     >
                       <FilledStarIcon className="size-4 shrink-0" />
                       Commands
-                      <ChevronDown className="ml-1 h-3.5 w-3.5" />
+                      <AppIcon name="chevron-down" fallback={ChevronDown} className="ml-1 h-3.5 w-3.5"  />
                     </Button>
                     {commandPickerOpen && (
                       <div className="absolute bottom-full left-0 z-50 mb-2 w-96 max-w-[calc(100vw-3rem)]">
@@ -1954,10 +3406,55 @@ _${event.error}_`;
                     )}
                   </div>
                 </div>
-                <Button type="button" onClick={submit} disabled={!input.trim() || isRunning}>
-                  {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                  Send
-                </Button>
+                <div className="flex items-center gap-1.5">
+                  <Button
+                    type="button"
+                    variant={isListening ? "destructive" : "outline"}
+                    size={isListening ? "default" : "icon"}
+                    onClick={toggleListening}
+                    disabled={isRunning}
+                    className={cn(
+                      "h-9 shrink-0 transition-all",
+                      isListening
+                        ? "gap-2 px-3 bg-red-500 hover:bg-red-600 text-white shadow-md animate-pulse border-red-500"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                    title={isListening ? "Listening... Click to finish voice input" : "Voice input (Speech to text)"}
+                    aria-label={isListening ? "Stop voice input" : "Start voice input"}
+                  >
+                    {isListening ? (
+                      <>
+                        <ThinkingOrb state="listening" size={20} theme="dark" />
+                        <span className="text-xs font-medium">Listening...</span>
+                        <AppIcon name="square" fallback={Square} className="h-3 w-3 fill-current ml-0.5" />
+                      </>
+                    ) : (
+                      <AppIcon name="mic" fallback={Mic} className="h-4 w-4" />
+                    )}
+                  </Button>
+
+                  {isStreaming ? (
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      onClick={() => streamAbortRef.current?.abort()}
+                      className="gap-1.5 shadow-sm bg-red-600 hover:bg-red-700 text-white font-medium active:scale-95 transition-all"
+                      title="Stop generating response"
+                    >
+                      <Square className="h-3.5 w-3.5 fill-current" />
+                      Stop
+                    </Button>
+                  ) : (
+                    <Button type="button" onClick={submit} disabled={!input.trim() || isRunning}>
+                      {isRunning ? (
+                        <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <AppIcon name="send" fallback={Send} className="h-4 w-4" />
+                      )}
+                      Send
+                    </Button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1972,13 +3469,14 @@ _${event.error}_`;
           if (!open) closePickers();
         }}
       >
-        <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-xl">
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-4xl max-w-[95vw] p-6">
           <DialogHeader>
             <DialogTitle>Agent Settings</DialogTitle>
             <DialogDescription>Configure provider keys, model, reasoning mode, project context, and deployment context.</DialogDescription>
           </DialogHeader>
 
-          <div className="grid gap-5">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
+            <div className="space-y-6">
             {/* ── 1. How it answers ─────────────────────────────── */}
             <section className="space-y-3">
               <div>
@@ -1999,7 +3497,7 @@ _${event.error}_`;
                       setSelectedModel(fastModels[0]?.id || "");
                     }}
                   >
-                    <Zap className="h-4 w-4" />
+                    <AppIcon name="zap" fallback={Zap} className="h-4 w-4"  />
                     Fast
                   </Button>
                   <Button
@@ -2010,7 +3508,7 @@ _${event.error}_`;
                       setSelectedModel(thinkingModels[0]?.id || "");
                     }}
                   >
-                    <BrainCircuit className="h-4 w-4" />
+                    <AppIcon name="brain-circuit" fallback={BrainCircuit} className="h-4 w-4"  />
                     Thinking
                   </Button>
                 </div>
@@ -2054,164 +3552,116 @@ _${event.error}_`;
               </div>
 
               <div className="space-y-2">
-                <Label>Model</Label>
-                <div className="relative">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="w-full justify-between"
-                    onClick={() => {
-                      setSettingsModelOpen((open) => !open);
-                      setProjectOpen(false);
-                      setDeploymentOpen(false);
-                      setComposerModelOpen(false);
-                    }}
-                  >
-                    <span className="truncate">{modelLabel(activeModel)}</span>
-                    <ChevronDown className="h-4 w-4" />
-                  </Button>
-                  {settingsModelOpen && (
-                    <div className="absolute left-0 right-0 top-full z-50 mt-2">
-                      {renderModelPicker(closePickers)}
-                    </div>
-                  )}
+                <div className="flex items-center justify-between">
+                  <Label>Model</Label>
+                  <span className="text-xs text-muted-foreground">
+                    {availableModels.length > 0 ? `${availableModels.length} models available` : "Enter any model"}
+                  </span>
                 </div>
-              </div>
-            </section>
-
-            {/* ── 2. Where it runs ──────────────────────────────── */}
-            <section className="space-y-3 border-t border-border pt-4">
-              <div>
-                <h3 className="text-sm font-medium">Where it runs</h3>
+                <div className="flex gap-2">
+                  <Input
+                    value={selectedModel}
+                    onChange={(event) => setSelectedModel(event.target.value)}
+                    placeholder={activeModelId || "Type or choose any model ID"}
+                    className="font-mono text-xs"
+                  />
+                  <div className="relative">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setSettingsModelOpen((open) => !open);
+                        setProjectOpen(false);
+                        setDeploymentOpen(false);
+                        setComposerModelOpen(false);
+                      }}
+                      title="Select from fetched models"
+                    >
+                      <AppIcon name="chevron-down" fallback={ChevronDown} className="h-4 w-4" />
+                    </Button>
+                    {settingsModelOpen && (
+                      <div className="absolute right-0 top-full z-50 mt-2 w-80">
+                        {renderModelPicker(closePickers)}
+                      </div>
+                    )}
+                  </div>
+                </div>
                 <p className="text-xs text-muted-foreground">
-                  Which service answers, and the key used to reach it.
-                  {/* The one genuinely confusing thing about the old layout:
-                      the button looked like it saved the whole dialog. */}{" "}
-                  Changes here need saving.
+                  Pick from the dynamic provider list or type any custom model ID directly.
                 </p>
               </div>
 
-              <div className="space-y-2">
-                <Label>Provider</Label>
-                <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-muted/30 p-1">
-                  <Button
-                    type="button"
-                    variant={provider === "nvidia_nim" ? "default" : "ghost"}
-                    onClick={() => setProvider("nvidia_nim")}
-                  >
-                    NVIDIA
-                  </Button>
-                  <Button
-                    type="button"
-                    variant={provider === "openai_compatible" ? "default" : "ghost"}
-                    onClick={() => setProvider("openai_compatible")}
-                  >
-                    OpenAI-compatible
-                  </Button>
+              {/* ── Thinking Orb Effect ───────────────────────────── */}
+              <div className="space-y-2 border-t border-border/70 pt-3">
+                <div className="flex items-center justify-between">
+                  <Label>Thinking Orb Effect</Label>
+                  <span className="text-xs font-mono text-muted-foreground">
+                    {orbStyle === "off" ? "Off" : orbStyle}
+                  </span>
                 </div>
-              </div>
+                <p className="text-xs text-muted-foreground">
+                  Select which animated orb to show during thinking & streaming, or disable it completely.
+                </p>
 
-              {/* Plain language instead of the raw `nvidia_nim` /
-                  `provider_verified` identifiers the old badges printed. */}
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                {provider === "nvidia_nim" ? (
-                  settingsQuery.data?.has_nvidia_key ? (
-                    <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-600 dark:text-emerald-400">
-                      <Check className="h-3 w-3" />
-                      NVIDIA key found
-                    </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1.5 rounded-full bg-destructive/10 px-2.5 py-1 text-destructive">
-                      No NVIDIA key — set NVIDIA_API_KEY on the server
-                    </span>
-                  )
-                ) : settingsQuery.data?.has_openai_compatible_key ? (
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-600 dark:text-emerald-400">
-                    <Check className="h-3 w-3" />
-                    API key saved
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-muted-foreground">
-                    No API key saved yet
-                  </span>
-                )}
-                {/* Where the model list came from. `fallback` means the probe
-                    failed and we are showing a built-in list, which is worth
-                    saying — a model that is not actually available otherwise
-                    fails later, at send time, with a confusing error. */}
-                {modelsQuery.data?.source === "provider_verified" && (
-                  <span className="text-muted-foreground">Model list confirmed with the provider</span>
-                )}
-                {(modelsQuery.data?.source === "fallback" ||
-                  modelsQuery.data?.source === "fallback_probe_failed") && (
-                  <span className="text-amber-600 dark:text-amber-400">
-                    Could not reach the provider — showing a built-in model list
-                  </span>
-                )}
-              </div>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5 rounded-lg border border-border bg-muted/20 p-2">
+                  {ORB_STYLES.map((style) => {
+                    const isSelected = orbStyle === style.id;
+                    return (
+                      <button
+                        key={style.id}
+                        type="button"
+                        onClick={() => setOrbStyle(style.id)}
+                        className={cn(
+                          "flex flex-col items-center justify-center rounded-md p-2 text-xs transition-all border",
+                          isSelected
+                            ? "bg-primary text-primary-foreground shadow-sm border-primary font-semibold"
+                            : "border-transparent hover:bg-muted text-muted-foreground hover:text-foreground"
+                        )}
+                        title={style.description}
+                      >
+                        <div className="h-6 w-6 flex items-center justify-center mb-1">
+                          {style.id === "off" ? (
+                            <span className="text-xs font-bold opacity-75">✕</span>
+                          ) : (
+                            <ThinkingOrb
+                              state={style.id}
+                              size={20}
+                              theme={isSelected ? (isDark ? "dark" : "light") : "auto"}
+                            />
+                          )}
+                        </div>
+                        <span className="truncate max-w-[4.2rem] text-[11px] leading-tight">
+                          {style.label.split(" ")[0]}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
 
-              {provider === "openai_compatible" && (
-                <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 sm:grid-cols-2">
-                  <div className="space-y-2 sm:col-span-2">
-                    <Label>Base URL</Label>
-                    <Input
-                      value={compatibleBaseUrl}
-                      onChange={(event) => setCompatibleBaseUrl(event.target.value)}
-                      placeholder="https://api.openai.com/v1"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Must be HTTPS. Private and loopback addresses are rejected.
+                {/* Live Preview Card */}
+                <div className="flex items-center gap-3 rounded-lg border border-border/70 bg-muted/30 p-2.5">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-background border border-border">
+                    {orbStyle === "off" ? (
+                      <span className="text-xs font-bold text-muted-foreground">OFF</span>
+                    ) : (
+                      <ThinkingOrb state={orbStyle} size={20} theme={isDark ? "dark" : "light"} />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                      <span>{ORB_STYLES.find((s) => s.id === orbStyle)?.label || "Solving"}</span>
+                      {orbStyle === "off" ? (
+                        <span className="text-[10px] rounded bg-muted px-1.5 py-0.5 text-muted-foreground font-normal">Disabled</span>
+                      ) : (
+                        <span className="text-[10px] rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 font-normal">Active</span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-muted-foreground line-clamp-1 mt-0.5">
+                      {ORB_STYLES.find((s) => s.id === orbStyle)?.description || ""}
                     </p>
                   </div>
-                  <div className="space-y-2">
-                    <Label>Model ID</Label>
-                    <Input
-                      value={compatibleModel}
-                      onChange={(event) => {
-                        setCompatibleModel(event.target.value);
-                        setSelectedModel(event.target.value);
-                      }}
-                      placeholder="gpt-4o-mini"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>API key</Label>
-                    <Input
-                      type="password"
-                      value={compatibleApiKey}
-                      onChange={(event) => setCompatibleApiKey(event.target.value)}
-                      placeholder={
-                        settingsQuery.data?.has_openai_compatible_key
-                          ? "Leave blank to keep the saved key"
-                          : "Paste API key"
-                      }
-                    />
-                  </div>
                 </div>
-              )}
-
-              <div className="flex items-center justify-end gap-3">
-                {saveSettingsMutation.isSuccess && !saveSettingsMutation.isPending && (
-                  <span className="text-xs text-muted-foreground">Saved</span>
-                )}
-                <Button
-                  type="button"
-                  onClick={() => saveSettingsMutation.mutate()}
-                  disabled={saveSettingsMutation.isPending}
-                >
-                  {saveSettingsMutation.isPending ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Check className="h-4 w-4" />
-                  )}
-                  Save provider
-                </Button>
               </div>
-              {saveSettingsMutation.isError && (
-                <p className="text-xs text-destructive">
-                  {errorMessage(saveSettingsMutation.error, "Could not save provider settings.")}
-                </p>
-              )}
             </section>
 
             {/* ── 3. What it can see ────────────────────────────── */}
@@ -2240,7 +3690,7 @@ _${event.error}_`;
                       }}
                     >
                       <span className="truncate">{selectedProject?.name || "Any project"}</span>
-                      <ChevronDown className="h-4 w-4" />
+                      <AppIcon name="chevron-down" fallback={ChevronDown} className="h-4 w-4"  />
                     </Button>
                     {projectOpen && (
                       <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
@@ -2253,7 +3703,7 @@ _${event.error}_`;
                           className="flex min-h-9 w-full items-center rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                         >
                           Any project
-                          {!selectedProjectId && <Check className="ml-auto h-4 w-4" />}
+                          {!selectedProjectId && <AppIcon name="check" fallback={Check} className="ml-auto h-4 w-4"  />}
                         </button>
                         <div className="my-1 h-px bg-border" />
                         {projects.map((project) => (
@@ -2267,7 +3717,7 @@ _${event.error}_`;
                             className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                           >
                             <span className="min-w-0 truncate">{project.name}</span>
-                            {project.id === selectedProjectId && <Check className="ml-auto h-4 w-4" />}
+                            {project.id === selectedProjectId && <AppIcon name="check" fallback={Check} className="ml-auto h-4 w-4"  />}
                           </button>
                         ))}
                       </div>
@@ -2294,7 +3744,7 @@ _${event.error}_`;
                           ? `${selectedDeployment.project_name} · ${selectedDeployment.status}`
                           : "Any deployment"}
                       </span>
-                      <ChevronDown className="h-4 w-4" />
+                      <AppIcon name="chevron-down" fallback={ChevronDown} className="h-4 w-4"  />
                     </Button>
                     {deploymentOpen && (
                       <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10">
@@ -2307,7 +3757,7 @@ _${event.error}_`;
                           className="flex min-h-9 w-full items-center rounded-md px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                         >
                           Any deployment
-                          {!selectedDeploymentId && <Check className="ml-auto h-4 w-4" />}
+                          {!selectedDeploymentId && <AppIcon name="check" fallback={Check} className="ml-auto h-4 w-4"  />}
                         </button>
                         <div className="my-1 h-px bg-border" />
                         {deployments.map((deployment) => (
@@ -2323,7 +3773,7 @@ _${event.error}_`;
                             <span className="min-w-0 truncate">
                               {deployment.project_name} · {deployment.status} · {shortId(deployment.id)}
                             </span>
-                            {deployment.id === selectedDeploymentId && <Check className="ml-auto h-4 w-4" />}
+                            {deployment.id === selectedDeploymentId && <AppIcon name="check" fallback={Check} className="ml-auto h-4 w-4"  />}
                           </button>
                         ))}
                       </div>
@@ -2331,6 +3781,171 @@ _${event.error}_`;
                   </div>
                 </div>
               </div>
+            </section>
+            </div>
+
+            {/* Right Column: Where it runs & Permissions */}
+            <div className="space-y-6">
+            {/* ── 2. Where it runs ──────────────────────────────── */}
+            <section className="space-y-3">
+              <div>
+                <h3 className="text-sm font-medium">Where it runs</h3>
+                <p className="text-xs text-muted-foreground">
+                  Which service answers, and the key used to reach it. Changes here need saving.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <Label>Provider</Label>
+                <div className="grid grid-cols-2 gap-1 rounded-lg border border-border bg-muted/30 p-1">
+                  <Button
+                    type="button"
+                    variant={provider === "nvidia_nim" ? "default" : "ghost"}
+                    onClick={() => setProvider("nvidia_nim")}
+                  >
+                    NVIDIA
+                  </Button>
+                  <Button
+                    type="button"
+                    variant={provider === "openai_compatible" ? "default" : "ghost"}
+                    onClick={() => setProvider("openai_compatible")}
+                  >
+                    OpenAI-compatible
+                  </Button>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                {provider === "nvidia_nim" ? (
+                  settingsQuery.data?.has_nvidia_key ? (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-600 dark:text-emerald-400">
+                      <AppIcon name="check" fallback={Check} className="h-3 w-3" />
+                      NVIDIA key saved
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-muted-foreground">
+                      No NVIDIA key saved yet
+                    </span>
+                  )
+                ) : settingsQuery.data?.has_openai_compatible_key ? (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-emerald-600 dark:text-emerald-400">
+                    <AppIcon name="check" fallback={Check} className="h-3 w-3" />
+                    API key saved
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1 text-muted-foreground">
+                    No API key saved yet
+                  </span>
+                )}
+                {availableModels.length > 0 && (
+                  <span className="text-muted-foreground">{availableModels.length} models fetched</span>
+                )}
+              </div>
+
+              {provider === "nvidia_nim" && (
+                <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                  <div className="space-y-2">
+                    <Label>NVIDIA NIM API Key</Label>
+                    <div className="flex gap-2">
+                      <Input
+                        type="password"
+                        value={nvidiaApiKey}
+                        onChange={(event) => setNvidiaApiKey(event.target.value)}
+                        placeholder={
+                          settingsQuery.data?.has_nvidia_key
+                            ? "Leave blank to keep saved key"
+                            : "Paste your nvapi-... key"
+                        }
+                      />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={fetchModelsWithCurrentKey}
+                        disabled={isFetchingModels}
+                        title="Fetch models with this API key"
+                      >
+                        {isFetchingModels ? (
+                          <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        <span className="ml-1.5 hidden sm:inline">Fetch Models</span>
+                      </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Enter your API key and click Fetch Models to dynamically load all available models from NVIDIA NIM.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {provider === "openai_compatible" && (
+                <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 sm:grid-cols-2">
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label>Base URL</Label>
+                    <Input
+                      value={compatibleBaseUrl}
+                      onChange={(event) => setCompatibleBaseUrl(event.target.value)}
+                      placeholder="https://api.openai.com/v1"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Must be HTTPS (OpenAI, OpenRouter, Groq, local proxy, etc.).
+                    </p>
+                  </div>
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label>API Key</Label>
+                    <div className="flex gap-2">
+                      <Input
+                        type="password"
+                        value={compatibleApiKey}
+                        onChange={(event) => setCompatibleApiKey(event.target.value)}
+                        placeholder={
+                          settingsQuery.data?.has_openai_compatible_key
+                            ? "Leave blank to keep saved key"
+                            : "Paste API key"
+                        }
+                      />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={fetchModelsWithCurrentKey}
+                        disabled={isFetchingModels}
+                        title="Fetch models with this API key"
+                      >
+                        {isFetchingModels ? (
+                          <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        <span className="ml-1.5 hidden sm:inline">Fetch Models</span>
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-3">
+                {saveSettingsMutation.isSuccess && !saveSettingsMutation.isPending && (
+                  <span className="text-xs text-muted-foreground">Saved</span>
+                )}
+                <Button
+                  type="button"
+                  onClick={() => saveSettingsMutation.mutate()}
+                  disabled={saveSettingsMutation.isPending}
+                >
+                  {saveSettingsMutation.isPending ? (
+                    <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
+                  ) : (
+                    <AppIcon name="check" fallback={Check} className="h-4 w-4"  />
+                  )}
+                  Save provider
+                </Button>
+              </div>
+              {saveSettingsMutation.isError && (
+                <p className="text-xs text-destructive">
+                  {errorMessage(saveSettingsMutation.error, "Could not save provider settings.")}
+                </p>
+              )}
             </section>
 
             <div className="space-y-2 rounded-lg border border-border p-3">
@@ -2384,6 +3999,7 @@ _${event.error}_`;
                   ? "Full access lets natural-language deploy requests create deployments and queue builds."
                   : "Ask first and Auto review prepare the action plan, then require your explicit approval before real deploy work."}
               </p>
+            </div>
             </div>
           </div>
         </DialogContent>

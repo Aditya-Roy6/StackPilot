@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query";
 import { Boxes, Database, Eye, FileCode2, History, Loader2, Play, RefreshCw, RotateCw, ScrollText, Server, ShieldCheck, SlidersHorizontal, Square, Trash2, Undo2 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 import api from "@/lib/api";
@@ -701,9 +702,9 @@ export function InfrastructureMonitor() {
         onClick={() => openResourceDetails(resource)}
       >
         {yamlResourceMutation.isPending && detailsResource?.resource_key === resource.resource_key ? (
-          <Loader2 className="h-4 w-4 animate-spin" />
+          <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
         ) : (
-          <FileCode2 className="h-4 w-4" />
+          <AppIcon name="file-code2" fallback={FileCode2} className="h-4 w-4"  />
         )}
         Details
       </Button>
@@ -720,7 +721,7 @@ export function InfrastructureMonitor() {
             disabled={isBusy}
             onClick={() => inspectResourceMutation.mutate(resource)}
           >
-            {inspectResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
+            {inspectResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
             Inspect
           </Button>
           {supportsLogs ? (
@@ -731,7 +732,7 @@ export function InfrastructureMonitor() {
               disabled={isBusy}
               onClick={() => logsResourceMutation.mutate(resource)}
             >
-              {logsResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScrollText className="h-4 w-4" />}
+              {logsResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="scroll-text" fallback={ScrollText} className="h-4 w-4"  />}
               Logs
             </Button>
           ) : null}
@@ -743,7 +744,7 @@ export function InfrastructureMonitor() {
               disabled={isBusy}
               onClick={() => setRestartCandidate(resource)}
             >
-              {restartResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
+              {restartResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="rotate-cw" fallback={RotateCw} className="h-4 w-4"  />}
               Restart
             </Button>
           ) : null}
@@ -756,7 +757,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => kubernetesControlMutation.mutate({ resource, action: "rollout_status" })}
               >
-                {kubernetesControlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                {kubernetesControlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="shield-check" fallback={ShieldCheck} className="h-4 w-4"  />}
                 Status
               </Button>
               <Button
@@ -766,7 +767,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => kubernetesControlMutation.mutate({ resource, action: "rollout_history" })}
               >
-                {kubernetesControlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <History className="h-4 w-4" />}
+                {kubernetesControlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="history" fallback={History} className="h-4 w-4"  />}
                 History
               </Button>
               <Button
@@ -776,7 +777,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => setKubernetesActionCandidate({ resource, action: "undo_rollout" })}
               >
-                <Undo2 className="h-4 w-4" />
+                <AppIcon name="undo2" fallback={Undo2} className="h-4 w-4"  />
                 Undo
               </Button>
               <Button
@@ -786,7 +787,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => setKubernetesActionCandidate({ resource, action: "pause_rollout" })}
               >
-                <Square className="h-4 w-4" />
+                <AppIcon name="square" fallback={Square} className="h-4 w-4"  />
                 Pause
               </Button>
               <Button
@@ -796,7 +797,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => setKubernetesActionCandidate({ resource, action: "resume_rollout" })}
               >
-                <Play className="h-4 w-4" />
+                <AppIcon name="play" fallback={Play} className="h-4 w-4"  />
                 Resume
               </Button>
               <Button
@@ -809,7 +810,7 @@ export function InfrastructureMonitor() {
                   setSetImageCandidate(resource);
                 }}
               >
-                <RefreshCw className="h-4 w-4" />
+                <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-4 w-4"  />
                 Set Image
               </Button>
             </>
@@ -822,7 +823,7 @@ export function InfrastructureMonitor() {
               disabled={isBusy}
               onClick={() => setKubernetesActionCandidate({ resource, action: "delete_pod" })}
             >
-              <Trash2 className="h-4 w-4" />
+              <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
               Delete Pod
             </Button>
           ) : null}
@@ -835,7 +836,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => kubernetesControlMutation.mutate({ resource, action: "node_describe" })}
               >
-                {kubernetesControlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Server className="h-4 w-4" />}
+                {kubernetesControlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="server" fallback={Server} className="h-4 w-4"  />}
                 Describe
               </Button>
               <Button
@@ -845,7 +846,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => setKubernetesActionCandidate({ resource, action: "cordon_node" })}
               >
-                <Square className="h-4 w-4" />
+                <AppIcon name="square" fallback={Square} className="h-4 w-4"  />
                 Cordon
               </Button>
               <Button
@@ -855,7 +856,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => setKubernetesActionCandidate({ resource, action: "uncordon_node" })}
               >
-                <Play className="h-4 w-4" />
+                <AppIcon name="play" fallback={Play} className="h-4 w-4"  />
                 Uncordon
               </Button>
               <Button
@@ -865,7 +866,7 @@ export function InfrastructureMonitor() {
                 disabled={isBusy}
                 onClick={() => setKubernetesActionCandidate({ resource, action: "drain_node" })}
               >
-                <Trash2 className="h-4 w-4" />
+                <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
                 Drain
               </Button>
             </>
@@ -879,11 +880,11 @@ export function InfrastructureMonitor() {
               onClick={() => setDockerStateCandidate({ resource, action: dockerIsRunning ? "stop" : "start" })}
             >
               {dockerStateMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
               ) : dockerIsRunning ? (
-                <Square className="h-4 w-4" />
+                <AppIcon name="square" fallback={Square} className="h-4 w-4"  />
               ) : (
-                <Play className="h-4 w-4" />
+                <AppIcon name="play" fallback={Play} className="h-4 w-4"  />
               )}
               {dockerIsRunning ? "Stop" : "Start"}
             </Button>
@@ -899,7 +900,7 @@ export function InfrastructureMonitor() {
                 setScaleCandidate(resource);
               }}
             >
-              {scaleResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <SlidersHorizontal className="h-4 w-4" />}
+              {scaleResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="sliders-horizontal" fallback={SlidersHorizontal} className="h-4 w-4"  />}
               Scale
             </Button>
           ) : null}
@@ -943,7 +944,7 @@ export function InfrastructureMonitor() {
     if (resource.claimed_by_StackPilot) {
       return (
         <Badge variant="default">
-          <ShieldCheck className="h-3 w-3" />
+          <AppIcon name="shield-check" fallback={ShieldCheck} className="h-3 w-3"  />
           Claimed
         </Badge>
       );
@@ -1076,7 +1077,7 @@ export function InfrastructureMonitor() {
             onClick={() => inventoryQuery.refetch()}
             disabled={inventoryQuery.isFetching}
           >
-            <RefreshCw className={inventoryQuery.isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+            <AppIcon name="refresh-cw" fallback={RefreshCw} className={inventoryQuery.isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"}  />
             Refresh
           </Button>
           {inventoryQuery.isFetching && (
@@ -1090,21 +1091,21 @@ export function InfrastructureMonitor() {
       <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
         <Card size="sm">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Server className="h-4 w-4" />Docker containers</CardTitle>
+            <CardTitle className="flex items-center gap-2"><AppIcon name="server" fallback={Server} className="h-4 w-4"  />Docker containers</CardTitle>
             <CardDescription>{inventoryQuery.data?.docker.available ? "Docker reachable" : "Docker unavailable"}</CardDescription>
           </CardHeader>
           <CardContent><div className="text-3xl font-bold">{inventoryQuery.data?.docker.container_count ?? "-"}</div></CardContent>
         </Card>
         <Card size="sm">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Database className="h-4 w-4" />Docker images</CardTitle>
+            <CardTitle className="flex items-center gap-2"><AppIcon name="database" fallback={Database} className="h-4 w-4"  />Docker images</CardTitle>
             <CardDescription>Host image inventory</CardDescription>
           </CardHeader>
           <CardContent><div className="text-3xl font-bold">{inventoryQuery.data?.docker.image_count ?? "-"}</div></CardContent>
         </Card>
         <Card size="sm">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2"><Boxes className="h-4 w-4" />Kubernetes nodes</CardTitle>
+            <CardTitle className="flex items-center gap-2"><AppIcon name="boxes" fallback={Boxes} className="h-4 w-4"  />Kubernetes nodes</CardTitle>
             <CardDescription>{inventoryQuery.data?.kubernetes.available ? "Cluster reachable" : "No cluster detected"}</CardDescription>
           </CardHeader>
           <CardContent><div className="text-3xl font-bold">{inventoryQuery.data?.kubernetes.node_count ?? "-"}</div></CardContent>
@@ -1577,7 +1578,7 @@ export function InfrastructureMonitor() {
               onClick={() => restartCandidate && restartResourceMutation.mutate(restartCandidate)}
               disabled={!restartCandidate || restartResourceMutation.isPending}
             >
-              {restartResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCw className="h-4 w-4" />}
+              {restartResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="rotate-cw" fallback={RotateCw} className="h-4 w-4"  />}
               Restart
             </Button>
           </DialogFooter>
@@ -1604,11 +1605,11 @@ export function InfrastructureMonitor() {
               disabled={!dockerStateCandidate || dockerStateMutation.isPending}
             >
               {dockerStateMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
               ) : dockerStateCandidate?.action === "stop" ? (
-                <Square className="h-4 w-4" />
+                <AppIcon name="square" fallback={Square} className="h-4 w-4"  />
               ) : (
-                <Play className="h-4 w-4" />
+                <AppIcon name="play" fallback={Play} className="h-4 w-4"  />
               )}
               {dockerStateCandidate?.action === "stop" ? "Stop" : "Start"}
             </Button>
@@ -1641,9 +1642,9 @@ export function InfrastructureMonitor() {
               disabled={!kubernetesActionCandidate || kubernetesControlMutation.isPending}
             >
               {kubernetesControlMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
               ) : (
-                <Eye className="h-4 w-4" />
+                <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />
               )}
               Preview
             </Button>
@@ -1657,15 +1658,15 @@ export function InfrastructureMonitor() {
               disabled={!kubernetesActionCandidate || kubernetesControlMutation.isPending}
             >
               {kubernetesControlMutation.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
               ) : kubernetesActionCandidate?.action === "delete_pod" || kubernetesActionCandidate?.action === "drain_node" ? (
-                <Trash2 className="h-4 w-4" />
+                <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
               ) : kubernetesActionCandidate?.action === "cordon_node" || kubernetesActionCandidate?.action === "pause_rollout" ? (
-                <Square className="h-4 w-4" />
+                <AppIcon name="square" fallback={Square} className="h-4 w-4"  />
               ) : kubernetesActionCandidate?.action === "uncordon_node" || kubernetesActionCandidate?.action === "resume_rollout" ? (
-                <Play className="h-4 w-4" />
+                <AppIcon name="play" fallback={Play} className="h-4 w-4"  />
               ) : (
-                <Undo2 className="h-4 w-4" />
+                <AppIcon name="undo2" fallback={Undo2} className="h-4 w-4"  />
               )}
               Confirm
             </Button>
@@ -1717,7 +1718,7 @@ export function InfrastructureMonitor() {
               })}
               disabled={!setImageCandidate || !deploymentImage.trim() || kubernetesControlMutation.isPending}
             >
-              {kubernetesControlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
+              {kubernetesControlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
               Preview
             </Button>
             <Button
@@ -1730,7 +1731,7 @@ export function InfrastructureMonitor() {
               })}
               disabled={!setImageCandidate || !deploymentImage.trim() || kubernetesControlMutation.isPending}
             >
-              {kubernetesControlMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+              {kubernetesControlMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-4 w-4"  />}
               Update Image
             </Button>
           </DialogFooter>
@@ -1769,7 +1770,7 @@ export function InfrastructureMonitor() {
               onClick={() => scaleCandidate && scaleResourceMutation.mutate({ resource: scaleCandidate, replicas: parsedScaleReplicas })}
               disabled={!scaleCandidate || !Number.isInteger(parsedScaleReplicas) || parsedScaleReplicas < 0 || parsedScaleReplicas > 50 || scaleResourceMutation.isPending}
             >
-              {scaleResourceMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <SlidersHorizontal className="h-4 w-4" />}
+              {scaleResourceMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  /> : <AppIcon name="sliders-horizontal" fallback={SlidersHorizontal} className="h-4 w-4"  />}
               Scale
             </Button>
           </DialogFooter>

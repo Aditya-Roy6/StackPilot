@@ -8,6 +8,7 @@
 #include <json/json.h>
 #include <pqxx/pqxx>
 #include <spdlog/spdlog.h>
+#include <vector>
 
 namespace stackpilot {
 
@@ -121,8 +122,18 @@ void LogWebSocketController::broadcastLog(const std::string& deploymentId, const
     Json::FastWriter writer;
     std::string out = writer.write(msg);
 
-    std::lock_guard<std::mutex> lock(subscribersMutex_);
-    sendToChannelUnlocked(deploymentId, out);
+    std::vector<drogon::WebSocketConnectionPtr> targets;
+    {
+        std::lock_guard<std::mutex> lock(subscribersMutex_);
+        auto it = subscribers_.find(deploymentId);
+        if (it != subscribers_.end()) {
+            targets.assign(it->second.begin(), it->second.end());
+        }
+    }
+
+    for (const auto& conn : targets) {
+        conn->send(out);
+    }
 }
 
 void LogWebSocketController::broadcastStatus(const std::string& deploymentId, const std::string& status) {
@@ -134,7 +145,6 @@ void LogWebSocketController::broadcastStatus(const std::string& deploymentId, co
     Json::FastWriter writer;
     std::string out = writer.write(msg);
 
-    std::lock_guard<std::mutex> lock(subscribersMutex_);
     sendToChannelUnlocked(deploymentId, out);
 }
 
@@ -146,13 +156,9 @@ void LogWebSocketController::broadcastDeploymentUpdate(const Json::Value& deploy
     Json::FastWriter writer;
     std::string out = writer.write(msg);
 
-    std::lock_guard<std::mutex> lock(subscribersMutex_);
-    // Only the owner's global channel. Without an owner we deliberately skip the
-    // global fan-out rather than fall back to broadcasting to everyone.
     if (!ownerUserId.empty()) {
         sendToChannelUnlocked(globalChannelFor(ownerUserId), out);
     }
-    // The per-deployment channel is safe: subscription is ownership-checked.
     if (deployment.isMember("id")) {
         sendToChannelUnlocked(deployment["id"].asString(), out);
     }
@@ -166,7 +172,6 @@ void LogWebSocketController::broadcastDeploymentDeleted(const std::string& deplo
     Json::FastWriter writer;
     std::string out = writer.write(msg);
 
-    std::lock_guard<std::mutex> lock(subscribersMutex_);
     if (!ownerUserId.empty()) {
         sendToChannelUnlocked(globalChannelFor(ownerUserId), out);
     }
@@ -174,11 +179,16 @@ void LogWebSocketController::broadcastDeploymentDeleted(const std::string& deplo
 }
 
 void LogWebSocketController::sendToChannelUnlocked(const std::string& channelKey, const std::string& payload) {
-    auto it = subscribers_.find(channelKey);
-    if (it != subscribers_.end()) {
-        for (const auto& conn : it->second) {
-            conn->send(payload);
+    std::vector<drogon::WebSocketConnectionPtr> targets;
+    {
+        std::lock_guard<std::mutex> lock(subscribersMutex_);
+        auto it = subscribers_.find(channelKey);
+        if (it != subscribers_.end()) {
+            targets.assign(it->second.begin(), it->second.end());
         }
+    }
+    for (const auto& conn : targets) {
+        conn->send(payload);
     }
 }
 

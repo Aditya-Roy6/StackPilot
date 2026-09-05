@@ -40,6 +40,7 @@ import {
   X,
   Upload,
 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 import { GitHubAuthButton } from "@/components/auth/GitHubAuthButton";
 import { RemoteSshTerminal } from "@/components/RemoteSshTerminal";
@@ -56,6 +57,15 @@ interface MeResponse {
     github_oauth_available: boolean;
     google_connected: boolean;
     password_enabled: boolean;
+    preferences?: {
+      ui_theme?: string;
+      color_mode?: string;
+      sidebar_collapsed?: boolean;
+      icon_mode?: string;
+      icon_pack?: string;
+      icon_overrides?: Record<string, string>;
+      preferences?: Record<string, unknown>;
+    };
   };
 }
 
@@ -90,6 +100,13 @@ interface ProvisionResponse {
   hint?: string;
   details?: string;
   needs_sudo_password?: boolean;
+  cluster?: {
+    id: string;
+    name: string;
+    provider?: string;
+    server_url?: string;
+    status?: string;
+  };
 }
 
 interface LoginHistoryEntry {
@@ -354,7 +371,11 @@ export default function SettingsPage() {
   const provisionDockerMutation = useMutation({
     mutationKey: ["ssh-provision-docker"],
     mutationFn: async ({ connectionId, sudoPassword }: { connectionId: string; sudoPassword?: string }) => {
-      const res = await api.post(`/ssh/connections/${connectionId}/provision/docker`, sudoPassword ? { sudo_password: sudoPassword } : undefined);
+      const res = await api.post(
+        `/ssh/connections/${connectionId}/provision/docker`,
+        sudoPassword ? { sudo_password: sudoPassword } : undefined,
+        { timeout: 600000 }
+      );
       return { id: connectionId, data: res.data as ProvisionResponse };
     },
     onSuccess: ({ id, data: responseData }) => {
@@ -389,12 +410,19 @@ export default function SettingsPage() {
   const provisionKubernetesMutation = useMutation({
     mutationKey: ["ssh-provision-kubernetes"],
     mutationFn: async ({ connectionId, sudoPassword }: { connectionId: string; sudoPassword?: string }) => {
-      const res = await api.post(`/ssh/connections/${connectionId}/provision/kubernetes`, sudoPassword ? { sudo_password: sudoPassword } : undefined);
+      const res = await api.post(
+        `/ssh/connections/${connectionId}/provision/kubernetes`,
+        sudoPassword ? { sudo_password: sudoPassword } : undefined,
+        { timeout: 600000 }
+      );
       return { id: connectionId, data: res.data as ProvisionResponse };
     },
     onSuccess: ({ id, data: responseData }) => {
-      toast.success(responseData.message || "Lightweight Kubernetes prepared");
+      toast.success(responseData.message || "Lightweight Kubernetes prepared", {
+        description: responseData.cluster?.name ? `Registered as cluster: ${responseData.cluster.name}` : undefined,
+      });
       probeSshConnectionMutation.mutate(id);
+      queryClient.invalidateQueries({ queryKey: ["kubernetes-clusters"] });
     },
     onError: (error: unknown) => {
       const responseData = error instanceof AxiosError
@@ -426,13 +454,13 @@ export default function SettingsPage() {
           <p className="text-muted-foreground">Manage account, integrations, and remote build connections.</p>
         </div>
         <div className="relative w-full lg:max-w-sm">
-          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+          <AppIcon name="search" fallback={Search} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground"  />
           <Input
             value={settingsQuery}
             onChange={(event) => setSettingsQuery(event.target.value)}
             placeholder="Search settings…"
             aria-label="Search settings"
-            className="pl-9 pr-9"
+            className="pl-10 pr-9"
           />
           {settingsQuery && (
             <button
@@ -441,7 +469,7 @@ export default function SettingsPage() {
               aria-label="Clear search"
               className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
             >
-              <X className="h-3.5 w-3.5" />
+              <AppIcon name="x" fallback={X} className="h-3.5 w-3.5"  />
             </button>
           )}
         </div>
@@ -453,7 +481,7 @@ export default function SettingsPage() {
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
-              <Shield className="h-5 w-5 text-primary" />
+              <AppIcon name="shield" fallback={Shield} className="h-5 w-5 text-primary"  />
               <CardTitle>Account Settings</CardTitle>
             </div>
             <CardDescription>Update your personal information and sign-in setup.</CardDescription>
@@ -495,9 +523,9 @@ export default function SettingsPage() {
 
               <Button onClick={() => updateMutation.mutate(fullName)} disabled={updateMutation.isPending || isLoading}>
                 {updateMutation.isPending ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                 ) : (
-                  <Save className="mr-2 h-4 w-4" />
+                  <AppIcon name="save" fallback={Save} className="mr-2 h-4 w-4"  />
                 )}
                 Save Changes
               </Button>
@@ -507,7 +535,7 @@ export default function SettingsPage() {
               <div className="flex min-h-0 flex-col justify-between rounded-xl border border-border bg-muted/25 p-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 text-foreground">
-                    <History className="h-4 w-4 text-primary" />
+                    <AppIcon name="history" fallback={History} className="h-4 w-4 text-primary"  />
                     <h3 className="font-medium">Login History</h3>
                   </div>
                   <p className="text-sm text-muted-foreground">
@@ -515,7 +543,7 @@ export default function SettingsPage() {
                   </p>
                 </div>
                 <Button variant="outline" className="mt-4 w-fit" onClick={() => setLoginHistoryOpen(true)}>
-                  <History className="mr-2 h-4 w-4" />
+                  <AppIcon name="history" fallback={History} className="mr-2 h-4 w-4"  />
                   Login History
                 </Button>
               </div>
@@ -523,7 +551,7 @@ export default function SettingsPage() {
               <div className="flex min-h-0 flex-col justify-between rounded-xl border border-border bg-muted/25 p-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2 text-foreground">
-                    <ScrollText className="h-4 w-4 text-primary" />
+                    <AppIcon name="scroll-text" fallback={ScrollText} className="h-4 w-4 text-primary"  />
                     <h3 className="font-medium">Audit Logs</h3>
                   </div>
                   <p className="text-sm text-muted-foreground">
@@ -531,7 +559,7 @@ export default function SettingsPage() {
                   </p>
                 </div>
                 <Button variant="outline" className="mt-4 w-fit" onClick={() => setAuditLogsOpen(true)}>
-                  <ScrollText className="mr-2 h-4 w-4" />
+                  <AppIcon name="scroll-text" fallback={ScrollText} className="mr-2 h-4 w-4"  />
                   Audit Logs
                 </Button>
               </div>
@@ -544,7 +572,7 @@ export default function SettingsPage() {
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
-              <Code2 className="h-5 w-5" />
+              <AppIcon name="code2" fallback={Code2} className="h-5 w-5"  />
               <CardTitle>GitHub Integration</CardTitle>
             </div>
             <CardDescription>Connect GitHub once to browse repositories and sign in faster.</CardDescription>
@@ -553,7 +581,7 @@ export default function SettingsPage() {
             <div className="flex flex-col gap-4 rounded-lg border border-border bg-muted/40 p-4 md:flex-row md:items-center md:justify-between">
               <div className="flex items-start gap-3">
                 <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-card">
-                  <Code2 className="h-5 w-5" />
+                  <AppIcon name="code2" fallback={Code2} className="h-5 w-5"  />
                 </div>
                 <div>
                   <p className="font-medium text-foreground">
@@ -572,7 +600,7 @@ export default function SettingsPage() {
                 {data?.user?.github_connected ? (
                   <>
                     <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                      <CheckCircle2 className="h-3.5 w-3.5" />
+                      <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-3.5 w-3.5"  />
                       Connected
                     </div>
                     <Button
@@ -582,9 +610,9 @@ export default function SettingsPage() {
                       disabled={disconnectGitHubMutation.isPending}
                     >
                       {disconnectGitHubMutation.isPending ? (
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <Unplug className="mr-2 h-4 w-4" />
+                        <AppIcon name="unplug" fallback={Unplug} className="mr-2 h-4 w-4"  />
                       )}
                       Disconnect
                     </Button>
@@ -593,7 +621,7 @@ export default function SettingsPage() {
                   <GitHubAuthButton mode="connect" enabled className="rounded-lg" />
                 ) : (
                   <div className="inline-flex items-center gap-2 rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
-                    <Link2 className="h-3.5 w-3.5" />
+                    <AppIcon name="link2" fallback={Link2} className="h-3.5 w-3.5"  />
                     GitHub OAuth not configured
                   </div>
                 )}
@@ -611,7 +639,7 @@ export default function SettingsPage() {
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
-              <Server className="h-5 w-5 text-primary" />
+              <AppIcon name="server" fallback={Server} className="h-5 w-5 text-primary"  />
               <CardTitle>Remote Connections</CardTitle>
             </div>
             <CardDescription>
@@ -747,7 +775,7 @@ export default function SettingsPage() {
                         onClick={() => setShowSshPassword((current) => !current)}
                         aria-label={showSshPassword ? "Hide SSH password" : "Show SSH password"}
                       >
-                        {showSshPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                        {showSshPassword ? <AppIcon name="eye-off" fallback={EyeOff} className="h-4 w-4"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
                       </button>
                     </div>
                   </div>
@@ -796,7 +824,7 @@ export default function SettingsPage() {
                           size="sm"
                           onClick={() => sshKeyFileRef.current?.click()}
                         >
-                          <Upload className="h-4 w-4" />
+                          <AppIcon name="upload" fallback={Upload} className="h-4 w-4"  />
                           Upload .pem
                         </Button>
                       </div>
@@ -832,9 +860,9 @@ export default function SettingsPage() {
                   }
                 >
                   {createSshConnectionMutation.isPending ? (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                   ) : (
-                    <KeyRound className="mr-2 h-4 w-4" />
+                    <AppIcon name="key-round" fallback={KeyRound} className="mr-2 h-4 w-4"  />
                   )}
                   Save Connection
                 </Button>
@@ -852,7 +880,7 @@ export default function SettingsPage() {
                     installs Kubernetes on every node for you.
                   </p>
                 </div>
-                {sshConnectionsQuery.isFetching && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+                {sshConnectionsQuery.isFetching && <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin text-muted-foreground"  />}
               </div>
 
               {connections.length === 0 ? (
@@ -923,9 +951,9 @@ export default function SettingsPage() {
                             >
                               {testSshConnectionMutation.isPending &&
                               testSshConnectionMutation.variables === connection.id ? (
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                               ) : (
-                                <FolderTree className="mr-2 h-4 w-4" />
+                                <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                               )}
                               Test Connection
                             </Button>
@@ -943,9 +971,9 @@ export default function SettingsPage() {
                             >
                               {probeSshConnectionMutation.isPending &&
                               probeSshConnectionMutation.variables === connection.id ? (
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                               ) : (
-                                <Server className="mr-2 h-4 w-4" />
+                                <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                               )}
                               Probe Host
                             </Button>
@@ -961,7 +989,7 @@ export default function SettingsPage() {
                                 provisionKubernetesMutation.isPending
                               }
                             >
-                              <Terminal className="mr-2 h-4 w-4" />
+                              <AppIcon name="terminal" fallback={Terminal} className="mr-2 h-4 w-4"  />
                               Terminal
                             </Button>
                             <Button
@@ -978,9 +1006,9 @@ export default function SettingsPage() {
                             >
                               {provisionDockerMutation.isPending &&
                               provisionDockerMutation.variables?.connectionId === connection.id ? (
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                               ) : (
-                                <Wrench className="mr-2 h-4 w-4" />
+                                <AppIcon name="wrench" fallback={Wrench} className="mr-2 h-4 w-4"  />
                               )}
                               Prepare Docker
                             </Button>
@@ -998,9 +1026,9 @@ export default function SettingsPage() {
                             >
                               {provisionKubernetesMutation.isPending &&
                               provisionKubernetesMutation.variables?.connectionId === connection.id ? (
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                               ) : (
-                                <Wrench className="mr-2 h-4 w-4" />
+                                <AppIcon name="wrench" fallback={Wrench} className="mr-2 h-4 w-4"  />
                               )}
                               Single-node Kubernetes
                             </Button>
@@ -1019,9 +1047,9 @@ export default function SettingsPage() {
                             >
                               {deleteSshConnectionMutation.isPending &&
                               deleteSshConnectionMutation.variables === connection.id ? (
-                                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                               ) : (
-                                <Trash2 className="mr-2 h-4 w-4" />
+                                <AppIcon name="trash2" fallback={Trash2} className="mr-2 h-4 w-4"  />
                               )}
                               Delete
                             </Button>
@@ -1038,7 +1066,7 @@ export default function SettingsPage() {
                                 </p>
                               </div>
                               <div className="inline-flex items-center gap-2 rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
-                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-3.5 w-3.5"  />
                                 Probed
                               </div>
                             </div>
@@ -1077,7 +1105,7 @@ export default function SettingsPage() {
         <Card>
           <CardHeader>
             <div className="flex items-center gap-2 text-foreground">
-              <Database className="h-5 w-5 text-primary" />
+              <AppIcon name="database" fallback={Database} className="h-5 w-5 text-primary"  />
               <CardTitle>Platform Configuration</CardTitle>
             </div>
             <CardDescription>Advanced technical settings for the platform engine.</CardDescription>
@@ -1105,7 +1133,7 @@ export default function SettingsPage() {
 
         {matchedSections.length === 0 && (
           <div className="rounded-xl border border-dashed border-border py-14 text-center">
-            <Search className="mx-auto mb-3 h-8 w-8 text-muted-foreground" />
+            <AppIcon name="search" fallback={Search} className="mx-auto mb-3 h-8 w-8 text-muted-foreground"  />
             <p className="font-medium">No settings match “{settingsQuery}”</p>
             <p className="mt-1 text-sm text-muted-foreground">
               Try a broader term such as “ssh”, “theme” or “token”.
@@ -1122,7 +1150,7 @@ export default function SettingsPage() {
           <DialogContent className="!flex !h-[min(92dvh,900px)] !w-[min(96vw,78rem)] !max-w-[78rem] !flex-col overflow-hidden rounded-xl border-border bg-card p-0">
             <DialogHeader className="shrink-0 border-b border-border px-5 py-3">
               <DialogTitle className="flex items-center gap-2">
-                <Terminal className="h-5 w-5 text-primary" />
+                <AppIcon name="terminal" fallback={Terminal} className="h-5 w-5 text-primary"  />
                 {terminalConnection.name} Terminal
               </DialogTitle>
               <DialogDescription>
@@ -1144,7 +1172,7 @@ export default function SettingsPage() {
         <DialogContent className="!flex !w-[min(92vw,760px)] !max-w-[760px] !max-h-[82dvh] flex-col overflow-hidden rounded-2xl p-0">
           <DialogHeader className="shrink-0 border-b border-border px-6 py-5">
             <DialogTitle className="flex items-center gap-2">
-              <History className="h-5 w-5 text-primary" />
+              <AppIcon name="history" fallback={History} className="h-5 w-5 text-primary"  />
               Login History
             </DialogTitle>
             <DialogDescription>
@@ -1154,7 +1182,7 @@ export default function SettingsPage() {
           <div className="min-h-0 flex-1 overflow-y-auto p-6 scrollbar-thin">
             {loginHistoryQuery.isLoading ? (
               <div className="flex items-center text-sm text-muted-foreground">
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                 Loading login history...
               </div>
             ) : (loginHistoryQuery.data?.history ?? []).length === 0 ? (
@@ -1196,7 +1224,7 @@ export default function SettingsPage() {
         <DialogContent className="!flex !w-[min(92vw,840px)] !max-w-[840px] !max-h-[82dvh] flex-col overflow-hidden rounded-2xl p-0">
           <DialogHeader className="shrink-0 border-b border-border px-6 py-5">
             <DialogTitle className="flex items-center gap-2">
-              <ScrollText className="h-5 w-5 text-primary" />
+              <AppIcon name="scroll-text" fallback={ScrollText} className="h-5 w-5 text-primary"  />
               Audit Logs
             </DialogTitle>
             <DialogDescription>
@@ -1206,7 +1234,7 @@ export default function SettingsPage() {
           <div className="min-h-0 flex-1 overflow-y-auto p-6 scrollbar-thin">
             {auditLogsQuery.isLoading ? (
               <div className="flex items-center text-sm text-muted-foreground">
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                 Loading audit logs...
               </div>
             ) : (auditLogsQuery.data?.logs ?? []).length === 0 ? (
@@ -1269,7 +1297,7 @@ export default function SettingsPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <Lock className="h-5 w-5 text-primary" />
+              <AppIcon name="lock" fallback={Lock} className="h-5 w-5 text-primary"  />
               Sudo Password Required
             </DialogTitle>
             <DialogDescription>
@@ -1312,7 +1340,7 @@ export default function SettingsPage() {
                   onClick={() => setShowSudoPassword((current) => !current)}
                   aria-label={showSudoPassword ? "Hide password" : "Show password"}
                 >
-                  {showSudoPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  {showSudoPassword ? <AppIcon name="eye-off" fallback={EyeOff} className="h-4 w-4"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
                 </button>
               </div>
               <p className="text-xs text-muted-foreground">
@@ -1332,7 +1360,7 @@ export default function SettingsPage() {
                 Cancel
               </Button>
               <Button type="submit" disabled={!sudoPasswordInput.trim()}>
-                <Lock className="mr-2 h-4 w-4" />
+                <AppIcon name="lock" fallback={Lock} className="mr-2 h-4 w-4"  />
                 Continue
               </Button>
             </div>

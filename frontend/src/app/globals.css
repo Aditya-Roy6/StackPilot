@@ -751,3 +751,20 @@
 :fullscreen .ssh-terminal-surface {
   background: #000;
 }
+
+/* ── Custom & Uploaded SVG Theme Inversion ──────────────────────
+   Allows SVGs to adapt to theme foreground without destroying
+   hollow gaps, line traces, cutouts, or internal transparency. */
+.app-custom-svg,
+.app-icon {
+  color: currentColor;
+}
+
+.app-custom-svg svg,
+.app-icon svg {
+  color: currentColor;
+  width: 100%;
+  height: 100%;
+}
+
+

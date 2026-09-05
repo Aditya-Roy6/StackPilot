@@ -14,6 +14,7 @@ import {
   Server,
   Star,
 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import {
   Bar,
   BarChart,
@@ -31,8 +32,9 @@ import { useChartTheme } from "@/lib/canvas-theme";
 import { useMutation, useQuery } from "@tanstack/react-query";
 
 import api from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import {
   Card,
   CardAction,
@@ -182,16 +184,15 @@ function StackCard({
         </CardTitle>
         <CardDescription>{description}</CardDescription>
         <CardAction>
-          <Button
-            variant="outline"
-            size="sm"
-            render={
-              <a href={href} target="_blank" rel="noreferrer">
-              <ExternalLink className="h-4 w-4" />
-              Open
-              </a>
-            }
-          />
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }), "gap-1.5")}
+          >
+            <AppIcon name="external-link" fallback={ExternalLink} className="h-4 w-4"  />
+            <span>Open</span>
+          </a>
         </CardAction>
       </CardHeader>
     </Card>
@@ -326,7 +327,7 @@ export default function LoggingMonitoringPage() {
           </p>
         </div>
         <Button variant="outline" onClick={() => refetch()} disabled={isFetching}>
-          <RefreshCw className={isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+          <AppIcon name="refresh-cw" fallback={RefreshCw} className={isFetching ? "h-4 w-4 animate-spin" : "h-4 w-4"}  />
           Refresh
         </Button>
       </section>
@@ -335,7 +336,7 @@ export default function LoggingMonitoringPage() {
         <Card size="sm" className="border-destructive/30 bg-destructive/5">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-destructive">
-              <AlertTriangle className="h-5 w-5" />
+              <AppIcon name="alert-triangle" fallback={AlertTriangle} className="h-5 w-5"  />
               Logs & Monitoring summary unavailable
             </CardTitle>
             <CardDescription>
@@ -349,7 +350,7 @@ export default function LoggingMonitoringPage() {
         <Card size="sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-primary" />
+              <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-4 w-4 text-primary"  />
               Platform
             </CardTitle>
             <CardDescription>{data?.service || "stackpilot-backend"}</CardDescription>
@@ -365,7 +366,7 @@ export default function LoggingMonitoringPage() {
         <Card size="sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Server className="h-4 w-4 text-muted-foreground" />
+              <AppIcon name="server" fallback={Server} className="h-4 w-4 text-muted-foreground"  />
               Runtimes
             </CardTitle>
             <CardDescription>Live deployments</CardDescription>
@@ -381,7 +382,7 @@ export default function LoggingMonitoringPage() {
         <Card size="sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Activity className="h-4 w-4 text-muted-foreground" />
+              <AppIcon name="activity" fallback={Activity} className="h-4 w-4 text-muted-foreground"  />
               Jobs
             </CardTitle>
             <CardDescription>Queue pressure</CardDescription>
@@ -395,7 +396,7 @@ export default function LoggingMonitoringPage() {
         <Card size="sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <AlertTriangle className="h-4 w-4 text-muted-foreground" />
+              <AppIcon name="alert-triangle" fallback={AlertTriangle} className="h-4 w-4 text-muted-foreground"  />
               Errors
             </CardTitle>
             <CardDescription>Tracked failures</CardDescription>
@@ -438,24 +439,26 @@ export default function LoggingMonitoringPage() {
           </CardHeader>
           <CardContent className="h-72">
             {mounted ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={deploymentStatusRows} dataKey="value" nameKey="name" innerRadius={62} outerRadius={96}>
-                  {deploymentStatusRows.map((entry, index) => (
-                    <Cell key={entry.name} fill={chartColors[index % chartColors.length]} />
-                  ))}
-                </Pie>
-                <RechartsTooltip
-                  contentStyle={{
-                    background: chartTooltipBackground,
-                    border: `1px solid ${chartTooltipBorder}`,
-                    color: chartTooltipText,
-                  }}
-                  itemStyle={{ color: chartTooltipText }}
-                  labelStyle={{ color: chartTooltipText }}
-                />
-              </PieChart>
-            </ResponsiveContainer>
+            <div className="h-full w-full min-h-[260px] min-w-0">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                <PieChart>
+                  <Pie data={deploymentStatusRows} dataKey="value" nameKey="name" innerRadius={62} outerRadius={96}>
+                    {deploymentStatusRows.map((entry, index) => (
+                      <Cell key={entry.name} fill={chartColors[index % chartColors.length]} />
+                    ))}
+                  </Pie>
+                  <RechartsTooltip
+                    contentStyle={{
+                      background: chartTooltipBackground,
+                      border: `1px solid ${chartTooltipBorder}`,
+                      color: chartTooltipText,
+                    }}
+                    itemStyle={{ color: chartTooltipText }}
+                    labelStyle={{ color: chartTooltipText }}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
             ) : null}
           </CardContent>
         </Card>
@@ -467,24 +470,26 @@ export default function LoggingMonitoringPage() {
           </CardHeader>
           <CardContent className="h-72">
             {mounted ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={runtimeRows}>
-                <CartesianGrid strokeDasharray="3 3" stroke={chartGridColor} />
-                <XAxis dataKey="name" tick={{ fill: chartAxisColor }} />
-                <YAxis allowDecimals={false} tick={{ fill: chartAxisColor }} />
-                <RechartsTooltip
-                  cursor={{ fill: chartCursorColor, fillOpacity: 0.35 }}
-                  contentStyle={{
-                    background: chartTooltipBackground,
-                    border: `1px solid ${chartTooltipBorder}`,
-                    color: chartTooltipText,
-                  }}
-                  itemStyle={{ color: chartTooltipText }}
-                  labelStyle={{ color: chartTooltipText }}
-                />
-                <Bar dataKey="value" fill="#3b82f6" radius={[6, 6, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+            <div className="h-full w-full min-h-[260px] min-w-0">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                <BarChart data={runtimeRows}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chartGridColor} />
+                  <XAxis dataKey="name" tick={{ fill: chartAxisColor }} />
+                  <YAxis allowDecimals={false} tick={{ fill: chartAxisColor }} />
+                  <RechartsTooltip
+                    cursor={{ fill: chartCursorColor, fillOpacity: 0.35 }}
+                    contentStyle={{
+                      background: chartTooltipBackground,
+                      border: `1px solid ${chartTooltipBorder}`,
+                      color: chartTooltipText,
+                    }}
+                    itemStyle={{ color: chartTooltipText }}
+                    labelStyle={{ color: chartTooltipText }}
+                  />
+                  <Bar dataKey="value" fill="#3b82f6" radius={[6, 6, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
             ) : null}
           </CardContent>
         </Card>
@@ -496,24 +501,26 @@ export default function LoggingMonitoringPage() {
           </CardHeader>
           <CardContent className="h-72">
             {mounted ? (
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={jobRows}>
-                <CartesianGrid strokeDasharray="3 3" stroke={chartGridColor} />
-                <XAxis dataKey="name" tick={{ fill: chartAxisColor }} />
-                <YAxis allowDecimals={false} tick={{ fill: chartAxisColor }} />
-                <RechartsTooltip
-                  cursor={{ fill: chartCursorColor, fillOpacity: 0.35 }}
-                  contentStyle={{
-                    background: chartTooltipBackground,
-                    border: `1px solid ${chartTooltipBorder}`,
-                    color: chartTooltipText,
-                  }}
-                  itemStyle={{ color: chartTooltipText }}
-                  labelStyle={{ color: chartTooltipText }}
-                />
-                <Bar dataKey="value" fill="#f59e0b" radius={[6, 6, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+            <div className="h-full w-full min-h-[260px] min-w-0">
+              <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                <BarChart data={jobRows}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={chartGridColor} />
+                  <XAxis dataKey="name" tick={{ fill: chartAxisColor }} />
+                  <YAxis allowDecimals={false} tick={{ fill: chartAxisColor }} />
+                  <RechartsTooltip
+                    cursor={{ fill: chartCursorColor, fillOpacity: 0.35 }}
+                    contentStyle={{
+                      background: chartTooltipBackground,
+                      border: `1px solid ${chartTooltipBorder}`,
+                      color: chartTooltipText,
+                    }}
+                    itemStyle={{ color: chartTooltipText }}
+                    labelStyle={{ color: chartTooltipText }}
+                  />
+                  <Bar dataKey="value" fill="#f59e0b" radius={[6, 6, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
             ) : null}
           </CardContent>
         </Card>
@@ -560,9 +567,9 @@ export default function LoggingMonitoringPage() {
                         disabled={explainFailureMutation.isPending}
                       >
                         {explainFailureMutation.isPending ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin"  />
                         ) : (
-                          <Star className="h-4 w-4" fill="currentColor" strokeWidth={2.4} />
+                          <AppIcon name="star" fallback={Star} className="h-4 w-4" fill="currentColor" strokeWidth={2.4}  />
                         )}
                         Explain
                       </Button>

@@ -13,6 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Trash2, Loader2, AlertTriangle, Copy } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import api from "@/lib/api";
 import { toast } from "sonner";
@@ -64,14 +65,14 @@ export function DeleteProjectDialog({ projectId, projectName }: DeleteProjectDia
       <DialogTrigger
         render={
           <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-destructive hover:bg-destructive/10">
-            <Trash2 className="h-4 w-4" />
+            <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
           </Button>
         }
       />
       <DialogContent className="!w-[min(94vw,680px)] !max-w-[680px] overflow-hidden p-0">
         <DialogHeader className="px-6 pt-6">
           <div className="mx-auto w-14 h-14 bg-destructive/10 rounded-full flex items-center justify-center mb-4 border border-destructive/20">
-            <AlertTriangle className="h-7 w-7 text-destructive" />
+            <AppIcon name="alert-triangle" fallback={AlertTriangle} className="h-7 w-7 text-destructive"  />
           </div>
           <DialogTitle className="text-center text-xl font-bold text-foreground tracking-tight">Delete Project?</DialogTitle>
           <DialogDescription className="text-center">
@@ -85,7 +86,7 @@ export function DeleteProjectDialog({ projectId, projectName }: DeleteProjectDia
               Confirmation text: <span className="font-medium text-foreground">{projectName}</span>
             </span>
             <Button type="button" variant="outline" size="sm" onClick={copyConfirmationText} className="shrink-0">
-              <Copy className="mr-2 h-3.5 w-3.5" />
+              <AppIcon name="copy" fallback={Copy} className="mr-2 h-3.5 w-3.5"  />
               Copy
             </Button>
           </div>
@@ -114,9 +115,9 @@ export function DeleteProjectDialog({ projectId, projectName }: DeleteProjectDia
             className="flex-1"
           >
             {deleteMutation.isPending ? (
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              <AppIcon name="loader2" fallback={Loader2} className="w-4 h-4 mr-2 animate-spin"  />
             ) : (
-              <Trash2 className="w-4 h-4 mr-2" />
+              <AppIcon name="trash2" fallback={Trash2} className="w-4 h-4 mr-2"  />
             )}
             Delete Permanently
           </Button>

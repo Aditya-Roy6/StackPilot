@@ -80,6 +80,26 @@ std::string sha256Hex(const std::string& input) {
     return out.str();
 }
 
+bool isMcpTokenRequest(const drogon::HttpRequestPtr& req) {
+    if (!req) return false;
+    if (req->getHeader("x-stackpilot-mcp-authenticated") == "1") {
+        return true;
+    }
+    const std::string authHeader = req->getHeader("Authorization");
+    if (authHeader.rfind("Bearer STACKPILOT_mcp_", 0) == 0) {
+        return true;
+    }
+    const std::string token = JwtHelper::extractTokenFromRequest(req);
+    if (token.rfind("STACKPILOT_mcp_", 0) == 0) {
+        return true;
+    }
+    Json::Value payload = JwtHelper::verifyRequestToken(req);
+    if (!payload.isNull() && payload.isMember("mcp") && payload["mcp"].asBool()) {
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ─── OPTIONS handler ────────────────────────────────────────
@@ -152,6 +172,16 @@ void McpController::createToken(
     std::function<void(const drogon::HttpResponsePtr&)>&& callback
 ) {
     spdlog::info("POST /api/v1/mcp/tokens");
+
+    if (isMcpTokenRequest(req)) {
+        Json::Value err;
+        err["error"] = "MCP tokens cannot manage MCP tokens";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k403Forbidden);
+        setCors(resp);
+        callback(resp);
+        return;
+    }
 
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
@@ -333,6 +363,16 @@ void McpController::revokeToken(
 ) {
     spdlog::info("DELETE /api/v1/mcp/tokens/{}", tokenId);
 
+    if (isMcpTokenRequest(req)) {
+        Json::Value err;
+        err["error"] = "MCP tokens cannot manage MCP tokens";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k403Forbidden);
+        setCors(resp);
+        callback(resp);
+        return;
+    }
+
     const std::string userId = extractUserId(req);
     if (userId.empty()) {
         Json::Value err; err["error"] = "Unauthorized";
@@ -381,6 +421,14 @@ void McpController::revokeToken(
         setCors(resp);
         callback(resp);
     }
+}
+
+void McpController::deleteToken(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& tokenId
+) {
+    revokeToken(req, std::move(callback), tokenId);
 }
 
 // ─── GET /api/v1/mcp/verify ────────────────────────────────

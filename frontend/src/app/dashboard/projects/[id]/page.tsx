@@ -15,6 +15,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { toast } from "sonner";
 import { ArrowLeft, ExternalLink, GitBranch, Loader2, ShieldCheck, Trash2 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 
 type RuntimeTarget = "docker" | "kubernetes";
 
@@ -122,6 +123,14 @@ export default function ProjectDeploymentsPage() {
       return res.data;
     },
     enabled: !!projectId,
+    refetchInterval: (query) => {
+      const data = query.state.data as any;
+      const list = data?.deployments || [];
+      const inFlight = list.some((d: any) =>
+        ["pending", "queued", "building", "deploying", "blocked"].includes(d.status)
+      );
+      return inFlight ? 2000 : 10000;
+    },
   });
 
   const environmentsQuery = useQuery({
@@ -165,6 +174,9 @@ export default function ProjectDeploymentsPage() {
           ? (error.response?.data as { error?: string } | undefined)?.error || "Failed to create deployment"
           : "Failed to create deployment";
       toast.error(message);
+      queryClient.invalidateQueries({ queryKey: ["project-deployments", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["project-environments", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
     },
   });
 
@@ -188,6 +200,8 @@ export default function ProjectDeploymentsPage() {
           : "Build failed";
       toast.error(message);
       queryClient.invalidateQueries({ queryKey: ["project-deployments", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["project-environments", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
     },
   });
 
@@ -198,7 +212,14 @@ export default function ProjectDeploymentsPage() {
       return res.data;
     },
     enabled: !!selectedDeploymentId,
-    refetchInterval: 3000,
+    refetchInterval: (query) => {
+      const data = query.state.data as any;
+      const status = data?.deployment?.status;
+      if (status && ["built", "failed", "canceled", "superseded", "failed_ci"].includes(status)) {
+        return false;
+      }
+      return 3000;
+    },
   });
 
   const deployRuntimeMutation = useMutation({
@@ -233,6 +254,9 @@ export default function ProjectDeploymentsPage() {
           ? (error.response?.data as { error?: string } | undefined)?.error || "Deploy failed"
           : "Deploy failed";
       toast.error(message);
+      queryClient.invalidateQueries({ queryKey: ["project-deployments", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["project-environments", projectId] });
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
     },
   });
 
@@ -243,7 +267,7 @@ export default function ProjectDeploymentsPage() {
   if (projectQuery.isLoading || deploymentsQuery.isLoading || environmentsQuery.isLoading) {
     return (
       <div className="flex h-full items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        <AppIcon name="loader2" fallback={Loader2} className="h-8 w-8 animate-spin text-muted-foreground"  />
       </div>
     );
   }
@@ -273,7 +297,7 @@ export default function ProjectDeploymentsPage() {
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="space-y-2">
           <Link href="/dashboard" className="inline-flex items-center text-sm text-muted-foreground hover:text-foreground">
-            <ArrowLeft className="mr-1 h-4 w-4" />
+            <AppIcon name="arrow-left" fallback={ArrowLeft} className="mr-1 h-4 w-4"  />
             Back to projects
           </Link>
           <h1 className="text-3xl font-bold tracking-tight">{project.name}</h1>
@@ -379,7 +403,7 @@ export default function ProjectDeploymentsPage() {
                     <div className="flex items-start justify-between gap-3">
                       <div>
                         <div className="flex items-center gap-2 font-semibold">
-                          <GitBranch className="h-4 w-4" />
+                          <AppIcon name="git-branch" fallback={GitBranch} className="h-4 w-4"  />
                           {environment.name}
                         </div>
                         <p className="mt-1 font-mono text-xs text-muted-foreground">{environment.branch}</p>
@@ -397,11 +421,11 @@ export default function ProjectDeploymentsPage() {
                         {environment.auto_deploy ? "auto deploy" : "manual"}
                       </Badge>
                       <Badge variant={environment.require_ci ? "secondary" : "outline"}>
-                        <ShieldCheck className="h-3 w-3" />
+                        <AppIcon name="shield-check" fallback={ShieldCheck} className="h-3 w-3"  />
                         {environment.require_ci ? "CI required" : "no CI gate"}
                       </Badge>
                       <Badge variant={environment.cleanup_previous_on_success ? "secondary" : "outline"}>
-                        <Trash2 className="h-3 w-3" />
+                        <AppIcon name="trash2" fallback={Trash2} className="h-3 w-3"  />
                         {environment.cleanup_previous_on_success ? "cleanup on success" : "keep previous"}
                       </Badge>
                     </div>
@@ -416,7 +440,7 @@ export default function ProjectDeploymentsPage() {
                           rel="noopener noreferrer"
                           onClick={(event) => event.stopPropagation()}
                         >
-                          Preview <ExternalLink className="h-3 w-3" />
+                          Preview <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
                         </a>
                       )}
                     </div>
@@ -486,7 +510,7 @@ export default function ProjectDeploymentsPage() {
                           rel="noopener noreferrer"
                           className="inline-flex items-center gap-1 text-primary hover:underline"
                         >
-                          Open <ExternalLink className="h-3 w-3" />
+                          Open <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
                         </a>
                       ) : (
                         <span className="text-muted-foreground">-</span>
@@ -567,7 +591,7 @@ export default function ProjectDeploymentsPage() {
           <CardContent className="space-y-3">
             {deploymentLogsQuery.isLoading ? (
               <div className="flex items-center text-sm text-muted-foreground">
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  />
                 Loading logs...
               </div>
             ) : deploymentLogsQuery.error ? (

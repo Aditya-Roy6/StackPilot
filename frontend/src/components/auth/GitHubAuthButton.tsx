@@ -3,6 +3,7 @@
 import { useMutation } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { Loader2 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 import api from "@/lib/api";
@@ -65,7 +66,7 @@ export function GitHubAuthButton({ mode, enabled, className }: GitHubAuthButtonP
       )}
     >
       <span className="pointer-events-none absolute left-4 top-1/2 flex -translate-y-1/2 items-center justify-center text-foreground">
-        {startMutation.isPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <GitHubMark />}
+        {startMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="h-5 w-5 animate-spin"  /> : <GitHubMark />}
       </span>
       <span className="px-8">{label}</span>
     </Button>

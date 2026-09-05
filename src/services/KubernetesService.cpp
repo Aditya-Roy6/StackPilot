@@ -188,6 +188,11 @@ std::string replaceAll(std::string value, const std::string& needle, const std::
 
 } // namespace
 
+KubernetesService& KubernetesService::getInstance() {
+    static KubernetesService instance;
+    return instance;
+}
+
 KubernetesService::KubernetesService()
     : kubeconfigPath_(getEnvOrDefault("KUBECONFIG_PATH", "")),
       defaultNamespace_(getEnvOrDefault("K8S_NAMESPACE", "stackpilot-apps")),
@@ -806,10 +811,6 @@ KubernetesRuntimeInfo KubernetesService::deployComposeStack(const KubernetesDepl
     planOptions.defaultContainerPort = options.containerPort;
     planOptions.maxReplicas = maxReplicas_;
     planOptions.enablePodDisruptionBudget = enablePodDisruptionBudget_;
-    planOptions.enableHorizontalPodAutoscaler = enableHorizontalPodAutoscaler_;
-    planOptions.hpaMinReplicas = hpaMinReplicas_;
-    planOptions.hpaMaxReplicas = hpaMaxReplicas_;
-    planOptions.hpaCpuUtilizationTarget = hpaCpuUtilizationTarget_;
     planOptions.useImagePlaceholders = true;
 
     const ComposeKubernetesPlan plan = ComposeKubernetesPlanner::build(composeConfig, planOptions);

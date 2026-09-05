@@ -29,6 +29,9 @@ public:
     /// Splits a block on newlines and appends each non-empty line.
     static void appendBlock(const std::string& deploymentId, const std::string& block);
 
+    /// Flushes any buffered log lines for deploymentId (or all deployments if empty).
+    static void flush(const std::string& deploymentId = "");
+
     /// Parses `__STACKPILOT_PORT_ADJUSTED__=key:from:to` markers out of build
     /// output. Pure; returns an array of {key, from, to} objects. Malformed
     /// markers are skipped rather than partially reported.

@@ -33,6 +33,7 @@ struct SshOperationResult {
     int exitCode = 0;
     std::string output;
     std::string error;
+    std::string remoteContainerName;
 };
 
 using SshLogCallback = std::function<void(const std::string&)>;
@@ -92,6 +93,11 @@ public:
     SshOperationResult removeK3sNode(const SshConnectionConfig& controlPlane,
                                      const std::string& nodeName,
                                      const std::string& sudoPassword) const;
+
+    /// Completely uninstalls K3s (server or agent), stops systemd units, wipes
+    /// /etc/rancher, /var/lib/rancher, and resets network/firewall artifacts.
+    SshOperationResult wipeK3sInstallation(const SshConnectionConfig& config,
+                                           const std::string& sudoPassword = "") const;
     SshOperationResult runRemoteCommand(const SshConnectionConfig& config,
                                         const std::string& workingDirectory,
                                         const std::string& command,

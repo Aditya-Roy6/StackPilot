@@ -47,7 +47,9 @@ public:
     static bool isValidImageRef(const std::string& value);
 
     /// `docker run` for a built image, with the port either pinned or
-    /// discovered from the image's exposed ports.
+    /// discovered from the image's exposed ports, followed by a readiness
+    /// polling loop that verifies the container does not crash on startup
+    /// and that the mapped port or container status is ready.
     static std::string makeRunCommand(const std::string& containerName,
                                       const std::string& imageName,
                                       int containerPort,

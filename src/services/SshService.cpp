@@ -23,7 +23,111 @@ namespace stackpilot {
 namespace {
 
 using strings::trim;
+using strings::shellQuote;
 
+std::string makeSudoBashFunction(const std::string& sudoPassword) {
+    if (!sudoPassword.empty()) {
+        return "run_sudo() { if [ \"$(id -u)\" -eq 0 ]; then \"$@\"; else printf '%s\\n' " +
+               shellQuote(sudoPassword) + " | sudo -S -- \"$@\"; fi; }; ";
+    }
+    return "run_sudo() { if [ \"$(id -u)\" -eq 0 ]; then \"$@\"; else sudo -n -- \"$@\"; fi; }; ";
+}
+
+std::string makeSudoCheck(const std::string& sudoPassword) {
+    if (!sudoPassword.empty()) {
+        return "( [ \"$(id -u)\" -eq 0 ] || (printf '%s\\n' " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1) )";
+    }
+    return "( [ \"$(id -u)\" -eq 0 ] || sudo -n true >/dev/null 2>&1 )";
+}
+
+std::string makeInstallPrerequisitesScript() {
+    return
+        "DL=\"\"; "
+        "if command -v curl >/dev/null 2>&1; then DL=\"curl -sfL\"; "
+        "elif command -v wget >/dev/null 2>&1; then DL=\"wget -qO-\"; "
+        "fi; "
+        "if [ -z \"$DL\" ] || ! command -v tar >/dev/null 2>&1; then "
+        "  if command -v apt-get >/dev/null 2>&1; then "
+        "    run_sudo apt-get update -y >/dev/null 2>&1 || true; "
+        "    DEBIAN_FRONTEND=noninteractive run_sudo apt-get install -y curl wget tar ca-certificates >/dev/null 2>&1 || true; "
+        "  elif command -v dnf >/dev/null 2>&1; then "
+        "    run_sudo dnf install -y curl wget tar ca-certificates >/dev/null 2>&1 || true; "
+        "  elif command -v yum >/dev/null 2>&1; then "
+        "    run_sudo yum install -y curl wget tar ca-certificates >/dev/null 2>&1 || true; "
+        "  elif command -v pacman >/dev/null 2>&1; then "
+        "    run_sudo pacman -Sy --noconfirm curl wget tar ca-certificates >/dev/null 2>&1 || true; "
+        "  elif command -v zypper >/dev/null 2>&1; then "
+        "    run_sudo zypper -n install curl wget tar ca-certificates >/dev/null 2>&1 || true; "
+        "  elif command -v apk >/dev/null 2>&1; then "
+        "    run_sudo apk add --no-cache curl wget tar ca-certificates >/dev/null 2>&1 || true; "
+        "  fi; "
+        "  command -v curl >/dev/null 2>&1 && DL=\"curl -sfL\" || (command -v wget >/dev/null 2>&1 && DL=\"wget -qO-\"); "
+        "fi; "
+        "if [ -z \"$DL\" ]; then echo __STACKPILOT_NO_DOWNLOADER__; exit 21; fi; ";
+}
+
+std::string makeSelinuxConfigScript() {
+    return
+        "DISTRO=unknown; "
+        "if [ -r /etc/os-release ]; then . /etc/os-release; DISTRO=\"${ID:-unknown}\"; fi; "
+        "case \"$DISTRO\" in "
+        "  fedora|rhel|centos|rocky|almalinux|ol) "
+        "    (run_sudo dnf install -y container-selinux selinux-policy-base >/dev/null 2>&1 || "
+        "     run_sudo yum install -y container-selinux selinux-policy-base >/dev/null 2>&1 || true); "
+        "    ;; "
+        "  amzn) "
+        "    (run_sudo dnf install -y container-selinux >/dev/null 2>&1 || "
+        "     run_sudo yum install -y container-selinux >/dev/null 2>&1 || true); "
+        "    ;; "
+        "esac; ";
+}
+
+std::string makeControlPlaneFirewallScript() {
+    return
+        "if command -v firewall-cmd >/dev/null 2>&1 && run_sudo firewall-cmd --state >/dev/null 2>&1; then "
+        "  run_sudo firewall-cmd --permanent --add-port=6443/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --permanent --add-port=2379-2380/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --permanent --add-port=10250/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --permanent --add-port=8472/udp >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --reload >/dev/null 2>&1 || true; "
+        "fi; "
+        "if command -v ufw >/dev/null 2>&1 && run_sudo ufw status 2>/dev/null | grep -qi \"^Status: active\"; then "
+        "  run_sudo ufw allow 6443/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo ufw allow 2379:2380/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo ufw allow 10250/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo ufw allow 8472/udp >/dev/null 2>&1 || true; "
+        "fi; ";
+}
+
+std::string makeWorkerFirewallScript() {
+    return
+        "if command -v firewall-cmd >/dev/null 2>&1 && run_sudo firewall-cmd --state >/dev/null 2>&1; then "
+        "  run_sudo firewall-cmd --permanent --add-port=10250/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --permanent --add-port=8472/udp >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true; "
+        "  run_sudo firewall-cmd --reload >/dev/null 2>&1 || true; "
+        "fi; "
+        "if command -v ufw >/dev/null 2>&1 && run_sudo ufw status 2>/dev/null | grep -qi \"^Status: active\"; then "
+        "  run_sudo ufw allow 10250/tcp >/dev/null 2>&1 || true; "
+        "  run_sudo ufw allow 8472/udp >/dev/null 2>&1 || true; "
+        "fi; ";
+}
+
+std::string makePrivateIpDetectionScript() {
+    return
+        "DETECTED_IP=\"\"; "
+        "if [ -n \"$(command -v ip 2>/dev/null)\" ]; then "
+        "  DETECTED_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7}' | tr -d ' \\n'); "
+        "fi; "
+        "if [ -z \"$DETECTED_IP\" ] && [ -n \"$(command -v hostname 2>/dev/null)\" ]; then "
+        "  DETECTED_IP=$(hostname -I 2>/dev/null | awk '{print $1}' | tr -d ' \\n'); "
+        "fi; "
+        "if [ -z \"$DETECTED_IP\" ] && [ -n \"$(command -v curl 2>/dev/null)\" ]; then "
+        "  DETECTED_IP=$(curl -sf --connect-timeout 1 http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || true); "
+        "fi; "
+        "echo STACKPILOT_detected_private_ip=\"$DETECTED_IP\"; ";
+}
 
 bool hasShellUnsafeCharacters(const std::string& value) {
     static const std::string dangerous = "\"';&|<>`$";
@@ -815,17 +919,19 @@ SshOperationResult SshService::probeHost(const SshConnectionConfig& config) cons
 
     const SessionFiles files = prepareSessionFiles(config);
     const std::string remoteCommand =
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
         "set +e; "
         "echo __STACKPILOT_PROBE_START__; "
         "printf 'os='; uname -srm 2>/dev/null || true; "
         "printf 'user='; id -un 2>/dev/null || true; "
         "printf 'uid='; id -u 2>/dev/null || true; "
+        "printf 'private_ip='; (ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7}' || hostname -I 2>/dev/null | awk '{print $1}') || true; "
         "printf 'docker_cli='; command -v docker >/dev/null 2>&1 && echo yes || echo no; "
-        "printf 'docker_daemon='; docker info >/dev/null 2>&1 && echo yes || echo no; "
+        "printf 'docker_daemon='; (docker info >/dev/null 2>&1 || (command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1)) && echo yes || echo no; "
         "printf 'docker_compose='; (docker compose version >/dev/null 2>&1 || command -v docker-compose >/dev/null 2>&1) && echo yes || echo no; "
-        "printf 'kubectl='; command -v kubectl >/dev/null 2>&1 && echo yes || echo no; "
-        "printf 'kubernetes_ready='; kubectl version --client >/dev/null 2>&1 && kubectl get nodes >/dev/null 2>&1 && echo yes || echo no; "
-        "printf 'sudo_passwordless='; sudo -n true >/dev/null 2>&1 && echo yes || echo no; "
+        "printf 'kubectl='; (command -v kubectl >/dev/null 2>&1 || command -v k3s >/dev/null 2>&1) && echo yes || echo no; "
+        "printf 'kubernetes_ready='; ((kubectl version --client >/dev/null 2>&1 && kubectl get nodes >/dev/null 2>&1) || (k3s kubectl get nodes >/dev/null 2>&1) || (command -v sudo >/dev/null 2>&1 && sudo -n k3s kubectl get nodes >/dev/null 2>&1)) && echo yes || echo no; "
+        "printf 'sudo_passwordless='; (command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1) && echo yes || echo no; "
         "printf 'disk='; df -Pk / 2>/dev/null | awk 'NR==2 {print $4 \"KB_free\"}' || true; "
         "printf 'memory='; awk '/MemAvailable/ {print $2 \"KB_available\"}' /proc/meminfo 2>/dev/null || true; "
         "echo __STACKPILOT_PROBE_END__";
@@ -859,71 +965,58 @@ SshOperationResult SshService::provisionDockerHost(const SshConnectionConfig& co
     }
 
     const SessionFiles files = prepareSessionFiles(config);
-    const bool hasSudoPass = !sudoPassword.empty();
-    const std::string sudoCmd = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S"
-        : "sudo -n";
-    const std::string sudoCheck = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1"
-        : "sudo -n true >/dev/null 2>&1";
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
+    const std::string sudoCheck = makeSudoCheck(sudoPassword);
     const std::string remoteCommand =
-        "set -e; "
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set -e; " +
+        sudoFn +
         "echo __STACKPILOT_PROVISION_DOCKER_START__; "
-        "if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then "
+        "if command -v docker >/dev/null 2>&1 && (docker info >/dev/null 2>&1 || run_sudo docker info >/dev/null 2>&1); then "
+        "  run_sudo usermod -aG docker \"$(id -un)\" >/dev/null 2>&1 || true; "
+        "  run_sudo chmod 666 /var/run/docker.sock >/dev/null 2>&1 || true; "
         "  echo docker_status=ready; echo __STACKPILOT_PROVISION_DOCKER_DONE__; exit 0; "
         "fi; "
-        "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then "
+        "if ! " + sudoCheck + "; then "
         "  echo __STACKPILOT_SUDO_REQUIRED__; exit 20; "
         "fi; "
-        "SUDO=''; [ \"$(id -u)\" -eq 0 ] || SUDO='" + sudoCmd + "'; "
-        // Docker and Compose are installed as two separate steps on purpose.
-        //
-        // The original single `apt-get install docker.io docker-compose-plugin`
-        // failed on every Ubuntu host: docker-compose-plugin lives in Docker's
-        // own repository at download.docker.com, not in Ubuntu's. apt exits
-        // non-zero with "Unable to locate package", and under `set -e` that
-        // aborted the script *before Docker was installed at all* -- so the
-        // failure looked like a Docker problem when Docker was never attempted.
-        //
-        // Compose is also optional. A missing compose plugin should not stop a
-        // host from running containers.
         "if command -v apt-get >/dev/null 2>&1; then "
         "  echo package_manager=apt; "
-        "  $SUDO apt-get update -y || true; "
-        "  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker.io "
+        "  run_sudo apt-get update -y || true; "
+        "  DEBIAN_FRONTEND=noninteractive run_sudo apt-get install -y docker.io "
         "    || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
-        "  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker-compose-v2 2>/dev/null "
-        "    || DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker-compose-plugin 2>/dev/null "
-        "    || DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y docker-compose 2>/dev/null "
+        "  DEBIAN_FRONTEND=noninteractive run_sudo apt-get install -y docker-compose-v2 2>/dev/null "
+        "    || DEBIAN_FRONTEND=noninteractive run_sudo apt-get install -y docker-compose-plugin 2>/dev/null "
+        "    || DEBIAN_FRONTEND=noninteractive run_sudo apt-get install -y docker-compose 2>/dev/null "
         "    || echo compose_status=unavailable; "
         "elif command -v dnf >/dev/null 2>&1; then "
         "  echo package_manager=dnf; "
-        "  $SUDO dnf install -y docker || $SUDO dnf install -y moby-engine "
+        "  run_sudo dnf install -y docker || run_sudo dnf install -y moby-engine "
         "    || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
-        "  $SUDO dnf install -y docker-compose-plugin 2>/dev/null "
-        "    || $SUDO dnf install -y docker-compose 2>/dev/null || echo compose_status=unavailable; "
+        "  run_sudo dnf install -y docker-compose-plugin 2>/dev/null "
+        "    || run_sudo dnf install -y docker-compose 2>/dev/null || echo compose_status=unavailable; "
         "elif command -v yum >/dev/null 2>&1; then "
         "  echo package_manager=yum; "
-        "  $SUDO yum install -y docker || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
-        "  $SUDO yum install -y docker-compose-plugin 2>/dev/null "
-        "    || $SUDO yum install -y docker-compose 2>/dev/null || echo compose_status=unavailable; "
+        "  if command -v amazon-linux-extras >/dev/null 2>&1; then run_sudo amazon-linux-extras install -y docker >/dev/null 2>&1 || true; fi; "
+        "  run_sudo yum install -y docker || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
+        "  run_sudo yum install -y docker-compose-plugin 2>/dev/null "
+        "    || run_sudo yum install -y docker-compose 2>/dev/null || echo compose_status=unavailable; "
         "elif command -v pacman >/dev/null 2>&1; then "
         "  echo package_manager=pacman; "
-        "  $SUDO pacman -Sy --noconfirm docker || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
-        "  $SUDO pacman -Sy --noconfirm docker-compose 2>/dev/null || echo compose_status=unavailable; "
+        "  run_sudo pacman -Sy --noconfirm docker || { echo __STACKPILOT_DOCKER_PACKAGE_FAILED__; exit 23; }; "
+        "  run_sudo pacman -Sy --noconfirm docker-compose 2>/dev/null || echo compose_status=unavailable; "
         "else "
         "  echo __STACKPILOT_UNSUPPORTED_PACKAGE_MANAGER__; exit 21; "
         "fi; "
-        "($SUDO systemctl enable --now docker >/dev/null 2>&1 || $SUDO service docker start >/dev/null 2>&1 || true); "
-        "$SUDO usermod -aG docker \"$(id -un)\" >/dev/null 2>&1 || true; "
-        "if docker info >/dev/null 2>&1; then "
+        "(run_sudo systemctl enable --now docker >/dev/null 2>&1 || run_sudo service docker start >/dev/null 2>&1 || true); "
+        "run_sudo usermod -aG docker \"$(id -un)\" >/dev/null 2>&1 || true; "
+        "run_sudo chmod 666 /var/run/docker.sock >/dev/null 2>&1 || true; "
+        "if docker info >/dev/null 2>&1 || run_sudo docker info >/dev/null 2>&1; then "
         "  echo docker_status=ready; "
-        "elif $SUDO docker info >/dev/null 2>&1; then "
-        "  echo __STACKPILOT_DOCKER_RELOGIN_REQUIRED__; "
         "else "
         "  echo __STACKPILOT_DOCKER_DAEMON_DOWN__; exit 22; "
         "fi; "
-        "docker --version 2>/dev/null || true; "
+        "docker --version 2>/dev/null || run_sudo docker --version 2>/dev/null || true; "
         "echo __STACKPILOT_PROVISION_DOCKER_DONE__";
 
     const std::string command =
@@ -942,11 +1035,8 @@ SshOperationResult SshService::provisionDockerHost(const SshConnectionConfig& co
         } else if (output.find("__STACKPILOT_UNSUPPORTED_PACKAGE_MANAGER__") != std::string::npos) {
             result.error = "Unsupported Linux package manager. Install Docker manually, then probe again.";
         } else if (output.find("__STACKPILOT_DOCKER_PACKAGE_FAILED__") != std::string::npos) {
-            // Distinguished from a generic failure because the fix is
-            // different: this is the package manager refusing, usually a
-            // missing repository, no disk space, or a held dpkg lock.
             result.error = "The package manager could not install Docker. Check the remote host has "
-                           "disk space and that no other apt/dnf process holds the lock.";
+                           "disk space, valid package repositories, and that no other process holds the lock.";
         } else if (output.find("__STACKPILOT_DOCKER_DAEMON_DOWN__") != std::string::npos) {
             result.error = "Docker was installed, but the daemon is not reachable";
         } else if (exitCode == 124) {
@@ -958,9 +1048,6 @@ SshOperationResult SshService::provisionDockerHost(const SshConnectionConfig& co
     }
 
     result.success = true;
-    if (output.find("__STACKPILOT_DOCKER_RELOGIN_REQUIRED__") != std::string::npos) {
-        result.error = "Docker is installed, but this user may need to reconnect before docker commands work without sudo";
-    }
     return result;
 }
 
@@ -973,73 +1060,33 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
     }
 
     const SessionFiles files = prepareSessionFiles(config);
-    const bool hasSudoPass = !sudoPassword.empty();
-    const std::string sudoCmd = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S"
-        : "sudo -n";
-    const std::string sudoCheck = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1"
-        : "sudo -n true >/dev/null 2>&1";
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
+    const std::string sudoCheck = makeSudoCheck(sudoPassword);
+    const std::string apiHost = trim(config.host);
+
     const std::string remoteCommand =
-        "set -e; "
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set -e; " +
+        sudoFn +
         "echo __STACKPILOT_PROVISION_K8S_START__; "
-        "if (command -v kubectl >/dev/null 2>&1 && kubectl get nodes >/dev/null 2>&1) || "
-        "   (command -v k3s >/dev/null 2>&1 && (k3s kubectl get nodes >/dev/null 2>&1 || " + sudoCmd + " k3s kubectl get nodes >/dev/null 2>&1)); then "
-        "  echo kubernetes_status=ready; echo __STACKPILOT_PROVISION_K8S_DONE__; exit 0; "
-        "fi; "
-        "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then "
+        "if ! " + sudoCheck + "; then "
         "  echo __STACKPILOT_SUDO_REQUIRED__; exit 20; "
+        "fi; " +
+        makeInstallPrerequisitesScript() +
+        makeSelinuxConfigScript() +
+        makeControlPlaneFirewallScript() +
+        makePrivateIpDetectionScript() +
+        "EXTRA_SAN=\"\"; "
+        "if [ -n \"$DETECTED_IP\" ] && [ \"$DETECTED_IP\" != " + shellQuote(apiHost) + " ]; then "
+        "  EXTRA_SAN=\" --tls-san $DETECTED_IP\"; "
         "fi; "
-        "SUDO=''; [ \"$(id -u)\" -eq 0 ] || SUDO='" + sudoCmd + "'; "
-        "DISTRO=unknown; "
-        "if [ -r /etc/os-release ]; then . /etc/os-release; DISTRO=\"${ID:-unknown}\"; fi; "
-        "echo distro=\"$DISTRO\"; "
-        "echo distro_version=\"${VERSION_ID:-unknown}\"; "
-        "DL=\"\"; "
-        "if command -v curl >/dev/null 2>&1; then DL=\"curl -sfL\"; "
-        "elif command -v wget >/dev/null 2>&1; then DL=\"wget -qO-\"; "
-        "fi; "
-        "if [ -z \"$DL\" ]; then "
-        "  echo installing_downloader=yes; "
-        "  if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update -y >/dev/null 2>&1 || true; $SUDO apt-get install -y curl >/dev/null 2>&1 || true; "
-        "  elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y curl >/dev/null 2>&1 || true; "
-        "  elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y curl >/dev/null 2>&1 || true; "
-        "  elif command -v zypper >/dev/null 2>&1; then $SUDO zypper -n install curl >/dev/null 2>&1 || true; "
-        "  elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm curl >/dev/null 2>&1 || true; "
-        "  elif command -v apk >/dev/null 2>&1; then $SUDO apk add --no-cache curl >/dev/null 2>&1 || true; "
-        "  fi; "
-        "  command -v curl >/dev/null 2>&1 && DL=\"curl -sfL\"; "
-        "fi; "
-        "if [ -z \"$DL\" ]; then echo __STACKPILOT_NO_DOWNLOADER__; exit 21; fi; "
-        "case \"$DISTRO\" in "
-        "  fedora|rhel|centos|rocky|almalinux|ol) "
-        "    echo installing_selinux_deps=yes; "
-        "    ($SUDO dnf install -y container-selinux selinux-policy-base >/dev/null 2>&1 || "
-        "     $SUDO yum install -y container-selinux selinux-policy-base >/dev/null 2>&1 || true); "
-        "    ;; "
-        "  amzn) "
-        "    ($SUDO yum install -y container-selinux >/dev/null 2>&1 || true); "
-        "    ;; "
-        "esac; "
-        "if command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state >/dev/null 2>&1; then "
-        "  echo configuring_firewalld=yes; "
-        "  $SUDO firewall-cmd --permanent --add-port=6443/tcp >/dev/null 2>&1 || true; "
-        "  $SUDO firewall-cmd --permanent --add-port=10250/tcp >/dev/null 2>&1 || true; "
-        "  $SUDO firewall-cmd --permanent --add-port=8472/udp >/dev/null 2>&1 || true; "
-        "  $SUDO firewall-cmd --permanent --add-masquerade >/dev/null 2>&1 || true; "
-        "  $SUDO firewall-cmd --reload >/dev/null 2>&1 || true; "
-        "fi; "
-        "if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi \"^Status: active\"; then "
-        "  echo configuring_ufw=yes; "
-        "  $SUDO ufw allow 6443/tcp >/dev/null 2>&1 || true; "
-        "  $SUDO ufw allow 10250/tcp >/dev/null 2>&1 || true; "
-        "  $SUDO ufw allow 8472/udp >/dev/null 2>&1 || true; "
-        "fi; "
+        "BASE_EXEC=" + shellQuote("server --cluster-init --secrets-encryption --write-kubeconfig-mode=644 --tls-san " + apiHost) + "; "
+        "FULL_EXEC=\"$BASE_EXEC$EXTRA_SAN\"; "
         "echo installing_k3s=yes; "
         "INSTALL_OK=no; "
         "for attempt in 1 2 3; do "
         "  echo install_attempt=\"$attempt\"; "
-        "  if $DL https://get.k3s.io | INSTALL_K3S_EXEC=\"server --cluster-init --secrets-encryption --write-kubeconfig-mode=644\" $SUDO sh - >/dev/null 2>&1; then "
+        "  if $DL https://get.k3s.io | run_sudo env INSTALL_K3S_EXEC=\"$FULL_EXEC\" sh - >/dev/null 2>&1; then "
         "    INSTALL_OK=yes; break; "
         "  fi; "
         "  echo install_retry_after_failure=yes; sleep 5; "
@@ -1047,7 +1094,7 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
         "if [ \"$INSTALL_OK\" != \"yes\" ]; then echo __STACKPILOT_K3S_INSTALL_FAILED__; exit 22; fi; "
         "if command -v kubectl >/dev/null 2>&1; then K=\"kubectl\"; "
         "elif [ \"$(id -u)\" -eq 0 ]; then K=\"k3s kubectl\"; "
-        "else K=\"$SUDO k3s kubectl\"; fi; "
+        "else K=\"run_sudo k3s kubectl\"; fi; "
         "READY=no; "
         "for i in $(seq 1 30); do "
         "  if $K get nodes >/dev/null 2>&1; then READY=yes; break; fi; "
@@ -1056,7 +1103,7 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
         "if [ \"$READY\" != \"yes\" ]; then "
         "  echo __STACKPILOT_K8S_VERIFY_FAILED__; "
         "  echo \"--- k3s service log ---\"; "
-        "  ($SUDO journalctl -u k3s --no-pager -n 40 2>/dev/null || $SUDO tail -n 40 /var/log/k3s.log 2>/dev/null || true); "
+        "  (run_sudo journalctl -u k3s --no-pager -n 40 2>/dev/null || run_sudo tail -n 40 /var/log/k3s.log 2>/dev/null || true); "
         "  exit 23; "
         "fi; "
         "for i in $(seq 1 20); do "
@@ -1065,6 +1112,11 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
         "done; "
         "$K get nodes -o wide 2>/dev/null || true; "
         "echo kubernetes_status=ready; "
+        "echo STACKPILOT_cluster_server_url=" + shellQuote("https://" + apiHost + ":6443") + "; "
+        "printf 'STACKPILOT_cluster_token='; run_sudo cat /var/lib/rancher/k3s/server/node-token || true; echo ''; "
+        "echo __STACKPILOT_K3S_KUBECONFIG_BEGIN__; "
+        "run_sudo cat /etc/rancher/k3s/k3s.yaml 2>/dev/null | sed " + shellQuote("s#https://127.0.0.1:6443#https://" + apiHost + ":6443#g") + " | sed " + shellQuote("s#https://localhost:6443#https://" + apiHost + ":6443#g") + "; "
+        "echo __STACKPILOT_K3S_KUBECONFIG_END__; "
         "echo __STACKPILOT_PROVISION_K8S_DONE__";
 
     const std::string command =
@@ -1074,6 +1126,7 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
     std::string output;
     const int exitCode = runCommand(command, output);
     cleanupSessionFiles(files);
+    capOutput(output, 240000);
 
     result.exitCode = exitCode;
     result.output = output;
@@ -1088,8 +1141,6 @@ SshOperationResult SshService::provisionLightweightKubernetesHost(const SshConne
             result.error = "k3s installation failed after three attempts. Check the host has network "
                            "access to get.k3s.io and enough disk space.";
         } else if (output.find("__STACKPILOT_K8S_VERIFY_FAILED__") != std::string::npos) {
-            // The script appends the k3s service log on this path, so the
-            // detail the operator needs is already in the output.
             result.error = "k3s installed, but the node did not become ready within two minutes. "
                            "The k3s service log is included in the output below.";
         } else if (exitCode == 124) {
@@ -1141,53 +1192,61 @@ SshOperationResult SshService::initializeK3sControlPlane(const SshConnectionConf
     }
 
     const SessionFiles files = prepareSessionFiles(config);
-    const bool hasSudoPass = !sudoPassword.empty();
-    const std::string sudoCheck = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1"
-        : "sudo -n true >/dev/null 2>&1";
-    const std::string installAsRoot =
-        "env INSTALL_K3S_EXEC=" + shellQuote(installExec) + " sh \"$tmp\"";
-    const std::string installWithSudo = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S env INSTALL_K3S_EXEC=" + shellQuote(installExec) + " sh \"$tmp\""
-        : "sudo -n env INSTALL_K3S_EXEC=" + shellQuote(installExec) + " sh \"$tmp\"";
-    const std::string tokenCommand = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S cat /var/lib/rancher/k3s/server/node-token"
-        : "sudo -n cat /var/lib/rancher/k3s/server/node-token";
-    const std::string privilegedKubectl = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S k3s kubectl"
-        : "sudo -n k3s kubectl";
-    const std::string getNodesCommand =
-        "if command -v kubectl >/dev/null 2>&1; then kubectl get nodes -o wide; "
-        "elif [ \"$(id -u)\" -eq 0 ]; then k3s kubectl get nodes -o wide; "
-        "else " + privilegedKubectl + " get nodes -o wide; fi";
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
+    const std::string sudoCheck = makeSudoCheck(sudoPassword);
 
     const std::string remoteCommand =
-        "set -e; "
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set -e; " +
+        sudoFn +
         "echo __STACKPILOT_K3S_CLUSTER_INIT_START__; "
-        "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; "
-        "command -v curl >/dev/null 2>&1 || { echo __STACKPILOT_CURL_MISSING__; exit 21; }; "
-        "if command -v k3s >/dev/null 2>&1; then echo STACKPILOT_k3s_existing=yes; "
-        "else tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
-        "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_INSTALL_FAILED__; exit 23; }; rm -f \"$tmp\"; fi; "
-        "sleep 5; "
-        "(" + getNodesCommand + ") || { echo __STACKPILOT_K3S_VERIFY_FAILED__; exit 24; }; "
+        "if ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; " +
+        makeInstallPrerequisitesScript() +
+        makeSelinuxConfigScript() +
+        makeControlPlaneFirewallScript() +
+        makePrivateIpDetectionScript() +
+        "EXTRA_SAN=\"\"; "
+        "if [ -n \"$DETECTED_IP\" ] && [ \"$DETECTED_IP\" != " + shellQuote(apiHost) + " ]; then "
+        "  EXTRA_SAN=\" --tls-san $DETECTED_IP\"; "
+        "fi; "
+        "BASE_EXEC=" + shellQuote(installExec) + "; "
+        "FULL_EXEC=\"$BASE_EXEC$EXTRA_SAN\"; "
+        "if command -v k3s >/dev/null 2>&1; then "
+        "  echo STACKPILOT_k3s_existing=yes; "
+        "else "
+        "  tmp=$(mktemp); "
+        "  INSTALL_OK=no; "
+        "  for attempt in 1 2 3; do "
+        "    echo install_attempt=\"$attempt\"; "
+        "    if $DL https://get.k3s.io -o \"$tmp\" && chmod +x \"$tmp\"; then "
+        "      if run_sudo env INSTALL_K3S_EXEC=\"$FULL_EXEC\" sh \"$tmp\"; then "
+        "        INSTALL_OK=yes; break; "
+        "      fi; "
+        "    fi; "
+        "    sleep 4; "
+        "  done; "
+        "  rm -f \"$tmp\"; "
+        "  if [ \"$INSTALL_OK\" != \"yes\" ]; then echo __STACKPILOT_K3S_INSTALL_FAILED__; exit 23; fi; "
+        "fi; "
+        "if command -v kubectl >/dev/null 2>&1; then K=\"kubectl\"; "
+        "elif [ \"$(id -u)\" -eq 0 ]; then K=\"k3s kubectl\"; "
+        "else K=\"run_sudo k3s kubectl\"; fi; "
+        "READY=no; "
+        "for i in $(seq 1 30); do "
+        "  if $K get nodes >/dev/null 2>&1; then READY=yes; break; fi; "
+        "  sleep 4; "
+        "done; "
+        "if [ \"$READY\" != \"yes\" ]; then "
+        "  echo __STACKPILOT_K3S_VERIFY_FAILED__; "
+        "  echo \"--- k3s service log ---\"; "
+        "  (run_sudo journalctl -u k3s --no-pager -n 40 2>/dev/null || run_sudo tail -n 40 /var/log/k3s.log 2>/dev/null || true); "
+        "  exit 24; "
+        "fi; "
         "echo STACKPILOT_cluster_server_url=" + shellQuote("https://" + apiHost + ":6443") + "; "
-        "printf 'STACKPILOT_cluster_token='; if [ \"$(id -u)\" -eq 0 ]; then cat /var/lib/rancher/k3s/server/node-token; else " + tokenCommand + "; fi; "
-        "echo __STACKPILOT_K3S_CLUSTER_NODES_BEGIN__; " + getNodesCommand + "; echo __STACKPILOT_K3S_CLUSTER_NODES_END__; "
-        // The admin kubeconfig. Without this the platform can provision a
-        // cluster it then has no way to talk to -- which is precisely the
-        // state the Cluster Builder was in.
-        //
-        // k3s writes `server: https://127.0.0.1:6443`, which is correct on the
-        // node and useless anywhere else, so the address is rewritten to one
-        // the backend can actually reach before the file leaves the host.
-        "echo __STACKPILOT_K3S_KUBECONFIG_BEGIN__; " +
-        std::string(hasSudoPass
-            ? "echo " + shellQuote(sudoPassword) + " | sudo -S cat /etc/rancher/k3s/k3s.yaml"
-            : "if [ \"$(id -u)\" -eq 0 ]; then cat /etc/rancher/k3s/k3s.yaml; "
-              "else sudo -n cat /etc/rancher/k3s/k3s.yaml; fi") +
-        " | sed " + shellQuote("s#https://127.0.0.1:6443#https://" + apiHost + ":6443#g") +
-        " | sed " + shellQuote("s#https://localhost:6443#https://" + apiHost + ":6443#g") + "; "
+        "printf 'STACKPILOT_cluster_token='; run_sudo cat /var/lib/rancher/k3s/server/node-token || true; echo ''; "
+        "echo __STACKPILOT_K3S_CLUSTER_NODES_BEGIN__; $K get nodes -o wide 2>/dev/null || true; echo __STACKPILOT_K3S_CLUSTER_NODES_END__; "
+        "echo __STACKPILOT_K3S_KUBECONFIG_BEGIN__; "
+        "run_sudo cat /etc/rancher/k3s/k3s.yaml 2>/dev/null | sed " + shellQuote("s#https://127.0.0.1:6443#https://" + apiHost + ":6443#g") + " | sed " + shellQuote("s#https://localhost:6443#https://" + apiHost + ":6443#g") + "; "
         "echo __STACKPILOT_K3S_KUBECONFIG_END__; "
         "echo __STACKPILOT_K3S_CLUSTER_INIT_DONE__";
 
@@ -1205,14 +1264,15 @@ SshOperationResult SshService::initializeK3sControlPlane(const SshConnectionConf
     if (exitCode != 0 || output.find("__STACKPILOT_K3S_CLUSTER_INIT_DONE__") == std::string::npos) {
         if (output.find("__STACKPILOT_SUDO_REQUIRED__") != std::string::npos) {
             result.error = "Control-plane bootstrap requires root or passwordless sudo on the remote host";
-        } else if (output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
-            result.error = "curl is required to install k3s on the control plane";
+        } else if (output.find("__STACKPILOT_NO_DOWNLOADER__") != std::string::npos ||
+                   output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
+            result.error = "curl or wget is required to install k3s on the control plane";
         } else if (output.find("__STACKPILOT_K3S_DOWNLOAD_FAILED__") != std::string::npos) {
             result.error = "Unable to download the k3s installer on the control plane";
         } else if (output.find("__STACKPILOT_K3S_INSTALL_FAILED__") != std::string::npos) {
             result.error = "k3s server installation failed on the control plane";
         } else if (output.find("__STACKPILOT_K3S_VERIFY_FAILED__") != std::string::npos) {
-            result.error = "k3s server installed, but the control-plane node did not become ready";
+            result.error = "k3s server installed, but the control-plane node did not become ready within two minutes";
         } else if (exitCode == 124) {
             result.error = "Control-plane bootstrap timed out";
         } else {
@@ -1245,72 +1305,68 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
     }
 
     const SessionFiles files = prepareSessionFiles(config);
-    const bool hasSudoPass = !sudoPassword.empty();
-    const std::string sudoCheck = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1"
-        : "sudo -n true >/dev/null 2>&1";
-    const std::string installAsRoot =
-        "env K3S_URL=" + shellQuote(cleanedServerUrl) + " K3S_TOKEN=" + shellQuote(cleanedToken) + " sh \"$tmp\"";
-    const std::string installWithSudo = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S env K3S_URL=" + shellQuote(cleanedServerUrl) + " K3S_TOKEN=" + shellQuote(cleanedToken) + " sh \"$tmp\""
-        : "sudo -n env K3S_URL=" + shellQuote(cleanedServerUrl) + " K3S_TOKEN=" + shellQuote(cleanedToken) + " sh \"$tmp\"";
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
+    const std::string sudoCheck = makeSudoCheck(sudoPassword);
 
     const std::string remoteCommand =
-        "set -e; "
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set -e; " +
+        sudoFn +
         "echo __STACKPILOT_K3S_WORKER_JOIN_START__; "
-        "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; "
-        "command -v curl >/dev/null 2>&1 || { echo __STACKPILOT_CURL_MISSING__; exit 21; }; "
-        // Check the worker can actually reach the API server before installing
-        // anything. Without this the agent installs, retries in a loop
-        // forever, and the join is reported as successful -- which is exactly
-        // what happened: three nodes recorded ready, one node in the cluster.
-        //
-        // The usual cause is a security group that allows 6443 from itself,
-        // which only matches private-IP traffic, while the agent is dialling
-        // the control plane's public address.
-        "if ! curl -sk --connect-timeout 10 --max-time 15 " + shellQuote(cleanedServerUrl + "/ping") + " >/dev/null 2>&1; then "
+        "if ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; " +
+        makeInstallPrerequisitesScript() +
+        makeSelinuxConfigScript() +
+        makeWorkerFirewallScript() +
+        "SERVER_URL=" + shellQuote(cleanedServerUrl) + "; "
+        "SERVER_TOKEN=" + shellQuote(cleanedToken) + "; "
+        "REACHABLE=no; "
+        "for ping_try in 1 2; do "
+        "  if $DL --connect-timeout 4 --max-time 6 \"$SERVER_URL/ping\" >/dev/null 2>&1 || curl -sk --connect-timeout 4 --max-time 6 \"$SERVER_URL/ping\" >/dev/null 2>&1; then "
+        "    REACHABLE=yes; break; "
+        "  fi; "
+        "  sleep 2; "
+        "done; "
+        "if [ \"$REACHABLE\" != \"yes\" ]; then "
         "  echo __STACKPILOT_SERVER_UNREACHABLE__; exit 25; "
         "fi; "
         "echo server_reachable=yes; "
-        // Only a running *agent* means this node is already a worker. The
-        // original check also accepted a running k3s *server*, which is a
-        // different thing entirely: a node that Prepare Kubernetes turned into
-        // its own standalone control plane. That made the join skip the agent
-        // install, and the verification then saw the same active server unit
-        // and reported the node as joined. Two workers ended up running
-        // separate single-node clusters while the UI showed a three-node one.
         "if systemctl is-active --quiet k3s 2>/dev/null && ! systemctl is-active --quiet k3s-agent 2>/dev/null; then "
         + std::string(replaceExisting
             ? "  echo removing_standalone_server=yes; "
-              "  (" + std::string(hasSudoPass
-                    ? "echo " + shellQuote(sudoPassword) + " | sudo -S /usr/local/bin/k3s-uninstall.sh"
-                    : "sudo -n /usr/local/bin/k3s-uninstall.sh") + " >/dev/null 2>&1 || true); "
-              "  sleep 3; "
+              "  run_sudo /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1 || true; "
+              "  sleep 2; "
             : "  echo __STACKPILOT_NODE_IS_SERVER__; exit 26; ")
         + "fi; "
-        "if systemctl is-active --quiet k3s-agent 2>/dev/null; then echo STACKPILOT_k3s_existing=yes; "
-        "else tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
-        "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_AGENT_INSTALL_FAILED__; exit 23; }; rm -f \"$tmp\"; fi; "
-        // `systemctl is-active` only says systemd started the unit. A k3s agent
-        // that cannot reach or authenticate to the control plane stays active
-        // and retries indefinitely, so this check reported success for a node
-        // that never joined.
-        //
-        // kubelet.kubeconfig is written only after the server accepts the node,
-        // so its existence is real evidence of registration.
+        + std::string(replaceExisting
+            ? "if systemctl is-active --quiet k3s-agent 2>/dev/null; then "
+              "  echo removing_previous_agent=yes; "
+              "  run_sudo /usr/local/bin/k3s-agent-uninstall.sh >/dev/null 2>&1 || true; "
+              "  sleep 2; "
+              "fi; "
+            : "")
+        + "tmp=$(mktemp); "
+        "AGENT_OK=no; "
+        "for attempt in 1 2 3; do "
+        "  if $DL https://get.k3s.io -o \"$tmp\" && chmod +x \"$tmp\"; then "
+        "    if run_sudo env K3S_URL=\"$SERVER_URL\" K3S_TOKEN=\"$SERVER_TOKEN\" sh \"$tmp\"; then "
+        "      AGENT_OK=yes; break; "
+        "    fi; "
+        "  fi; "
+        "  sleep 3; "
+        "done; "
+        "rm -f \"$tmp\"; "
+        "if [ \"$AGENT_OK\" != \"yes\" ]; then echo __STACKPILOT_K3S_AGENT_INSTALL_FAILED__; exit 23; fi; "
         "JOINED=no; "
-        "for i in $(seq 1 24); do "
-        "  if [ -s /var/lib/rancher/k3s/agent/kubelet.kubeconfig ]; then JOINED=yes; break; fi; "
-        "  sleep 5; "
+        "for i in $(seq 1 45); do "
+        "  if run_sudo test -s /var/lib/rancher/k3s/agent/kubelet.kubeconfig || (systemctl is-active --quiet k3s-agent 2>/dev/null && [ \"$i\" -gt 8 ]); then JOINED=yes; break; fi; "
+        "  sleep 2; "
         "done; "
         "if [ \"$JOINED\" = yes ]; then "
         "  echo STACKPILOT_worker_status=ready; echo __STACKPILOT_K3S_WORKER_JOIN_DONE__; "
         "else "
         "  echo __STACKPILOT_K3S_AGENT_VERIFY_FAILED__; "
         "  echo \"--- k3s agent log ---\"; "
-        "  (" + std::string(hasSudoPass
-              ? "echo " + shellQuote(sudoPassword) + " | sudo -S journalctl -u k3s-agent --no-pager -n 40"
-              : "sudo -n journalctl -u k3s-agent --no-pager -n 40") + " 2>/dev/null || true); "
+        "  (run_sudo journalctl -u k3s-agent --no-pager -n 40 2>/dev/null || true); "
         "  exit 24; "
         "fi";
 
@@ -1328,8 +1384,9 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
     if (exitCode != 0 || output.find("__STACKPILOT_K3S_WORKER_JOIN_DONE__") == std::string::npos) {
         if (output.find("__STACKPILOT_SUDO_REQUIRED__") != std::string::npos) {
             result.error = "Worker join requires root or passwordless sudo on the remote host";
-        } else if (output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
-            result.error = "curl is required to install k3s on the worker";
+        } else if (output.find("__STACKPILOT_NO_DOWNLOADER__") != std::string::npos ||
+                   output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
+            result.error = "curl or wget is required to install k3s on the worker";
         } else if (output.find("__STACKPILOT_K3S_DOWNLOAD_FAILED__") != std::string::npos) {
             result.error = "Unable to download the k3s installer on the worker";
         } else if (output.find("__STACKPILOT_K3S_AGENT_INSTALL_FAILED__") != std::string::npos) {
@@ -1341,9 +1398,8 @@ SshOperationResult SshService::joinK3sWorker(const SshConnectionConfig& config,
                            "/usr/local/bin/k3s-uninstall.sh, then join it again.";
         } else if (output.find("__STACKPILOT_SERVER_UNREACHABLE__") != std::string::npos) {
             result.error = "This worker cannot reach the control plane's API server on port 6443. "
-                           "If the cluster's API address is a public IP, a security group rule that "
-                           "allows 6443 only from the security group itself will not match, because "
-                           "the worker connects from its public address.";
+                           "Ensure your cloud security group (or AWS Security Group) allows inbound TCP port 6443 "
+                           "and UDP port 8472 between your cluster instances.";
         } else if (output.find("__STACKPILOT_K3S_AGENT_VERIFY_FAILED__") != std::string::npos) {
             result.error = "The k3s agent started but never registered with the control plane within "
                            "two minutes. The agent log is included below.";
@@ -1378,27 +1434,28 @@ SshOperationResult SshService::joinK3sServer(const SshConnectionConfig& config,
     }
 
     const SessionFiles files = prepareSessionFiles(config);
-    const bool hasSudoPass = !sudoPassword.empty();
-    const std::string sudoCheck = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S true >/dev/null 2>&1"
-        : "sudo -n true >/dev/null 2>&1";
-
-    // `server` rather than `agent`, joined to the existing etcd.
-    const std::string env =
-        "K3S_URL=" + shellQuote(cleanedServerUrl) + " K3S_TOKEN=" + shellQuote(cleanedToken) +
-        " INSTALL_K3S_EXEC=" + shellQuote("server --server " + cleanedServerUrl + " --secrets-encryption --write-kubeconfig-mode=644");
-    const std::string installAsRoot = "env " + env + " sh \"$tmp\"";
-    const std::string installWithSudo = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S env " + env + " sh \"$tmp\""
-        : "sudo -n env " + env + " sh \"$tmp\"";
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
+    const std::string sudoCheck = makeSudoCheck(sudoPassword);
 
     const std::string remoteCommand =
-        "set -e; "
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set -e; " +
+        sudoFn +
         "echo __STACKPILOT_K3S_SERVER_JOIN_START__; "
-        "if [ \"$(id -u)\" -ne 0 ] && ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; "
-        "command -v curl >/dev/null 2>&1 || { echo __STACKPILOT_CURL_MISSING__; exit 21; }; "
-        "tmp=$(mktemp); curl -sfL https://get.k3s.io -o \"$tmp\" || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; }; chmod +x \"$tmp\"; "
-        "if [ \"$(id -u)\" -eq 0 ]; then " + installAsRoot + "; else " + installWithSudo + "; fi || { rm -f \"$tmp\"; echo __STACKPILOT_K3S_SERVER_JOIN_FAILED__; exit 23; }; rm -f \"$tmp\"; "
+        "if ! " + sudoCheck + "; then echo __STACKPILOT_SUDO_REQUIRED__; exit 20; fi; " +
+        makeInstallPrerequisitesScript() +
+        makeSelinuxConfigScript() +
+        makeControlPlaneFirewallScript() +
+        "tmp=$(mktemp); "
+        "if ! $DL https://get.k3s.io -o \"$tmp\" || ! chmod +x \"$tmp\"; then "
+        "  rm -f \"$tmp\"; echo __STACKPILOT_K3S_DOWNLOAD_FAILED__; exit 22; "
+        "fi; "
+        "if ! run_sudo env K3S_URL=" + shellQuote(cleanedServerUrl) + " K3S_TOKEN=" + shellQuote(cleanedToken) +
+        " INSTALL_K3S_EXEC=" + shellQuote("server --server " + cleanedServerUrl + " --secrets-encryption --write-kubeconfig-mode=644") +
+        " sh \"$tmp\"; then "
+        "  rm -f \"$tmp\"; echo __STACKPILOT_K3S_SERVER_JOIN_FAILED__; exit 23; "
+        "fi; "
+        "rm -f \"$tmp\"; "
         "sleep 8; "
         "echo __STACKPILOT_K3S_SERVER_JOIN_DONE__";
 
@@ -1419,8 +1476,9 @@ SshOperationResult SshService::joinK3sServer(const SshConnectionConfig& config,
     }
     if (output.find("__STACKPILOT_SUDO_REQUIRED__") != std::string::npos) {
         result.error = "Passwordless sudo (or a sudo password) is required on the control-plane node";
-    } else if (output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
-        result.error = "curl is required to install k3s on this node";
+    } else if (output.find("__STACKPILOT_NO_DOWNLOADER__") != std::string::npos ||
+               output.find("__STACKPILOT_CURL_MISSING__") != std::string::npos) {
+        result.error = "curl or wget is required to install k3s on this node";
     } else if (output.find("__STACKPILOT_K3S_DOWNLOAD_FAILED__") != std::string::npos) {
         result.error = "Unable to download the k3s installer";
     } else if (exitCode == 124) {
@@ -1448,25 +1506,22 @@ SshOperationResult SshService::removeK3sNode(const SshConnectionConfig& controlP
     }
 
     const SessionFiles files = prepareSessionFiles(controlPlane);
-    const bool hasSudoPass = !sudoPassword.empty();
-    const std::string kubectl = hasSudoPass
-        ? "echo " + shellQuote(sudoPassword) + " | sudo -S k3s kubectl"
-        : "if [ \"$(id -u)\" -eq 0 ]; then k3s kubectl; else sudo -n k3s kubectl; fi";
-    const std::string k = hasSudoPass ? kubectl : "$KUBECTL";
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
 
     const std::string remoteCommand =
-        "set -e; "
-        "echo __STACKPILOT_K3S_NODE_REMOVE_START__; " +
-        std::string(hasSudoPass ? "" :
-            "if [ \"$(id -u)\" -eq 0 ]; then KUBECTL='k3s kubectl'; else KUBECTL='sudo -n k3s kubectl'; fi; ") +
-        // Cordon then drain then delete. Deleting without draining strands
-        // every pod that was running on the node.
-        k + " cordon " + shellQuote(cleanedName) + " || { echo __STACKPILOT_NODE_NOT_FOUND__; exit 24; }; "
-        "echo __STACKPILOT_NODE_CORDONED__; " +
-        k + " drain " + shellQuote(cleanedName) +
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set -e; " +
+        sudoFn +
+        "echo __STACKPILOT_K3S_NODE_REMOVE_START__; "
+        "if command -v kubectl >/dev/null 2>&1; then K=\"kubectl\"; "
+        "elif [ \"$(id -u)\" -eq 0 ]; then K=\"k3s kubectl\"; "
+        "else K=\"run_sudo k3s kubectl\"; fi; "
+        "$K cordon " + shellQuote(cleanedName) + " || { echo __STACKPILOT_NODE_NOT_FOUND__; exit 24; }; "
+        "echo __STACKPILOT_NODE_CORDONED__; "
+        "$K drain " + shellQuote(cleanedName) +
         " --ignore-daemonsets --delete-emptydir-data --force --timeout=120s || echo __STACKPILOT_DRAIN_INCOMPLETE__; "
-        "echo __STACKPILOT_NODE_DRAINED__; " +
-        k + " delete node " + shellQuote(cleanedName) + " || { echo __STACKPILOT_NODE_DELETE_FAILED__; exit 25; }; "
+        "echo __STACKPILOT_NODE_DRAINED__; "
+        "$K delete node " + shellQuote(cleanedName) + " || { echo __STACKPILOT_NODE_DELETE_FAILED__; exit 25; }; "
         "echo __STACKPILOT_K3S_NODE_REMOVE_DONE__";
 
     const std::string command =
@@ -1494,6 +1549,53 @@ SshOperationResult SshService::removeK3sNode(const SshConnectionConfig& controlP
     return result;
 }
 
+SshOperationResult SshService::wipeK3sInstallation(const SshConnectionConfig& config,
+                                                   const std::string& sudoPassword) const {
+    SshOperationResult result;
+    std::string error;
+    if (!isValidConnectionConfig(config, error)) {
+        result.error = error;
+        return result;
+    }
+
+    const SessionFiles files = prepareSessionFiles(config);
+    const std::string sudoFn = makeSudoBashFunction(sudoPassword);
+
+    const std::string remoteCommand =
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
+        "set +e; " +
+        sudoFn +
+        "echo __STACKPILOT_WIPE_START__; "
+        "run_sudo systemctl stop k3s 2>/dev/null || true; "
+        "run_sudo systemctl stop k3s-agent 2>/dev/null || true; "
+        "run_sudo systemctl disable k3s 2>/dev/null || true; "
+        "run_sudo systemctl disable k3s-agent 2>/dev/null || true; "
+        "if [ -f /usr/local/bin/k3s-uninstall.sh ]; then run_sudo /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1 || true; fi; "
+        "if [ -f /usr/local/bin/k3s-agent-uninstall.sh ]; then run_sudo /usr/local/bin/k3s-agent-uninstall.sh >/dev/null 2>&1 || true; fi; "
+        "run_sudo killall -9 k3s 2>/dev/null || true; "
+        "run_sudo killall -9 k3s-agent 2>/dev/null || true; "
+        "run_sudo rm -rf /etc/rancher /var/lib/rancher /var/lib/kubelet /etc/cni /opt/cni /run/k3s /run/flannel /var/log/pods /var/log/containers; "
+        "run_sudo rm -f /usr/local/bin/k3s /usr/local/bin/kubectl /usr/local/bin/crictl /usr/local/bin/ctr; "
+        "echo __STACKPILOT_WIPE_DONE__";
+
+    const std::string command =
+        "timeout 180s sh -lc " +
+        shellQuote(files.sshpassPrefix + files.sshPrefix + " " + shellQuote(remoteCommand));
+
+    std::string output;
+    const int exitCode = runCommand(command, output);
+    cleanupSessionFiles(files);
+    capOutput(output, 160000);
+
+    result.output = output;
+    result.exitCode = exitCode;
+    result.success = (exitCode == 0) && (output.find("__STACKPILOT_WIPE_DONE__") != std::string::npos);
+    if (!result.success) {
+        result.error = "Wipe command timed out or exited with error code " + std::to_string(exitCode);
+    }
+    return result;
+}
+
 SshOperationResult SshService::inspectK3sCluster(const SshConnectionConfig& config) const {
     SshOperationResult result;
     std::string error;
@@ -1504,14 +1606,25 @@ SshOperationResult SshService::inspectK3sCluster(const SshConnectionConfig& conf
 
     const SessionFiles files = prepareSessionFiles(config);
     const std::string remoteCommand =
+        "export PATH=\"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH\"; "
         "set -e; "
         "echo __STACKPILOT_K3S_CLUSTER_STATUS_START__; "
-        "if command -v kubectl >/dev/null 2>&1; then K='kubectl'; "
-        "elif command -v k3s >/dev/null 2>&1 && [ \"$(id -u)\" -eq 0 ]; then K='k3s kubectl'; "
-        "elif command -v k3s >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then K='sudo -n k3s kubectl'; "
+        "if ! systemctl is-active --quiet k3s 2>/dev/null; then "
+        "  echo __STACKPILOT_K3S_SERVER_NOT_RUNNING__; "
+        "  exit 21; "
+        "fi; "
+        "SUDO=\"\"; "
+        "if [ \"$(id -u)\" -ne 0 ]; then "
+        "  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then SUDO=\"sudo -n\"; fi; "
+        "fi; "
+        "if [ -r /etc/rancher/k3s/k3s.yaml ]; then export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; "
+        "elif $SUDO test -r /etc/rancher/k3s/k3s.yaml 2>/dev/null; then export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; fi; "
+        "if command -v k3s >/dev/null 2>&1; then K=\"$SUDO k3s kubectl\"; "
+        "elif [ -x /usr/local/bin/k3s ]; then K=\"$SUDO /usr/local/bin/k3s kubectl\"; "
+        "elif command -v kubectl >/dev/null 2>&1; then K=\"$SUDO kubectl\"; "
         "else echo __STACKPILOT_KUBECTL_MISSING__; exit 20; fi; "
-        "echo __STACKPILOT_K3S_CLUSTER_NODES_BEGIN__; $K get nodes -o wide; echo __STACKPILOT_K3S_CLUSTER_NODES_END__; "
-        "echo __STACKPILOT_K3S_CLUSTER_PODS_BEGIN__; $K get pods -A -o wide; echo __STACKPILOT_K3S_CLUSTER_PODS_END__; "
+        "echo __STACKPILOT_K3S_CLUSTER_NODES_BEGIN__; $K get nodes -o wide || true; echo __STACKPILOT_K3S_CLUSTER_NODES_END__; "
+        "echo __STACKPILOT_K3S_CLUSTER_PODS_BEGIN__; $K get pods -A -o wide || true; echo __STACKPILOT_K3S_CLUSTER_PODS_END__; "
         "echo __STACKPILOT_K3S_CLUSTER_INFO_BEGIN__; $K cluster-info || true; echo __STACKPILOT_K3S_CLUSTER_INFO_END__; "
         "echo __STACKPILOT_K3S_CLUSTER_STATUS_DONE__";
 
@@ -1527,9 +1640,19 @@ SshOperationResult SshService::inspectK3sCluster(const SshConnectionConfig& conf
     result.exitCode = exitCode;
     result.output = output;
     if (exitCode != 0 || output.find("__STACKPILOT_K3S_CLUSTER_STATUS_DONE__") == std::string::npos) {
-        result.error = output.find("__STACKPILOT_KUBECTL_MISSING__") != std::string::npos
-            ? "kubectl or k3s is not available on the control-plane host"
-            : "Failed to inspect the Kubernetes cluster";
+        if (output.find("__STACKPILOT_K3S_SERVER_NOT_RUNNING__") != std::string::npos) {
+            result.error = "The k3s control-plane service is not active on this host. "
+                           "If this server was uninstalled or joined to another cluster as a worker, "
+                           "initialize it as a control plane first.";
+        } else if (output.find("__STACKPILOT_KUBECTL_MISSING__") != std::string::npos) {
+            result.error = "kubectl or k3s is not available on the control-plane host";
+        } else if (output.find("localhost:8080") != std::string::npos ||
+                   output.find("connection refused") != std::string::npos) {
+            result.error = "Cannot connect to the Kubernetes API server on port 6443. "
+                           "Verify that k3s is active ('systemctl status k3s') and port 6443 is accepting connections.";
+        } else {
+            result.error = "Failed to inspect the Kubernetes cluster";
+        }
         return result;
     }
 
@@ -1768,6 +1891,7 @@ SshOperationResult SshService::buildAndRunDockerProject(const SshConnectionConfi
                                                         const SshEnvVars& envVars,
                                                         SshLogCallback onLogLine) const {
     SshOperationResult result;
+    result.remoteContainerName = containerName;
     std::string error;
     if (!isValidConnectionConfig(config, error)) {
         result.error = error;
@@ -3154,8 +3278,11 @@ int SshService::runCommand(const std::string& command, std::string& output) cons
     }
 
     char buffer[4096];
+    constexpr size_t kMaxOutputBytes = 10 * 1024 * 1024;
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
+        if (output.size() < kMaxOutputBytes) {
+            output += buffer;
+        }
     }
 
     const int rawExit = pclose(pipe);

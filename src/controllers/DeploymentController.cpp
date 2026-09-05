@@ -377,11 +377,24 @@ rewrite_conflicting_application_ports() {
   fi
   return "$changed"
 }
+sed -i -E 's/^([[:space:]]*)container_name:/\1# [stackpilot-isolated] container_name:/g' )sh" + composeFileArg + R"sh( 2>/dev/null || true
 compose_up_exit=0
 compose_up_output=$($compose_cmd -f )sh" + composeFileArg + " -p " + projectArg + R"sh( up -d --build --remove-orphans 2>&1) || compose_up_exit=$?
 printf '%s\n' "$compose_up_output"
 if [ "$compose_up_exit" -ne 0 ]; then
-  if printf '%s\n' "$compose_up_output" | grep -Eqi 'address already in use|ports are not available|only one usage of each socket address|bind:'; then
+  if printf '%s\n' "$compose_up_output" | grep -Eqi 'Conflict\. The container name|is already in use by container'; then
+    echo "Resolving container name conflicts and re-isolating stack..."
+    conflicting_ids=$(printf '%s\n' "$compose_up_output" | grep -oE 'in use by container "[a-f0-9]+"' | awk -F'"' '{print $2}' || true)
+    for cid in $conflicting_ids; do
+      [ -n "$cid" ] && docker rm -f "$cid" 2>/dev/null || true
+    done
+    conflicting_names=$(printf '%s\n' "$compose_up_output" | grep -oE 'The container name "/[^"]+"' | awk -F'"' '{print $2}' | tr -d '/' || true)
+    for cname in $conflicting_names; do
+      [ -n "$cname" ] && docker rm -f "$cname" 2>/dev/null || true
+    done
+    sed -i -E 's/^([[:space:]]*)container_name:/\1# [stackpilot-isolated] container_name:/g' )sh" + composeFileArg + R"sh( 2>/dev/null || true
+    $compose_cmd -f )sh" + composeFileArg + " -p " + projectArg + R"sh( up -d --build --remove-orphans
+  elif printf '%s\n' "$compose_up_output" | grep -Eqi 'address already in use|ports are not available|only one usage of each socket address|bind:|port is already allocated'; then
     rewrite_conflicting_application_ports || true
     if grep -Eq 'STACKPILOT_HTTP_PORT|STACKPILOT_HTTPS_PORT' )sh" + composeFileArg + R"sh( 2>/dev/null; then
       old_http_port=$(read_env_value STACKPILOT_HTTP_PORT)
@@ -394,6 +407,17 @@ if [ "$compose_up_exit" -ne 0 ]; then
       echo "__STACKPILOT_PORT_ADJUSTED__=STACKPILOT_HTTPS_PORT:${old_https_port:-443}:${https_port}"
       echo "Host port conflict detected; retrying Compose with STACKPILOT_HTTP_PORT=$http_port and STACKPILOT_HTTPS_PORT=$https_port"
     fi
+    conflicting_ports=$(printf '%s\n' "$compose_up_output" | grep -oE 'Bind for [^:]+:([0-9]+) failed' | awk -F':' '{print $2}' | awk '{print $1}' || true)
+    if [ -z "$conflicting_ports" ]; then
+      conflicting_ports=$(printf '%s\n' "$compose_up_output" | grep -oE 'listen tcp4 [^:]+:([0-9]+): bind:' | awk -F':' '{print $2}' || true)
+    fi
+    for p in $conflicting_ports; do
+      if [ -n "$p" ]; then
+        np=$(choose_port $((p + 1)) 8082 8083 8084 8085 8088 8092 18080 18088 19000 13000 3002)
+        sed -i -E "s/([\"']?)${p}:([0-9]+)([\"']?)/\1${np}:\2\3/g" )sh" + composeFileArg + R"sh( 2>/dev/null || true
+        echo "Port conflict resolved: remapped host port $p -> $np in compose file"
+      fi
+    done
     $compose_cmd -f )sh" + composeFileArg + " -p " + projectArg + R"sh( up -d --build --remove-orphans
   else
     exit "$compose_up_exit"
@@ -525,14 +549,14 @@ long long parseByteQuantity(const std::string& raw) {
     std::string unit = toLower(value.substr(index));
     double multiplier = 1.0;
     if (unit == "b" || unit.empty()) multiplier = 1.0;
-    else if (unit == "kb") multiplier = 1000.0;
-    else if (unit == "kib") multiplier = 1024.0;
-    else if (unit == "mb") multiplier = 1000.0 * 1000.0;
-    else if (unit == "mib") multiplier = 1024.0 * 1024.0;
-    else if (unit == "gb") multiplier = 1000.0 * 1000.0 * 1000.0;
-    else if (unit == "gib") multiplier = 1024.0 * 1024.0 * 1024.0;
-    else if (unit == "tb") multiplier = 1000.0 * 1000.0 * 1000.0 * 1000.0;
-    else if (unit == "tib") multiplier = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "k" || unit == "kb") multiplier = 1000.0;
+    else if (unit == "ki" || unit == "kib") multiplier = 1024.0;
+    else if (unit == "m" || unit == "mb") multiplier = 1000.0 * 1000.0;
+    else if (unit == "mi" || unit == "mib") multiplier = 1024.0 * 1024.0;
+    else if (unit == "g" || unit == "gb") multiplier = 1000.0 * 1000.0 * 1000.0;
+    else if (unit == "gi" || unit == "gib") multiplier = 1024.0 * 1024.0 * 1024.0;
+    else if (unit == "t" || unit == "tb") multiplier = 1000.0 * 1000.0 * 1000.0 * 1000.0;
+    else if (unit == "ti" || unit == "tib") multiplier = 1024.0 * 1024.0 * 1024.0 * 1024.0;
     return static_cast<long long>(amount * multiplier);
 }
 
@@ -701,17 +725,18 @@ Json::Value parseDockerMetrics(const std::string& output,
             const std::string value = trim(line.substr(4));
             if (!value.empty()) {
                 const auto parts = splitString(value, ',');
-                if (parts.size() >= 4) {
-                    const double usage = parseMetricNumber(parts[0]);
+                if (!parts.empty() && !trim(parts[0]).empty()) {
+                    host["gpu_usage_percent"] = parseMetricNumber(parts[0]);
+                }
+                if (parts.size() >= 3) {
                     const double used = parseMetricNumber(parts[1]);
                     const double total = parseMetricNumber(parts[2]);
-                    host["gpu_usage_percent"] = usage;
                     if (total > 0) {
                         host["gpu_memory_percent"] = (used / total) * 100.0;
                     }
-                    if (!trim(parts[3]).empty()) {
-                        host["gpu_temperature_celsius"] = parseMetricNumber(parts[3]);
-                    }
+                }
+                if (parts.size() >= 4 && !trim(parts[3]).empty()) {
+                    host["gpu_temperature_celsius"] = parseMetricNumber(parts[3]);
                 }
             }
         }
@@ -1020,7 +1045,7 @@ void DeploymentController::createDeployment(
         pqxx::work txn(*conn);
 
         // Verify project ownership
-        auto check = txn.exec_params("SELECT id, source_type, repo_url FROM projects WHERE id = $1 AND has_project_access(id, $2)", projectId, userId);
+        auto check = txn.exec_params("SELECT id, source_type, repo_url FROM projects WHERE id = $1 AND has_project_access(id, $2, 'member')", projectId, userId);
         if (check.empty()) {
             Json::Value err; err["error"] = "Project not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -1369,7 +1394,7 @@ void DeploymentController::triggerBuild(
             // simultaneous POSTs both read 'built', both enqueue, and two workers
             // build the same deployment — colliding on identical derived image and
             // container names, where `docker rm -f` kills the other run's container.
-            "WHERE d.id = $1 AND has_project_access(p.id, $2) "
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'member') "
             "FOR UPDATE OF d",
             deploymentId,
             userId
@@ -1462,6 +1487,104 @@ void DeploymentController::triggerBuild(
         resp->setStatusCode(drogon::k500InternalServerError);
         callback(resp);
         return;
+    }
+}
+
+void DeploymentController::cancelDeployment(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& deploymentId
+) {
+    std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        Json::Value err; err["error"] = "Unauthorized";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k401Unauthorized);
+        callback(resp); return;
+    }
+
+    try {
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+
+        auto rows = txn.exec_params(
+            "SELECT d.id, d.status, d.project_id, p.name AS project_name "
+            "FROM deployments d "
+            "JOIN projects p ON d.project_id = p.id "
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'member') "
+            "FOR UPDATE OF d",
+            deploymentId,
+            userId
+        );
+
+        if (rows.empty()) {
+            Json::Value err; err["error"] = "Deployment not found";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k404NotFound);
+            callback(resp); return;
+        }
+
+        const std::string currentStatus = rows[0]["status"].as<std::string>();
+        const std::string projectName = rows[0]["project_name"].as<std::string>();
+
+        if (currentStatus == "canceled") {
+            Json::Value payload;
+            payload["message"] = "Deployment is already canceled";
+            payload["deployment_id"] = deploymentId;
+            payload["status"] = "canceled";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+            resp->setStatusCode(drogon::k200OK);
+            callback(resp); return;
+        }
+
+        // Cancel any in-flight build child processes
+        BuildService::getInstance().cancelBuild(deploymentId);
+
+        // Cancel active jobs in deployment_jobs
+        txn.exec_params(
+            "UPDATE deployment_jobs "
+            "SET status = 'canceled', last_error = 'Deployment was canceled by user', "
+            "completed_at = NOW(), locked_by = '', locked_at = NULL, updated_at = NOW() "
+            "WHERE deployment_id = $1 AND status IN ('queued', 'running', 'retrying')",
+            deploymentId
+        );
+
+        // Update deployment status to canceled and record log line
+        txn.exec_params(
+            "UPDATE deployments "
+            "SET status = 'canceled', "
+            "logs = COALESCE(logs, '') || E'\\nDeployment was canceled by user\\n', "
+            "updated_at = NOW() "
+            "WHERE id = $1",
+            deploymentId
+        );
+
+        txn.commit();
+
+        DeploymentJournal::appendLine(deploymentId, "Deployment was canceled by user");
+        DeploymentJournal::broadcastSummary(deploymentId);
+        LogWebSocketController::broadcastLog(deploymentId, "Deployment was canceled by user");
+        LogWebSocketController::broadcastStatus(deploymentId, "canceled");
+
+        Json::Value auditMeta;
+        auditMeta["project_name"] = projectName;
+        auditMeta["previous_status"] = currentStatus;
+        AuditLogger::recordFromRequest(req, userId, "deployment.canceled", "deployment", deploymentId, auditMeta);
+
+        Json::Value payload;
+        payload["message"] = "Deployment was canceled by user";
+        payload["deployment_id"] = deploymentId;
+        payload["status"] = "canceled";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+        resp->setStatusCode(drogon::k200OK);
+        callback(resp);
+    } catch (const std::exception& e) {
+        spdlog::error("Cancel deployment error for {}: {}", deploymentId, e.what());
+        Json::Value err; err["error"] = "Internal server error";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
     }
 }
 
@@ -1560,11 +1683,25 @@ void DeploymentController::deleteDeployment(
         {
             auto conn = Database::getInstance().getConnection();
             pqxx::work txn(*conn);
+            auto depCheck = txn.exec_params(
+                "SELECT d.id FROM deployments d "
+                "JOIN projects p ON d.project_id = p.id "
+                "WHERE d.id = $1 AND has_project_access(p.id, $2, 'admin')",
+                deploymentId,
+                userId
+            );
+            if (depCheck.empty()) {
+                Json::Value err; err["error"] = "Deployment not found";
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+                resp->setStatusCode(drogon::k404NotFound);
+                callback(resp); return;
+            }
+
             auto activeJobs = txn.exec_params(
                 "SELECT COUNT(*) FROM deployments d "
                 "JOIN deployment_jobs j ON j.deployment_id = d.id "
                 "JOIN projects p ON d.project_id = p.id "
-                "WHERE d.id = $1 AND has_project_access(p.id, $2) "
+                "WHERE d.id = $1 AND has_project_access(p.id, $2, 'admin') "
                 "  AND j.status IN ('running', 'queued', 'retrying')",
                 deploymentId,
                 userId
@@ -1647,7 +1784,7 @@ void DeploymentController::deployToLocalDocker(
             "p.name AS project_name "
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
-            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'member')",
             deploymentId,
             userId
         );
@@ -1943,7 +2080,7 @@ void DeploymentController::deployToKubernetes(
             "p.name AS project_name, p.runtime_scheme, p.local_https_enabled "
             "FROM deployments d "
             "JOIN projects p ON d.project_id = p.id "
-            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'member')",
             deploymentId, userId
         );
 
@@ -1988,19 +2125,10 @@ void DeploymentController::deployToKubernetes(
         options.projectName = row["project_name"].as<std::string>();
         options.imageName = imageName;
         options.nameSpace = requestedNamespace;
-        options.exposureMode = !requestedExposureMode.empty()
+        options.exposureMode = toLower(trim(!requestedExposureMode.empty()
             ? requestedExposureMode
-            : (row["runtime_exposure"].is_null() ? "" : row["runtime_exposure"].as<std::string>());
+            : (row["runtime_exposure"].is_null() ? "" : row["runtime_exposure"].as<std::string>())));
         options.runtimeScheme = requestedRuntimeScheme.empty() ? savedScheme : requestedRuntimeScheme;
-        if (options.runtimeScheme == "https") {
-            options.runtimeScheme = "http";
-        }
-        const std::string localExposureMode = toLower(trim(options.exposureMode));
-        if (localExposureMode != "nodeport") {
-            options.exposureMode = "nodeport";
-        } else {
-            options.exposureMode = localExposureMode;
-        }
         options.replicas = replicas;
         options.containerPort = containerPort;
         options.resourcePreset = resourcePreset;
@@ -2164,7 +2292,7 @@ void DeploymentController::scaleKubernetesDeployment(
     try {
         auto body = req->getJsonObject();
         const int replicas =
-            (body && body->isMember("replicas")) ? std::max(1, (*body)["replicas"].asInt()) : 1;
+            (body && body->isMember("replicas")) ? std::max(0, (*body)["replicas"].asInt()) : 1;
 
         auto& db = Database::getInstance();
         auto conn = db.getConnection();
@@ -2179,7 +2307,7 @@ void DeploymentController::scaleKubernetesDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'member')",
             deploymentId, userId
         );
 
@@ -2353,7 +2481,7 @@ void DeploymentController::setRuntimePausedState(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'member')",
             deploymentId, userId
         );
 
@@ -2602,12 +2730,76 @@ void DeploymentController::setRuntimePausedState(
         }
 
         if (isLocalDocker) {
-            RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
-            Json::Value err;
-            err["error"] = "Pause and resume are currently supported for remote Docker and Kubernetes runtimes.";
-            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
-            resp->setStatusCode(drogon::k400BadRequest);
-            callback(resp);
+            if (remoteContainerName.empty()) {
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                Json::Value err;
+                err["error"] = "Local Docker container is not attached to this deployment";
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+                resp->setStatusCode(drogon::k400BadRequest);
+                callback(resp);
+                return;
+            }
+
+            std::string output;
+            const int exitCode = LocalDockerRuntime::run(
+                "timeout 20s sh -lc " + shellQuote(LocalDockerRuntime::makePauseCommand(remoteContainerName, paused)),
+                output
+            );
+            DeploymentJournal::appendBlock(deploymentId, output);
+
+            if (exitCode != 0) {
+                RuntimeRateLimiter::recordFailure(rateLimitKey, kRuntimeMutationRateLimit);
+                payload["error"] = paused ? "Failed to pause runtime" : "Failed to resume runtime";
+                payload["runtime"]["logs"] = output;
+                auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+                resp->setStatusCode(drogon::k500InternalServerError);
+                callback(resp);
+                return;
+            }
+
+            const std::string status = valueFromKeyValueOutput(output, "status");
+            const bool running = valueFromKeyValueOutput(output, "running") == "true";
+            const bool dockerPaused = valueFromKeyValueOutput(output, "paused") == "true";
+            const std::string persistedStatus = dockerPaused ? "paused" : (running ? "running" : (status.empty() ? "built" : status));
+
+            auto connUpdate = db.getConnection();
+            pqxx::work updateTxn(*connUpdate);
+            updateTxn.exec_params(
+                "UPDATE deployments SET status = $1, runtime_paused = $2, updated_at = NOW() WHERE id = $3",
+                persistedStatus,
+                dockerPaused,
+                deploymentId
+            );
+            updateTxn.commit();
+
+            RuntimeRateLimiter::clear(rateLimitKey);
+            LogWebSocketController::broadcastStatus(deploymentId, persistedStatus);
+            DeploymentJournal::broadcastSummary(deploymentId);
+
+            payload["message"] = paused ? "Runtime paused successfully" : "Runtime resumed successfully";
+            payload["runtime"]["provider"] = "local_docker";
+            payload["runtime"]["status"] = persistedStatus;
+            payload["runtime"]["ready_replicas"] = dockerPaused ? 0 : (running ? 1 : 0);
+            payload["runtime"]["runtime_url"] = runtimeUrl;
+            payload["runtime"]["container_name"] = remoteContainerName;
+            payload["runtime"]["image"] = valueFromKeyValueOutput(output, "image");
+            payload["runtime"]["started_at"] = valueFromKeyValueOutput(output, "started_at");
+            payload["runtime"]["finished_at"] = valueFromKeyValueOutput(output, "finished_at");
+            payload["runtime"]["restart_count"] = valueFromKeyValueOutput(output, "restart_count");
+            Json::Value auditMeta;
+            auditMeta["provider"] = "local_docker";
+            auditMeta["container_name"] = remoteContainerName;
+            auditMeta["image_name"] = imageName;
+            auditMeta["paused"] = dockerPaused;
+            AuditLogger::recordFromRequest(
+                req,
+                userId,
+                paused ? "runtime.paused" : "runtime.resumed",
+                "deployment",
+                deploymentId,
+                auditMeta
+            );
+            callback(drogon::HttpResponse::newHttpJsonResponse(payload));
             return;
         }
 
@@ -3466,7 +3658,7 @@ void DeploymentController::rollbackKubernetesDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'admin')",
             deploymentId, userId
         );
 
@@ -3556,10 +3748,17 @@ void DeploymentController::rollbackKubernetesDeployment(
         KubernetesRuntimeInfo runtime;
         if (isRemoteKubernetes) {
             SshService sshService;
-            runtime = sshService.deployKubernetesRuntime(remoteConfig, options);
+            runtime = sshService.rollbackKubernetesRuntime(remoteConfig, nameSpace, deploymentName, serviceName, exposureMode, runtimeScheme);
+            runtime.runtimeScheme = runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme;
         } else {
-            KubernetesService service(ClusterTargets::forDeployment(deploymentId).kubeconfig);
-            runtime = service.deploy(options);
+            const std::string targetKubeconfig = ClusterTargets::forDeployment(deploymentId).kubeconfig;
+            if (!targetKubeconfig.empty()) {
+                KubernetesService service(targetKubeconfig);
+                runtime = service.rollback(nameSpace, deploymentName, serviceName, exposureMode, runtimeScheme);
+            } else {
+                runtime = KubernetesService::getInstance().rollback(nameSpace, deploymentName, serviceName, exposureMode, runtimeScheme);
+            }
+            runtime.runtimeScheme = runtime.runtimeScheme.empty() ? runtimeScheme : runtime.runtimeScheme;
         }
         DeploymentJournal::appendBlock(deploymentId, runtime.logs);
 
@@ -3681,7 +3880,7 @@ void DeploymentController::removeKubernetesDeployment(
             "JOIN projects p ON d.project_id = p.id "
             "LEFT JOIN project_environments e ON d.environment_id = e.id AND e.project_id = p.id "
             "LEFT JOIN ssh_connections rs ON COALESCE(d.remote_connection_id, e.remote_connection_id, p.remote_connection_id) = rs.id "
-            "WHERE d.id = $1 AND has_project_access(p.id, $2)",
+            "WHERE d.id = $1 AND has_project_access(p.id, $2, 'admin')",
             deploymentId, userId
         );
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import api from "@/lib/api";
@@ -43,9 +44,11 @@ import {
   Trash2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useWorkspace } from "@/context/WorkspaceContext";
 import { GitHubAuthButton } from "@/components/auth/GitHubAuthButton";
 import { ProjectEnvEditor, ProjectEnvVar } from "@/components/ProjectEnvEditor";
 import { RemoteSshTerminal } from "@/components/RemoteSshTerminal";
+import { AppIcon } from "@/lib/custom-icons";
 
 interface GitHubRepo {
   id: number;
@@ -142,6 +145,42 @@ interface ApplicationField {
   defaultValue: string;
   required?: boolean;
   secret?: boolean;
+}
+
+export interface DockerHubItem {
+  name: string;
+  description: string;
+  star_count: number;
+  pull_count: number;
+  is_official: boolean;
+}
+
+function formatPulls(count: number): string {
+  if (!count) return "0";
+  if (count >= 1000000000) return `${(count / 1000000000).toFixed(1)}B`;
+  if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+  if (count >= 1000) return `${(count / 1000).toFixed(0)}K`;
+  return count.toString();
+}
+
+function guessPortForImage(imageName: string): number {
+  const lower = imageName.toLowerCase();
+  if (lower.includes("redis")) return 6379;
+  if (lower.includes("postgres")) return 5432;
+  if (lower.includes("mysql") || lower.includes("mariadb")) return 3306;
+  if (lower.includes("mongo")) return 27017;
+  if (lower.includes("nginx") || lower.includes("apache") || lower.includes("httpd") || lower.includes("caddy") || lower.includes("traefik")) return 80;
+  if (lower.includes("rabbitmq")) return 5672;
+  if (lower.includes("nats")) return 4222;
+  if (lower.includes("elastic") || lower.includes("opensearch")) return 9200;
+  if (lower.includes("kafka")) return 9092;
+  if (lower.includes("clickhouse")) return 8123;
+  if (lower.includes("memcached")) return 11211;
+  if (lower.includes("prometheus")) return 9090;
+  if (lower.includes("grafana")) return 3000;
+  if (lower.includes("vault")) return 8200;
+  if (lower.includes("minio")) return 9000;
+  return 80;
 }
 
 interface ApplicationTemplate {
@@ -339,6 +378,7 @@ function isGeneratedApplicationProjectName(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return true;
   const lower = trimmed.toLowerCase();
+  if (lower === "dockerhub" || lower === "custom-image") return true;
   if (APPLICATION_TEMPLATES.some((template) => template.id === lower || conciseApplicationProjectName(template).toLowerCase() === lower)) {
     return true;
   }
@@ -398,7 +438,10 @@ function defaultProjectEnvironments(): ProjectEnvironmentDraft[] {
 }
 
 export function CreateProjectDialog() {
+  const router = useRouter();
+  const { organizations, activeWorkspaceId } = useWorkspace();
   const [open, setOpen] = useState(false);
+  const [organizationId, setOrganizationId] = useState<string>("");
   const [sourceType, setSourceType] = useState<SourceType>("github");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -429,9 +472,47 @@ export function CreateProjectDialog() {
   const [environments, setEnvironments] = useState<ProjectEnvironmentDraft[]>(() => defaultProjectEnvironments());
   const [applicationTemplateId, setApplicationTemplateId] = useState(APPLICATION_TEMPLATES[0].id);
   const [applicationSearch, setApplicationSearch] = useState("");
+  const [dockerHubResults, setDockerHubResults] = useState<DockerHubItem[]>([]);
+  const [isSearchingDockerHub, setIsSearchingDockerHub] = useState(false);
+  const [selectedDockerHubImage, setSelectedDockerHubImage] = useState<DockerHubItem | null>(null);
   const [applicationConfig, setApplicationConfig] = useState<Record<string, string>>(() =>
     initialApplicationConfig(APPLICATION_TEMPLATES[0])
   );
+
+  useEffect(() => {
+    const q = applicationSearch.trim();
+    if (!q || q.length < 2) {
+      setDockerHubResults([]);
+      setIsSearchingDockerHub(false);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        setIsSearchingDockerHub(true);
+        const res = await fetch(`/api/dockerhub?query=${encodeURIComponent(q)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data?.results)) {
+            setDockerHubResults(data.results);
+          }
+        }
+      } catch (err) {
+        console.error("Docker Hub search error:", err);
+      } finally {
+        setIsSearchingDockerHub(false);
+      }
+    }, 350);
+
+    return () => clearTimeout(timer);
+  }, [applicationSearch]);
+
+  useEffect(() => {
+    if (open) {
+      const defaultOrg = activeWorkspaceId || organizations.find((o) => o.is_personal)?.id || organizations[0]?.id || "";
+      setOrganizationId(defaultOrg);
+    }
+  }, [open, activeWorkspaceId, organizations]);
 
   const queryClient = useQueryClient();
   const meQuery = useQuery({
@@ -467,8 +548,31 @@ export function CreateProjectDialog() {
   const effectiveRemoteK8sExposure: RemoteK8sExposure =
     remoteRuntimeType === "kubernetes" && executionMode === "remote_host" ? remoteK8sExposure : "nodeport";
   const effectiveLocalHttpsEnabled = false;
-  const selectedApplicationTemplate =
-    APPLICATION_TEMPLATES.find((template) => template.id === applicationTemplateId) ?? APPLICATION_TEMPLATES[0];
+
+  const isDockerHubSelected = applicationTemplateId === "dockerhub" || applicationTemplateId.startsWith("dockerhub:");
+
+  const selectedApplicationTemplate = useMemo(() => {
+    if (isDockerHubSelected) {
+      const imageName = applicationConfig.image || selectedDockerHubImage?.name || "custom-image:latest";
+      return {
+        id: "dockerhub",
+        name: applicationConfig.name || selectedDockerHubImage?.name || imageName,
+        category: "Docker Hub",
+        image: imageName,
+        description: selectedDockerHubImage?.description || "Docker container image running on demand from Docker Hub.",
+        primaryPort: parseInt(applicationConfig.container_port || "80", 10) || 80,
+        fields: [
+          { id: "image", label: "Docker Image Tag", envKey: "APP_IMAGE", type: "text" as const, defaultValue: imageName, required: true },
+          { id: "container_port", label: "Container Port", envKey: "CONTAINER_PORT", type: "port" as const, defaultValue: applicationConfig.container_port || "80", required: true },
+          { id: "public_port", label: "Public Port", envKey: "APP_PUBLIC_PORT", type: "port" as const, defaultValue: applicationConfig.public_port || "18080", required: true },
+        ],
+      };
+    }
+    return (
+      APPLICATION_TEMPLATES.find((template) => template.id === applicationTemplateId) ?? APPLICATION_TEMPLATES[0]
+    );
+  }, [isDockerHubSelected, applicationTemplateId, applicationConfig, selectedDockerHubImage]);
+
   const filteredApplicationTemplates = useMemo(() => {
     const query = applicationSearch.trim().toLowerCase();
     if (!query) return APPLICATION_TEMPLATES;
@@ -660,7 +764,11 @@ export function CreateProjectDialog() {
               runtime_scheme: effectiveRuntimeScheme,
               local_https_enabled: effectiveLocalHttpsEnabled,
             };
-      const res = await api.post("/projects", { ...payload, environments: environmentPayload });
+      const res = await api.post("/projects", {
+        ...payload,
+        organization_id: organizationId || undefined,
+        environments: environmentPayload,
+      });
       return res.data;
     },
     onSuccess: (data) => {
@@ -670,6 +778,9 @@ export function CreateProjectDialog() {
       queryClient.invalidateQueries({ queryKey: ["deployments"] });
       setOpen(false);
       resetForm();
+      if (data?.project?.id) {
+        router.push(`/dashboard/projects/${data.project.id}`);
+      }
     },
     onError: (error: unknown) => {
       const message =
@@ -710,6 +821,9 @@ export function CreateProjectDialog() {
     setEnvironments(defaultProjectEnvironments());
     setApplicationTemplateId(APPLICATION_TEMPLATES[0].id);
     setApplicationSearch("");
+    setDockerHubResults([]);
+    setIsSearchingDockerHub(false);
+    setSelectedDockerHubImage(null);
     setApplicationConfig(initialApplicationConfig(APPLICATION_TEMPLATES[0]));
   };
 
@@ -733,6 +847,7 @@ export function CreateProjectDialog() {
   };
 
   const handleApplicationTemplateSelect = (template: ApplicationTemplate) => {
+    setSelectedDockerHubImage(null);
     const shouldReplaceName = isGeneratedApplicationProjectName(name);
     setApplicationTemplateId(template.id);
     setApplicationConfig(initialApplicationConfig(template));
@@ -740,6 +855,63 @@ export function CreateProjectDialog() {
       setName(conciseApplicationProjectName(template));
     }
     if (!description.trim()) setDescription(template.description);
+  };
+
+  const handleDockerHubSelect = (item: DockerHubItem) => {
+    setSelectedDockerHubImage(item);
+    setApplicationTemplateId("dockerhub");
+    const defaultPort = guessPortForImage(item.name);
+    const parts = item.name.split("/");
+    const simpleName = parts[parts.length - 1];
+    const capitalized = simpleName.charAt(0).toUpperCase() + simpleName.slice(1);
+    const shouldReplaceName = isGeneratedApplicationProjectName(name) || !name.trim();
+
+    setApplicationConfig({
+      image: item.name.includes(":") ? item.name : `${item.name}:latest`,
+      name: capitalized,
+      container_port: defaultPort.toString(),
+      public_port: (10000 + defaultPort).toString(),
+    });
+
+    if (shouldReplaceName) {
+      setName(capitalized);
+    }
+    if (!description.trim()) {
+      setDescription(item.description || `Docker Hub image ${item.name}`);
+    }
+  };
+
+  const handleCustomImageSelect = (customImage: string) => {
+    const trimmed = customImage.trim();
+    if (!trimmed) return;
+    const defaultPort = guessPortForImage(trimmed);
+    const rawName = trimmed.split(":")[0];
+    const parts = rawName.split("/");
+    const simpleName = parts[parts.length - 1];
+    const capitalized = simpleName.charAt(0).toUpperCase() + simpleName.slice(1);
+
+    const item: DockerHubItem = {
+      name: trimmed,
+      description: `Docker container image ${trimmed}`,
+      star_count: 0,
+      pull_count: 0,
+      is_official: false,
+    };
+    setSelectedDockerHubImage(item);
+    setApplicationTemplateId("dockerhub");
+    setApplicationConfig({
+      image: trimmed.includes(":") ? trimmed : `${trimmed}:latest`,
+      name: capitalized,
+      container_port: defaultPort.toString(),
+      public_port: (10000 + defaultPort).toString(),
+    });
+
+    if (isGeneratedApplicationProjectName(name) || !name.trim()) {
+      setName(capitalized);
+    }
+    if (!description.trim()) {
+      setDescription(`Custom Docker image ${trimmed}`);
+    }
   };
 
   const handleApplicationSourceSelect = () => {
@@ -882,6 +1054,11 @@ export function CreateProjectDialog() {
         toast.error("Choose a saved SSH/VPS connection for server-side application deploys");
         return;
       }
+      if (executionMode === "remote_host" && !githubRemoteWorkspacePath.trim()) {
+        toast.error("Remote workspace path is required for remote application deployment");
+        document.getElementById("applicationRemoteWorkspacePath")?.focus();
+        return;
+      }
       const missingField = selectedApplicationTemplate.fields.find(
         (field) => field.required && !String(applicationConfig[field.id] || "").trim()
       );
@@ -937,7 +1114,7 @@ export function CreateProjectDialog() {
                 setLocalHttpsEnabled(false);
               }}
             >
-              <Server className="mr-2 h-4 w-4" />
+              <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
               {runtimeScope} Docker
             </Button>
             <Button
@@ -946,7 +1123,7 @@ export function CreateProjectDialog() {
               className={cn(segmentedButtonClass, remoteRuntimeType === "kubernetes" && segmentedButtonActiveClass)}
               onClick={() => setRemoteRuntimeType("kubernetes")}
             >
-              <Server className="mr-2 h-4 w-4" />
+              <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
               {runtimeScope} Kubernetes
             </Button>
           </div>
@@ -1071,7 +1248,7 @@ export function CreateProjectDialog() {
           </p>
         </div>
         <Button type="button" variant="outline" size="sm" onClick={addEnvironment}>
-          <Plus className="mr-2 h-4 w-4" />
+          <AppIcon name="plus" fallback={Plus} className="mr-2 h-4 w-4"  />
           Add
         </Button>
       </div>
@@ -1135,7 +1312,7 @@ export function CreateProjectDialog() {
                   disabled={environments.length <= 1}
                   onClick={() => removeEnvironment(environment.id)}
                 >
-                  <Trash2 className="h-4 w-4" />
+                  <AppIcon name="trash2" fallback={Trash2} className="h-4 w-4"  />
                 </Button>
               </div>
             </div>
@@ -1150,7 +1327,7 @@ export function CreateProjectDialog() {
                 )}
                 onClick={() => updateEnvironment(environment.id, { auto_deploy: !environment.auto_deploy })}
               >
-                <GitBranch className="mr-2 h-4 w-4" />
+                <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                 {environment.auto_deploy ? "Auto deploy on push" : "Manual deploy only"}
               </Button>
               <Button
@@ -1163,7 +1340,7 @@ export function CreateProjectDialog() {
                 onClick={() => updateEnvironment(environment.id, { require_ci: !environment.require_ci })}
                 disabled={sourceType === "application"}
               >
-                <ShieldCheck className="mr-2 h-4 w-4" />
+                <AppIcon name="shield-check" fallback={ShieldCheck} className="mr-2 h-4 w-4"  />
                 {sourceType === "application"
                   ? "CI checks do not apply"
                   : environment.require_ci
@@ -1183,7 +1360,7 @@ export function CreateProjectDialog() {
                   })
                 }
               >
-                <Trash2 className="mr-2 h-4 w-4" />
+                <AppIcon name="trash2" fallback={Trash2} className="mr-2 h-4 w-4"  />
                 {environment.cleanup_previous_on_success ? "Clean old runtime" : "Keep old runtime"}
               </Button>
             </div>
@@ -1214,7 +1391,7 @@ export function CreateProjectDialog() {
       <DialogTrigger
         render={
           <Button>
-            <Plus className="mr-2 h-4 w-4" /> New Project
+            <AppIcon name="plus" fallback={Plus} size={16} className="mr-2 h-4 w-4" /> New Project
           </Button>
         }
       />
@@ -1223,7 +1400,7 @@ export function CreateProjectDialog() {
           <div className="flex items-start justify-between gap-4 pr-8">
             <div className="space-y-2">
               <DialogTitle className="flex items-center gap-2">
-                <Plus className="h-5 w-5 text-primary" />
+                <AppIcon name="plus" fallback={Plus} size={20} className="h-5 w-5 text-primary" />
                 Create New Project
               </DialogTitle>
               <DialogDescription>
@@ -1231,7 +1408,7 @@ export function CreateProjectDialog() {
               </DialogDescription>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={() => setHelpOpen(true)} className="shrink-0">
-              <Info className="mr-2 h-4 w-4" />
+              <AppIcon name="info" fallback={Info} className="mr-2 h-4 w-4"  />
               Guide
             </Button>
           </div>
@@ -1248,7 +1425,7 @@ export function CreateProjectDialog() {
                     className={cn(segmentedButtonClass, sourceType === "github" && segmentedButtonActiveClass)}
                     onClick={() => setSourceType("github")}
                   >
-                    <GitBranch className="mr-2 h-4 w-4" />
+                    <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                     GitHub
                   </Button>
                   <Button
@@ -1257,7 +1434,7 @@ export function CreateProjectDialog() {
                     className={cn(segmentedButtonClass, sourceType === "ssh" && segmentedButtonActiveClass)}
                     onClick={() => setSourceType("ssh")}
                   >
-                    <Server className="mr-2 h-4 w-4" />
+                    <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                     SSH / VPS
                   </Button>
                   <Button
@@ -1266,7 +1443,7 @@ export function CreateProjectDialog() {
                     className={cn(segmentedButtonClass, sourceType === "application" && segmentedButtonActiveClass)}
                     onClick={handleApplicationSourceSelect}
                   >
-                    <Boxes className="mr-2 h-4 w-4" />
+                    <AppIcon name="boxes" fallback={Boxes} className="mr-2 h-4 w-4"  />
                     Apps
                   </Button>
                   <Button
@@ -1275,7 +1452,7 @@ export function CreateProjectDialog() {
                     className={cn(segmentedButtonClass, sourceType === "local" && segmentedButtonActiveClass)}
                     onClick={() => setSourceType("local")}
                   >
-                    <HardDrive className="mr-2 h-4 w-4" />
+                    <AppIcon name="hard-drive" fallback={HardDrive} className="mr-2 h-4 w-4"  />
                     Local
                   </Button>
               </div>
@@ -1297,7 +1474,7 @@ export function CreateProjectDialog() {
                     </div>
                     {githubConnected && (
                       <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                        <CheckCircle2 className="h-3.5 w-3.5" />
+                        <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-3.5 w-3.5"  />
                         Signed in
                       </div>
                     )}
@@ -1312,9 +1489,9 @@ export function CreateProjectDialog() {
                         disabled={fetchReposMutation.isPending}
                       >
                         {fetchReposMutation.isPending ? (
-                          <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                          <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                         ) : (
-                          <GitBranch className="mr-2 h-4 w-4" />
+                          <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                         )}
                         Load Repositories
                       </Button>
@@ -1322,7 +1499,7 @@ export function CreateProjectDialog() {
                       <GitHubAuthButton mode="connect" enabled className="rounded-lg" />
                     ) : (
                       <div className="inline-flex items-center gap-2 rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
-                        <Link2 className="h-3.5 w-3.5" />
+                        <AppIcon name="link2" fallback={Link2} className="h-3.5 w-3.5"  />
                         GitHub OAuth not configured
                       </div>
                     )}
@@ -1357,9 +1534,9 @@ export function CreateProjectDialog() {
                       className="shrink-0"
                     >
                       {fetchReposMutation.isPending ? (
-                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-4 w-4 animate-spin"  />
                       ) : (
-                        <GitBranch className="mr-2 h-4 w-4" />
+                        <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                       )}
                       Fetch
                     </Button>
@@ -1384,7 +1561,7 @@ export function CreateProjectDialog() {
                             <span className="font-medium text-foreground">{repo.full_name}</span>
                             {repo.private && <span className="text-[10px] font-medium text-amber-500">Private</span>}
                           </div>
-                          {repoUrl === repo.clone_url && <CheckCircle2 className="h-4 w-4 text-primary" />}
+                          {repoUrl === repo.clone_url && <AppIcon name="check-circle2" fallback={CheckCircle2} className="h-4 w-4 text-primary"  />}
                         </button>
                       ))}
                     </div>
@@ -1417,9 +1594,9 @@ export function CreateProjectDialog() {
                       className="shrink-0"
                     >
                       {fetchBranchesMutation.isPending ? (
-                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <GitBranch className="mr-2 h-4 w-4" />
+                        <AppIcon name="git-branch" fallback={GitBranch} className="mr-2 h-4 w-4"  />
                       )}
                       Branches
                     </Button>
@@ -1446,7 +1623,7 @@ export function CreateProjectDialog() {
                       className={cn(segmentedButtonClass, executionMode === "local" && segmentedButtonActiveClass)}
                       onClick={() => setExecutionMode("local")}
                     >
-                      <HardDrive className="mr-2 h-4 w-4" />
+                      <AppIcon name="hard-drive" fallback={HardDrive} className="mr-2 h-4 w-4"  />
                       Run locally
                     </Button>
                     <Button
@@ -1455,7 +1632,7 @@ export function CreateProjectDialog() {
                       className={cn(segmentedButtonClass, executionMode === "remote_host" && segmentedButtonActiveClass)}
                       onClick={() => setExecutionMode("remote_host")}
                     >
-                      <Server className="mr-2 h-4 w-4" />
+                      <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                       Run on server
                     </Button>
                   </div>
@@ -1485,7 +1662,7 @@ export function CreateProjectDialog() {
                                 ? `${activeSshConnection.name} - ${activeSshConnection.username}@${activeSshConnection.host}${activeSshConnection.connection_type === "ssh" ? `:${activeSshConnection.port}` : ""}`
                                 : "Select a saved connection"}
                             </span>
-                            <ChevronRight className={cn("h-4 w-4 text-muted-foreground transition-transform", showSshConnectionPicker && "rotate-90")} />
+                            <AppIcon name="chevron-right" fallback={ChevronRight} className={cn("h-4 w-4 text-muted-foreground transition-transform", showSshConnectionPicker && "rotate-90")}  />
                           </Button>
                         </div>
                         <div className="self-end">
@@ -1496,9 +1673,9 @@ export function CreateProjectDialog() {
                             disabled={sshConnectionsQuery.isFetching}
                           >
                             {sshConnectionsQuery.isFetching ? (
-                              <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                              <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                             ) : (
-                              <RefreshCw className="mr-2 h-4 w-4" />
+                              <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />
                             )}
                             Refresh
                           </Button>
@@ -1537,7 +1714,7 @@ export function CreateProjectDialog() {
                                       {connection.connection_type === "ssh" ? `:${connection.port}` : ""}
                                     </div>
                                   </div>
-                                  {isActive ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : null}
+                                  {isActive ? <AppIcon name="check-circle2" fallback={CheckCircle2} className="mt-0.5 h-4 w-4 shrink-0 text-primary"  /> : null}
                                 </button>
                               );
                             })
@@ -1573,9 +1750,9 @@ export function CreateProjectDialog() {
                                 disabled={!sshConnectionId || browseSshMutation.isPending}
                               >
                                 {browseSshMutation.isPending ? (
-                                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                                  <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                                 ) : (
-                                  <FolderTree className="mr-2 h-4 w-4" />
+                                  <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                                 )}
                                 Browse
                               </Button>
@@ -1620,10 +1797,10 @@ export function CreateProjectDialog() {
                                       )}
                                     >
                                       <div className="flex items-center gap-2">
-                                        <FolderTree className="h-4 w-4 text-muted-foreground" />
+                                        <AppIcon name="folder-tree" fallback={FolderTree} className="h-4 w-4 text-muted-foreground"  />
                                         <span className="text-foreground">{entry.name}</span>
                                       </div>
-                                      {entry.directory && <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+                                      {entry.directory && <AppIcon name="chevron-right" fallback={ChevronRight} className="h-4 w-4 text-muted-foreground"  />}
                                     </button>
                                   ))}
                                 </div>
@@ -1653,7 +1830,7 @@ export function CreateProjectDialog() {
                                   setShowRemoteTerminal((current) => !current);
                                 }}
                               >
-                                <Terminal className="mr-2 h-4 w-4" />
+                                <AppIcon name="terminal" fallback={Terminal} className="mr-2 h-4 w-4"  />
                                 Terminal
                               </Button>
                             </div>
@@ -1675,47 +1852,144 @@ export function CreateProjectDialog() {
                 <div className="grid gap-4 lg:grid-cols-[minmax(0,0.95fr),minmax(0,1.25fr)]">
                   <div className="space-y-3">
                     <div className="space-y-2">
-                      <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                        Application Catalog
-                      </Label>
+                      <div className="flex items-center justify-between">
+                        <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                          Application Catalog & Docker Hub
+                        </Label>
+                        {isSearchingDockerHub && (
+                          <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                            <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-3 w-3 animate-spin text-primary" />
+                            Searching Docker Hub...
+                          </span>
+                        )}
+                      </div>
                       <Input
                         value={applicationSearch}
                         onChange={(event) => setApplicationSearch(event.target.value)}
-                        placeholder="Search databases, queues, monitoring..."
+                        placeholder="Search templates or any Docker Hub image (e.g. redis, nginx, meilisearch)..."
                         className="bg-muted/40"
                       />
                     </div>
-                    <div className="max-h-[330px] space-y-2 overflow-y-auto pr-1 scrollbar-thin">
-                      {filteredApplicationTemplates.map((template) => {
-                        const isActive = template.id === applicationTemplateId;
-                        return (
-                          <button
-                            key={template.id}
-                            type="button"
-                            onClick={() => handleApplicationTemplateSelect(template)}
-                            className={cn(
-                              "w-full rounded-xl border border-border bg-card p-3 text-left transition-colors hover:bg-accent",
-                              isActive && "border-primary/50 bg-accent"
-                            )}
-                          >
-                            <div className="flex items-start justify-between gap-3">
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-2">
-                                  <Boxes className="h-4 w-4 text-muted-foreground" />
-                                  <span className="font-medium text-foreground">{template.name}</span>
-                                </div>
-                                <p className="mt-1 text-xs text-muted-foreground">{template.description}</p>
-                                <p className="mt-2 truncate font-mono text-[11px] text-muted-foreground">
-                                  {template.image}
-                                </p>
-                              </div>
-                              <span className="shrink-0 rounded-full border border-border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                                {template.category}
+                    <div className="max-h-[360px] space-y-2 overflow-y-auto pr-1 scrollbar-thin">
+                      {applicationSearch.trim().length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => handleCustomImageSelect(applicationSearch.trim())}
+                          className={cn(
+                            "w-full rounded-xl border border-dashed border-primary/40 bg-primary/5 p-3 text-left transition-colors hover:bg-primary/10",
+                            isDockerHubSelected && applicationConfig.image === applicationSearch.trim() && "border-primary bg-primary/15"
+                          )}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <AppIcon name="boxes" fallback={Boxes} className="h-4 w-4 text-primary shrink-0" />
+                              <span className="font-medium text-foreground text-xs truncate">
+                                Pull image tag: <code className="text-primary font-bold">{applicationSearch.trim()}</code>
                               </span>
                             </div>
-                          </button>
-                        );
-                      })}
+                            <span className="shrink-0 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-primary">
+                              Custom Image
+                            </span>
+                          </div>
+                        </button>
+                      )}
+
+                      {filteredApplicationTemplates.length > 0 && (
+                        <div className="space-y-1.5">
+                          {applicationSearch.trim().length > 0 && (
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground px-1 pt-1">
+                              Curated Templates
+                            </p>
+                          )}
+                          {filteredApplicationTemplates.map((template) => {
+                            const isActive = !isDockerHubSelected && template.id === applicationTemplateId;
+                            return (
+                              <button
+                                key={template.id}
+                                type="button"
+                                onClick={() => handleApplicationTemplateSelect(template)}
+                                className={cn(
+                                  "w-full rounded-xl border border-border bg-card p-3 text-left transition-colors hover:bg-accent",
+                                  isActive && "border-primary/50 bg-accent"
+                                )}
+                              >
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-2">
+                                      <AppIcon name="boxes" fallback={Boxes} className="h-4 w-4 text-muted-foreground" />
+                                      <span className="font-medium text-foreground text-sm">{template.name}</span>
+                                    </div>
+                                    <p className="mt-1 text-xs text-muted-foreground">{template.description}</p>
+                                    <p className="mt-1.5 truncate font-mono text-[11px] text-muted-foreground">
+                                      {template.image}
+                                    </p>
+                                  </div>
+                                  <span className="shrink-0 rounded-full border border-border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                                    {template.category}
+                                  </span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {dockerHubResults.length > 0 && (
+                        <div className="space-y-1.5 pt-1">
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-primary px-1 pt-1 flex items-center justify-between">
+                            <span>Docker Hub Registry</span>
+                            <span className="text-[9px] text-muted-foreground lowercase">pulls on-demand</span>
+                          </p>
+                          {dockerHubResults.map((item) => {
+                            const isItemActive =
+                              isDockerHubSelected &&
+                              (selectedDockerHubImage?.name === item.name || applicationConfig.image?.startsWith(item.name));
+                            return (
+                              <button
+                                key={item.name}
+                                type="button"
+                                onClick={() => handleDockerHubSelect(item)}
+                                className={cn(
+                                  "w-full rounded-xl border border-border bg-card p-3 text-left transition-colors hover:bg-accent",
+                                  isItemActive && "border-primary/50 bg-accent"
+                                )}
+                              >
+                                <div className="flex items-start justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                      <AppIcon name="boxes" fallback={Boxes} className="h-4 w-4 text-muted-foreground shrink-0" />
+                                      <span className="font-medium text-foreground text-sm font-mono">{item.name}</span>
+                                      {item.is_official && (
+                                        <span className="rounded-full bg-emerald-500/10 border border-emerald-500/30 px-1.5 py-0.2 text-[9px] font-semibold uppercase tracking-wider text-emerald-400">
+                                          Official
+                                        </span>
+                                      )}
+                                    </div>
+                                    {item.description && (
+                                      <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
+                                        {item.description}
+                                      </p>
+                                    )}
+                                    <div className="mt-1.5 flex items-center gap-3 text-[11px] text-muted-foreground font-mono">
+                                      <span>⭐ {item.star_count.toLocaleString()}</span>
+                                      <span>⬇ {formatPulls(item.pull_count)} pulls</span>
+                                    </div>
+                                  </div>
+                                  <span className="shrink-0 rounded-full border border-border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                                    Docker Hub
+                                  </span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {filteredApplicationTemplates.length === 0 && dockerHubResults.length === 0 && !isSearchingDockerHub && applicationSearch.trim().length > 0 && (
+                        <div className="rounded-xl border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
+                          No matching curated templates found. You can click the "Pull image tag" button above to pull <code className="text-primary">{applicationSearch.trim()}</code> directly from Docker Hub!
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -1788,7 +2062,7 @@ export function CreateProjectDialog() {
                           className={cn(segmentedButtonClass, executionMode === "local" && segmentedButtonActiveClass)}
                           onClick={() => setExecutionMode("local")}
                         >
-                          <HardDrive className="mr-2 h-4 w-4" />
+                          <AppIcon name="hard-drive" fallback={HardDrive} className="mr-2 h-4 w-4"  />
                           Run locally
                         </Button>
                         <Button
@@ -1797,7 +2071,7 @@ export function CreateProjectDialog() {
                           className={cn(segmentedButtonClass, executionMode === "remote_host" && segmentedButtonActiveClass)}
                           onClick={() => setExecutionMode("remote_host")}
                         >
-                          <Server className="mr-2 h-4 w-4" />
+                          <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                           Run on server
                         </Button>
                       </div>
@@ -1822,7 +2096,7 @@ export function CreateProjectDialog() {
                                     ? `${activeSshConnection.name} - ${activeSshConnection.username}@${activeSshConnection.host}${activeSshConnection.connection_type === "ssh" ? `:${activeSshConnection.port}` : ""}`
                                     : "Select a saved connection"}
                                 </span>
-                                <ChevronRight className={cn("h-4 w-4 text-muted-foreground transition-transform", showSshConnectionPicker && "rotate-90")} />
+                                <AppIcon name="chevron-right" fallback={ChevronRight} className={cn("h-4 w-4 text-muted-foreground transition-transform", showSshConnectionPicker && "rotate-90")}  />
                               </Button>
                             </div>
                             <div className="self-end">
@@ -1833,9 +2107,9 @@ export function CreateProjectDialog() {
                                 disabled={sshConnectionsQuery.isFetching}
                               >
                                 {sshConnectionsQuery.isFetching ? (
-                                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                                  <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                                 ) : (
-                                  <RefreshCw className="mr-2 h-4 w-4" />
+                                  <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />
                                 )}
                                 Refresh
                               </Button>
@@ -1874,7 +2148,7 @@ export function CreateProjectDialog() {
                                           {connection.connection_type === "ssh" ? `:${connection.port}` : ""}
                                         </div>
                                       </div>
-                                      {isActive ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : null}
+                                      {isActive ? <AppIcon name="check-circle2" fallback={CheckCircle2} className="mt-0.5 h-4 w-4 shrink-0 text-primary"  /> : null}
                                     </button>
                                   );
                                 })
@@ -1909,9 +2183,9 @@ export function CreateProjectDialog() {
                                   disabled={!sshConnectionId || browseSshMutation.isPending}
                                 >
                                   {browseSshMutation.isPending ? (
-                                    <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                                    <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                                   ) : (
-                                    <FolderTree className="mr-2 h-4 w-4" />
+                                    <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                                   )}
                                   Browse
                                 </Button>
@@ -1940,7 +2214,7 @@ export function CreateProjectDialog() {
                       className={cn(segmentedButtonClass, executionMode === "local" && segmentedButtonActiveClass)}
                       onClick={() => setExecutionMode("local")}
                     >
-                      <HardDrive className="mr-2 h-4 w-4" />
+                      <AppIcon name="hard-drive" fallback={HardDrive} className="mr-2 h-4 w-4"  />
                       Run locally
                     </Button>
                     <Button
@@ -1949,7 +2223,7 @@ export function CreateProjectDialog() {
                       className={cn(segmentedButtonClass, executionMode === "remote_host" && segmentedButtonActiveClass)}
                       onClick={() => setExecutionMode("remote_host")}
                     >
-                      <Server className="mr-2 h-4 w-4" />
+                      <AppIcon name="server" fallback={Server} className="mr-2 h-4 w-4"  />
                       Run on server
                     </Button>
                   </div>
@@ -1978,7 +2252,7 @@ export function CreateProjectDialog() {
                           ? `${activeSshConnection.name} - ${activeSshConnection.username}@${activeSshConnection.host}${activeSshConnection.connection_type === "ssh" ? `:${activeSshConnection.port}` : ""}`
                           : "Select a saved connection"}
                       </span>
-                      <ChevronRight className={cn("h-4 w-4 text-muted-foreground transition-transform", showSshConnectionPicker && "rotate-90")} />
+                      <AppIcon name="chevron-right" fallback={ChevronRight} className={cn("h-4 w-4 text-muted-foreground transition-transform", showSshConnectionPicker && "rotate-90")}  />
                     </Button>
                   </div>
                   <div className="self-end">
@@ -1989,9 +2263,9 @@ export function CreateProjectDialog() {
                       disabled={sshConnectionsQuery.isFetching}
                     >
                       {sshConnectionsQuery.isFetching ? (
-                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <RefreshCw className="mr-2 h-4 w-4" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />
                       )}
                       Refresh
                     </Button>
@@ -2037,7 +2311,7 @@ export function CreateProjectDialog() {
                                 <span className="rounded-full border border-border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                                   {connection.connection_type === "headscale" ? "headscale" : connection.connection_type === "tailscale" ? "tailscale" : connection.auth_type}
                                 </span>
-                                {isActive ? <CheckCircle2 className="mt-0.5 h-4 w-4 text-primary" /> : null}
+                                {isActive ? <AppIcon name="check-circle2" fallback={CheckCircle2} className="mt-0.5 h-4 w-4 text-primary"  /> : null}
                               </div>
                             </button>
                           );
@@ -2078,9 +2352,9 @@ export function CreateProjectDialog() {
                       disabled={!sshConnectionId || browseSshMutation.isPending}
                     >
                       {browseSshMutation.isPending ? (
-                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <FolderTree className="mr-2 h-4 w-4" />
+                        <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                       )}
                       Browse
                     </Button>
@@ -2097,7 +2371,7 @@ export function CreateProjectDialog() {
                             }}
                             disabled={!sshConnectionId}
                           >
-                            <Terminal className="h-4 w-4" />
+                            <AppIcon name="terminal" fallback={Terminal} className="h-4 w-4"  />
                           </Button>
                         }
                       />
@@ -2139,10 +2413,10 @@ export function CreateProjectDialog() {
                             )}
                           >
                             <div className="flex items-center gap-2">
-                              <FolderTree className="h-4 w-4 text-muted-foreground" />
+                              <AppIcon name="folder-tree" fallback={FolderTree} className="h-4 w-4 text-muted-foreground"  />
                               <span className="text-foreground">{entry.name}</span>
                             </div>
-                            {entry.directory && <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+                            {entry.directory && <AppIcon name="chevron-right" fallback={ChevronRight} className="h-4 w-4 text-muted-foreground"  />}
                           </button>
                         ))}
                       </div>
@@ -2165,7 +2439,7 @@ export function CreateProjectDialog() {
                           Interactive shell on the selected SSH/VPS connection. You can run git, install tools, and navigate normally.
                         </p>
                       </div>
-                      <Terminal className="h-5 w-5 text-muted-foreground" />
+                      <AppIcon name="terminal" fallback={Terminal} className="h-5 w-5 text-muted-foreground"  />
                     </div>
                     <RemoteSshTerminal
                       connectionId={sshConnectionId}
@@ -2196,9 +2470,9 @@ export function CreateProjectDialog() {
                       disabled={browseLocalMutation.isPending}
                     >
                       {browseLocalMutation.isPending ? (
-                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                       ) : (
-                        <FolderTree className="mr-2 h-4 w-4" />
+                        <AppIcon name="folder-tree" fallback={FolderTree} className="mr-2 h-4 w-4"  />
                       )}
                       Browse
                     </Button>
@@ -2239,7 +2513,7 @@ export function CreateProjectDialog() {
                             browseLocalMutation.mutate(root.path);
                           }}
                         >
-                          <HardDrive className="mr-2 h-4 w-4" />
+                          <AppIcon name="hard-drive" fallback={HardDrive} className="mr-2 h-4 w-4"  />
                           <span className="truncate">{root.path}</span>
                         </Button>
                       ))}
@@ -2259,10 +2533,10 @@ export function CreateProjectDialog() {
                           )}
                         >
                           <div className="flex min-w-0 items-center gap-2">
-                            <FolderTree className="h-4 w-4 shrink-0 text-muted-foreground" />
+                            <AppIcon name="folder-tree" fallback={FolderTree} className="h-4 w-4 shrink-0 text-muted-foreground"  />
                             <span className="truncate text-foreground">{entry.name}</span>
                           </div>
-                          <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                          <AppIcon name="chevron-right" fallback={ChevronRight} className="h-4 w-4 shrink-0 text-muted-foreground"  />
                         </button>
                       ))}
                     </div>
@@ -2280,6 +2554,33 @@ export function CreateProjectDialog() {
             <ProjectEnvEditor envVars={envVars} onChange={setEnvVars} />
 
             <div className="space-y-4">
+              {organizations.length > 0 && (
+                <div className="space-y-2">
+                  <Label htmlFor="project-org" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Workspace / Organization
+                  </Label>
+                  <Select value={organizationId} onValueChange={(val) => setOrganizationId(val || "")}>
+                    <SelectTrigger id="project-org" className="bg-muted/40">
+                      <SelectValue placeholder="Select workspace" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {organizations
+                        .filter((org) => org.role !== "viewer")
+                        .map((org) => (
+                          <SelectItem key={org.id} value={org.id}>
+                            <span className="flex items-center gap-2">
+                              <span className="font-medium">{org.name}</span>
+                              <span className="text-[11px] text-muted-foreground">
+                                {org.is_personal ? "(Personal Workspace)" : `(${org.role})`}
+                              </span>
+                            </span>
+                          </SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
               <div className="space-y-2">
                 <Label htmlFor="name" className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                   Project Name
@@ -2320,7 +2621,7 @@ export function CreateProjectDialog() {
           <Button type="submit" onClick={handleSubmit} disabled={createMutation.isPending} className="min-w-[140px]">
             {createMutation.isPending ? (
               <>
-                <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4 animate-spin"  />
                 Creating...
               </>
             ) : (
@@ -2334,7 +2635,7 @@ export function CreateProjectDialog() {
       <DialogContent className="!w-[min(90vw,620px)] !max-w-[620px] rounded-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <Info className="h-5 w-5 text-primary" />
+            <AppIcon name="info" fallback={Info} className="h-5 w-5 text-primary"  />
             Project Creation Guide
           </DialogTitle>
           <DialogDescription>

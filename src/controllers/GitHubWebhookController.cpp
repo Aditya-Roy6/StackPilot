@@ -10,14 +10,17 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <iomanip>
 #include <json/json.h>
+#include <mutex>
 #include <openssl/crypto.h>
 #include <openssl/hmac.h>
 #include <pqxx/pqxx>
 #include <sstream>
 #include <spdlog/spdlog.h>
+#include <unordered_map>
 #include <vector>
 
 namespace stackpilot {
@@ -437,6 +440,59 @@ void supersedeOlderEnvironmentCandidates(pqxx::transaction_base& txn,
     }
 }
 
+class WebhookDeliveryTracker {
+public:
+    static WebhookDeliveryTracker& getInstance() {
+        static WebhookDeliveryTracker instance;
+        return instance;
+    }
+
+    bool has(const std::string& deliveryId) {
+        if (deliveryId.empty()) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        return seenDeliveries_.find(deliveryId) != seenDeliveries_.end();
+    }
+
+    void record(const std::string& deliveryId) {
+        if (deliveryId.empty()) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        pruneLocked();
+        seenDeliveries_.emplace(deliveryId, std::chrono::steady_clock::now());
+    }
+
+private:
+    void pruneLocked() {
+        const auto now = std::chrono::steady_clock::now();
+        if (seenDeliveries_.size() < 10000 && now - lastPrune_ < std::chrono::minutes(10)) {
+            return;
+        }
+        lastPrune_ = now;
+        for (auto it = seenDeliveries_.begin(); it != seenDeliveries_.end(); ) {
+            if (now - it->second > std::chrono::hours(24)) {
+                it = seenDeliveries_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (seenDeliveries_.size() > 50000) {
+            std::vector<std::pair<std::chrono::steady_clock::time_point, std::string>> entries;
+            entries.reserve(seenDeliveries_.size());
+            for (const auto& [k, v] : seenDeliveries_) {
+                entries.emplace_back(v, k);
+            }
+            std::sort(entries.begin(), entries.end());
+            const size_t toRemove = seenDeliveries_.size() - 40000;
+            for (size_t i = 0; i < toRemove; ++i) {
+                seenDeliveries_.erase(entries[i].second);
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> seenDeliveries_;
+    std::chrono::steady_clock::time_point lastPrune_ = std::chrono::steady_clock::now();
+};
+
 struct PendingEnqueue {
     std::string deploymentId;
     std::string userId;
@@ -487,13 +543,57 @@ void GitHubWebhookController::handleWebhook(
         }
 
         if (event == "installation" || event == "installation_repositories") {
+            if (!deliveryId.empty() && WebhookDeliveryTracker::getInstance().has(deliveryId)) {
+                spdlog::info("GitHub installation event already processed for delivery {}", deliveryId);
+                txn.commit();
+                callback(drogon::HttpResponse::newHttpJsonResponse(
+                    okPayload("GitHub App installation delivery already processed")
+                ));
+                return;
+            }
             Json::Value body = handleGitHubAppInstallationEvent(txn, payload, event);
             txn.commit();
+            if (!deliveryId.empty()) {
+                WebhookDeliveryTracker::getInstance().record(deliveryId);
+            }
             callback(drogon::HttpResponse::newHttpJsonResponse(body));
             return;
         }
 
         if (event == "pull_request") {
+            if (!deliveryId.empty()) {
+                if (WebhookDeliveryTracker::getInstance().has(deliveryId)) {
+                    spdlog::info("GitHub pull request delivery {} already processed (in-memory)", deliveryId);
+                    txn.commit();
+                    callback(drogon::HttpResponse::newHttpJsonResponse(
+                        okPayload("Pull request delivery already processed")
+                    ));
+                    return;
+                }
+
+                auto existingDeliveries = txn.exec_params(
+                    "SELECT id, project_id FROM deployments WHERE github_delivery_id = $1",
+                    deliveryId
+                );
+                if (!existingDeliveries.empty()) {
+                    spdlog::info("GitHub pull request delivery {} already processed (database)", deliveryId);
+                    WebhookDeliveryTracker::getInstance().record(deliveryId);
+                    txn.commit();
+                    Json::Value body = okPayload("Pull request delivery already processed");
+                    Json::Value previews(Json::arrayValue);
+                    for (const auto& row : existingDeliveries) {
+                        Json::Value item(Json::objectValue);
+                        item["deployment_id"] = row["id"].as<std::string>();
+                        item["project_id"] = row["project_id"].as<std::string>();
+                        item["action"] = "idempotent_skip";
+                        previews.append(item);
+                    }
+                    body["previews"] = previews;
+                    callback(drogon::HttpResponse::newHttpJsonResponse(body));
+                    return;
+                }
+            }
+
             const std::string fullName = repoFullName(payload);
             const PreviewRequest preview = PreviewEnvironments::parseWebhook(payload);
             if (fullName.empty() || preview.prNumber <= 0) {
@@ -537,6 +637,21 @@ void GitHubWebhookController::handleWebhook(
                         projectId, preview.prNumber
                     );
                 } else if (decision.shouldDeploy()) {
+                    if (!deliveryId.empty()) {
+                        auto existingPR = txn.exec_params(
+                            "SELECT id FROM deployments WHERE github_delivery_id = $1 AND project_id = $2",
+                            deliveryId, projectId
+                        );
+                        if (!existingPR.empty()) {
+                            spdlog::info("Skipping duplicate pull request delivery {} for project {}", deliveryId, projectId);
+                            entry["deployment_id"] = existingPR[0]["id"].as<std::string>();
+                            entry["action"] = "idempotent_skip";
+                            entry["reason"] = "Delivery already processed";
+                            handled.append(entry);
+                            continue;
+                        }
+                    }
+
                     // Supersede the previous preview for this PR before inserting
                     // the new one; the partial unique index allows exactly one
                     // live preview per (project, PR).
@@ -589,6 +704,9 @@ void GitHubWebhookController::handleWebhook(
             }
 
             txn.commit();
+            if (!deliveryId.empty()) {
+                WebhookDeliveryTracker::getInstance().record(deliveryId);
+            }
             for (const auto& enqueue : pendingEnqueues) {
                 JobQueueService::getInstance().enqueueDeploymentBuild(
                     enqueue.deploymentId, enqueue.userId, enqueue.message);

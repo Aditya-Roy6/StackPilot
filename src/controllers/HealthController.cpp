@@ -22,10 +22,23 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <set>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h>
+#ifndef W_OK
+#define W_OK 2
+#endif
+#ifndef access
+#define access _access
+#endif
+#else
+#include <unistd.h>
+#endif
 
 namespace stackpilot {
 
@@ -574,15 +587,61 @@ void HealthController::health(
     const drogon::HttpRequestPtr&,
     std::function<void(const drogon::HttpResponsePtr&)>&& callback
 ) {
+    const bool healthy = Database::getInstance().ping();
     Json::Value payload;
-    payload["status"] = Database::getInstance().isConnected() ? "ok" : "degraded";
+    payload["status"] = healthy ? "ok" : "degraded";
     payload["service"] = "stackpilot-backend";
     payload["timestamp"] = trantor::Date::now().toFormattedString(false);
 
     auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
-    resp->setStatusCode(Database::getInstance().isConnected()
+    resp->setStatusCode(healthy
         ? drogon::k200OK
         : drogon::k503ServiceUnavailable);
+    callback(resp);
+}
+
+void HealthController::healthDetailed(
+    const drogon::HttpRequestPtr&,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback
+) {
+    const bool dbPing = Database::getInstance().ping();
+    const bool uploadsWritable = (access("uploads", W_OK) == 0);
+    const bool overallOk = dbPing && uploadsWritable;
+
+    Json::Value payload;
+    payload["status"] = overallOk ? "ok" : "degraded";
+    payload["service"] = "stackpilot-backend";
+    payload["timestamp"] = trantor::Date::now().toFormattedString(false);
+
+    payload["checks"]["database"]["status"] = dbPing ? "ok" : "degraded";
+    payload["checks"]["database"]["connected"] = Database::getInstance().isConnected();
+    payload["checks"]["database"]["ping"] = dbPing;
+
+    payload["checks"]["storage"]["status"] = uploadsWritable ? "ok" : "degraded";
+    payload["checks"]["storage"]["uploads_writable"] = uploadsWritable;
+
+    auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+    resp->setStatusCode(overallOk ? drogon::k200OK : drogon::k503ServiceUnavailable);
+    callback(resp);
+}
+
+void HealthController::healthReady(
+    const drogon::HttpRequestPtr&,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback
+) {
+    const bool dbPing = Database::getInstance().ping();
+    const bool uploadsWritable = (access("uploads", W_OK) == 0);
+    const bool ready = dbPing && uploadsWritable;
+
+    Json::Value payload;
+    payload["status"] = ready ? "ok" : "degraded";
+    payload["service"] = "stackpilot-backend";
+    payload["timestamp"] = trantor::Date::now().toFormattedString(false);
+    payload["database"] = dbPing ? "ok" : "degraded";
+    payload["uploads_writable"] = uploadsWritable;
+
+    auto resp = drogon::HttpResponse::newHttpJsonResponse(payload);
+    resp->setStatusCode(ready ? drogon::k200OK : drogon::k503ServiceUnavailable);
     callback(resp);
 }
 
@@ -599,66 +658,84 @@ void HealthController::metrics(
         return;
     }
 
-    std::ostringstream body;
-    body << "# HELP STACKPILOT_database_connected Database connection health, 1 means connected.\n";
-    body << "# TYPE STACKPILOT_database_connected gauge\n";
-    addMetricLine(body, "STACKPILOT_database_connected", {}, Database::getInstance().isConnected() ? 1 : 0);
+    static std::mutex metricsCacheMutex;
+    static std::chrono::steady_clock::time_point lastMetricsTime;
+    static std::string cachedMetricsBody;
 
-    try {
-        auto conn = Database::getInstance().getConnection();
-        pqxx::work txn(*conn);
+    std::string responseBody;
+    {
+        std::lock_guard<std::mutex> lock(metricsCacheMutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (!cachedMetricsBody.empty() &&
+            std::chrono::duration_cast<std::chrono::seconds>(now - lastMetricsTime).count() < 10) {
+            responseBody = cachedMetricsBody;
+        } else {
+            std::ostringstream body;
+            body << "# HELP STACKPILOT_database_connected Database connection health, 1 means connected.\n";
+            body << "# TYPE STACKPILOT_database_connected gauge\n";
+            addMetricLine(body, "STACKPILOT_database_connected", {}, Database::getInstance().ping() ? 1 : 0);
 
-        body << "# HELP STACKPILOT_projects_total Projects grouped by status.\n";
-        body << "# TYPE STACKPILOT_projects_total gauge\n";
-        for (const auto& row : txn.exec("SELECT COALESCE(status, 'unknown'), COUNT(*) FROM projects GROUP BY 1")) {
-            addMetricLine(body, "STACKPILOT_projects_total", {{"status", row[0].as<std::string>()}}, row[1].as<long long>());
+            try {
+                auto conn = Database::getInstance().getConnection();
+                pqxx::work txn(*conn);
+
+                body << "# HELP STACKPILOT_projects_total Projects grouped by status.\n";
+                body << "# TYPE STACKPILOT_projects_total gauge\n";
+                for (const auto& row : txn.exec("SELECT COALESCE(status, 'unknown'), COUNT(*) FROM projects GROUP BY 1")) {
+                    addMetricLine(body, "STACKPILOT_projects_total", {{"status", row[0].as<std::string>()}}, row[1].as<long long>());
+                }
+
+                body << "# HELP STACKPILOT_deployments_total Deployments grouped by status.\n";
+                body << "# TYPE STACKPILOT_deployments_total gauge\n";
+                for (const auto& row : txn.exec("SELECT COALESCE(status, 'unknown'), COUNT(*) FROM deployments GROUP BY 1")) {
+                    addMetricLine(body, "STACKPILOT_deployments_total", {{"status", row[0].as<std::string>()}}, row[1].as<long long>());
+                }
+
+                body << "# HELP STACKPILOT_deployments_by_runtime_total Deployments grouped by runtime provider.\n";
+                body << "# TYPE STACKPILOT_deployments_by_runtime_total gauge\n";
+                for (const auto& row : txn.exec(
+                         "SELECT COALESCE(NULLIF(runtime_provider, ''), 'docker'), COUNT(*) "
+                         "FROM deployments GROUP BY 1")) {
+                    addMetricLine(body, "STACKPILOT_deployments_by_runtime_total",
+                                  {{"runtime_provider", row[0].as<std::string>()}},
+                                  row[1].as<long long>());
+                }
+
+                body << "# HELP STACKPILOT_running_runtimes_total Deployments currently running.\n";
+                body << "# TYPE STACKPILOT_running_runtimes_total gauge\n";
+                addMetricLine(body, "STACKPILOT_running_runtimes_total", {},
+                              firstCount(txn, "SELECT COUNT(*) FROM deployments WHERE status = 'running'"));
+
+                body << "# HELP STACKPILOT_deployment_jobs_total Deployment jobs grouped by status.\n";
+                body << "# TYPE STACKPILOT_deployment_jobs_total gauge\n";
+                for (const auto& row : txn.exec("SELECT COALESCE(status, 'unknown'), COUNT(*) FROM deployment_jobs GROUP BY 1")) {
+                    addMetricLine(body, "STACKPILOT_deployment_jobs_total", {{"status", row[0].as<std::string>()}}, row[1].as<long long>());
+                }
+
+                body << "# HELP STACKPILOT_deployment_failures_last_24h Failed deployments created in the last 24 hours.\n";
+                body << "# TYPE STACKPILOT_deployment_failures_last_24h gauge\n";
+                addMetricLine(body, "STACKPILOT_deployment_failures_last_24h", {},
+                              firstCount(txn,
+                                         "SELECT COUNT(*) FROM deployments "
+                                         "WHERE status = 'failed' AND created_at > NOW() - INTERVAL '24 hours'"));
+
+                txn.commit();
+            } catch (const std::exception& e) {
+                body << "# HELP STACKPILOT_metrics_collection_error Metrics collection error, 1 means failed.\n";
+                body << "# TYPE STACKPILOT_metrics_collection_error gauge\n";
+                addMetricLine(body, "STACKPILOT_metrics_collection_error", {{"message", e.what()}}, 1);
+            }
+
+            cachedMetricsBody = body.str();
+            lastMetricsTime = std::chrono::steady_clock::now();
+            responseBody = cachedMetricsBody;
         }
-
-        body << "# HELP STACKPILOT_deployments_total Deployments grouped by status.\n";
-        body << "# TYPE STACKPILOT_deployments_total gauge\n";
-        for (const auto& row : txn.exec("SELECT COALESCE(status, 'unknown'), COUNT(*) FROM deployments GROUP BY 1")) {
-            addMetricLine(body, "STACKPILOT_deployments_total", {{"status", row[0].as<std::string>()}}, row[1].as<long long>());
-        }
-
-        body << "# HELP STACKPILOT_deployments_by_runtime_total Deployments grouped by runtime provider.\n";
-        body << "# TYPE STACKPILOT_deployments_by_runtime_total gauge\n";
-        for (const auto& row : txn.exec(
-                 "SELECT COALESCE(NULLIF(runtime_provider, ''), 'docker'), COUNT(*) "
-                 "FROM deployments GROUP BY 1")) {
-            addMetricLine(body, "STACKPILOT_deployments_by_runtime_total",
-                          {{"runtime_provider", row[0].as<std::string>()}},
-                          row[1].as<long long>());
-        }
-
-        body << "# HELP STACKPILOT_running_runtimes_total Deployments currently running.\n";
-        body << "# TYPE STACKPILOT_running_runtimes_total gauge\n";
-        addMetricLine(body, "STACKPILOT_running_runtimes_total", {},
-                      firstCount(txn, "SELECT COUNT(*) FROM deployments WHERE status = 'running'"));
-
-        body << "# HELP STACKPILOT_deployment_jobs_total Deployment jobs grouped by status.\n";
-        body << "# TYPE STACKPILOT_deployment_jobs_total gauge\n";
-        for (const auto& row : txn.exec("SELECT COALESCE(status, 'unknown'), COUNT(*) FROM deployment_jobs GROUP BY 1")) {
-            addMetricLine(body, "STACKPILOT_deployment_jobs_total", {{"status", row[0].as<std::string>()}}, row[1].as<long long>());
-        }
-
-        body << "# HELP STACKPILOT_deployment_failures_last_24h Failed deployments created in the last 24 hours.\n";
-        body << "# TYPE STACKPILOT_deployment_failures_last_24h gauge\n";
-        addMetricLine(body, "STACKPILOT_deployment_failures_last_24h", {},
-                      firstCount(txn,
-                                 "SELECT COUNT(*) FROM deployments "
-                                 "WHERE status = 'failed' AND created_at > NOW() - INTERVAL '24 hours'"));
-
-        txn.commit();
-    } catch (const std::exception& e) {
-        body << "# HELP STACKPILOT_metrics_collection_error Metrics collection error, 1 means failed.\n";
-        body << "# TYPE STACKPILOT_metrics_collection_error gauge\n";
-        addMetricLine(body, "STACKPILOT_metrics_collection_error", {{"message", e.what()}}, 1);
     }
 
     auto resp = drogon::HttpResponse::newHttpResponse();
     resp->setStatusCode(drogon::k200OK);
     resp->addHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
-    resp->setBody(body.str());
+    resp->setBody(responseBody);
     callback(resp);
 }
 

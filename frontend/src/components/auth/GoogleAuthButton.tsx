@@ -5,6 +5,7 @@ import { useMutation } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 import { toast } from "sonner";
 
 import api from "@/lib/api";
@@ -214,7 +215,7 @@ export function GoogleAuthButton({ mode, clientId, className }: GoogleAuthButton
         )}
       >
         <span className="absolute left-4 flex items-center justify-center">
-          {googleAuthPending ? <Loader2 className="h-5 w-5 animate-spin" /> : <GoogleMark />}
+          {googleAuthPending ? <AppIcon name="loader2" fallback={Loader2} className="h-5 w-5 animate-spin"  /> : <GoogleMark />}
         </span>
         <span>{label}</span>
       </Button>

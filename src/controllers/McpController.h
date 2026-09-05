@@ -39,6 +39,10 @@ public:
                      std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                      const std::string& tokenId);
 
+    void deleteToken(const drogon::HttpRequestPtr& req,
+                     std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                     const std::string& tokenId);
+
     void verifyToken(const drogon::HttpRequestPtr& req,
                      std::function<void(const drogon::HttpResponsePtr&)>&& callback);
 

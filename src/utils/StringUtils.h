@@ -118,5 +118,33 @@ inline Json::Value parseJsonObject(const std::string& raw) {
     return parsed;
 }
 
+inline bool isTrustedProxy(const std::string& ipStr) {
+    if (ipStr.empty()) {
+        return false;
+    }
+    if (ipStr == "127.0.0.1" || ipStr == "::1" || ipStr == "localhost") {
+        return true;
+    }
+    std::string ip = ipStr;
+    const std::string v6Prefix = "::ffff:";
+    if (ip.rfind(v6Prefix, 0) == 0) {
+        ip = ip.substr(v6Prefix.size());
+    }
+
+    unsigned int a = 0, b = 0, c = 0, d = 0;
+    char dot1 = 0, dot2 = 0, dot3 = 0;
+    std::istringstream iss(ip);
+    if ((iss >> a >> dot1 >> b >> dot2 >> c >> dot3 >> d) &&
+        dot1 == '.' && dot2 == '.' && dot3 == '.' &&
+        a <= 255 && b <= 255 && c <= 255 && d <= 255 &&
+        iss.eof()) {
+        if (a == 127) return true;
+        if (a == 10) return true;
+        if (a == 172 && b >= 16 && b <= 31) return true;
+        if (a == 192 && b == 168) return true;
+    }
+    return false;
+}
+
 } // namespace strings
 } // namespace stackpilot

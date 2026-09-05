@@ -6,6 +6,7 @@
 #include "../utils/StringUtils.h"
 #include "../db/Database.h"
 #include "../utils/AuditLogger.h"
+#include "../utils/Authz.h"
 #include "../utils/JwtHelper.h"
 #include "../utils/TokenCrypto.h"
 
@@ -39,6 +40,11 @@ Json::Value environmentRowToJson(const pqxx::row& row) {
     env["remote_runtime_type"] = row["remote_runtime_type"].as<std::string>();
     env["remote_k8s_exposure"] = row["remote_k8s_exposure"].as<std::string>();
     env["runtime_scheme"] = row["runtime_scheme"].as<std::string>();
+    try {
+        env["target_cluster_id"] = row["target_cluster_id"].is_null() ? "" : row["target_cluster_id"].as<std::string>();
+    } catch (...) {
+        env["target_cluster_id"] = "";
+    }
     env["current_deployment_id"] = row["current_deployment_id"].is_null() ? "" : row["current_deployment_id"].as<std::string>();
     env["current_deployment_status"] = row["current_deployment_status"].is_null() ? "" : row["current_deployment_status"].as<std::string>();
     env["current_deployment_version"] = row["current_deployment_version"].is_null() ? "" : row["current_deployment_version"].as<std::string>();
@@ -50,8 +56,9 @@ Json::Value environmentRowToJson(const pqxx::row& row) {
 
 bool projectBelongsToUser(pqxx::transaction_base& txn,
                           const std::string& projectId,
-                          const std::string& userId) {
-    auto rows = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2)", projectId, userId);
+                          const std::string& userId,
+                          const std::string& minRole = roles::kViewer) {
+    auto rows = txn.exec_params("SELECT id FROM projects WHERE id = $1 AND has_project_access(id, $2, $3)", projectId, userId, minRole);
     return !rows.empty();
 }
 
@@ -114,20 +121,27 @@ void normalizeRuntimePreferences(std::string& executionMode,
 
 bool remoteConnectionBelongsToUser(pqxx::transaction_base& txn,
                                    const std::string& remoteConnectionId,
-                                   const std::string& userId) {
+                                   const std::string& userId,
+                                   const std::string& orgId,
+                                   bool isPersonal) {
     if (remoteConnectionId.empty()) {
         return true;
     }
+    if (isPersonal || orgId.empty()) {
+        auto rows = txn.exec_params(
+            "SELECT id FROM ssh_connections WHERE id = $1 AND user_id = $2",
+            remoteConnectionId,
+            userId
+        );
+        return !rows.empty();
+    }
     auto rows = txn.exec_params(
-        // Same reasoning as ProjectController: an environment may point at a
-        // connection owned by a teammate, because the deploy path resolves it
-        // without a user gate anyway.
         "SELECT id FROM ssh_connections WHERE id = $1 AND (user_id = $2 OR EXISTS ("
-        "  SELECT 1 FROM organization_members m1 "
-        "  JOIN organization_members m2 ON m2.organization_id = m1.organization_id "
-        "  WHERE m1.user_id = ssh_connections.user_id AND m2.user_id = $2))",
+        "  SELECT 1 FROM organization_members m "
+        "  WHERE m.organization_id = $3::uuid AND m.user_id = ssh_connections.user_id))",
         remoteConnectionId,
-        userId
+        userId,
+        orgId
     );
     return !rows.empty();
 }
@@ -375,6 +389,7 @@ void ProjectEnvironmentController::listEnvironments(
         auto rows = txn.exec_params(
             "SELECT e.id, e.project_id, e.name, e.branch, e.auto_deploy, e.require_ci, e.cleanup_previous_on_success, "
             "e.execution_mode, e.remote_connection_id, e.remote_runtime_type, e.remote_k8s_exposure, e.runtime_scheme, "
+            "e.target_cluster_id, "
             "e.current_deployment_id, d.status AS current_deployment_status, d.version AS current_deployment_version, "
             "d.commit_sha AS current_commit_sha, d.runtime_url AS current_runtime_url, e.updated_at "
             "FROM project_environments e "
@@ -424,9 +439,11 @@ void ProjectEnvironmentController::createEnvironment(
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
         auto projectRows = txn.exec_params(
-            "SELECT p.repo_url, p.github_pat, u.github_access_token "
-            "FROM projects p JOIN users u ON p.user_id = u.id "
-            "WHERE p.id = $1 AND has_project_access(p.id, $2)",
+            "SELECT p.repo_url, p.github_pat, p.organization_id, COALESCE(o.is_personal, false) AS is_personal, u.github_access_token "
+            "FROM projects p "
+            "JOIN users u ON p.user_id = u.id "
+            "LEFT JOIN organizations o ON o.id = p.organization_id "
+            "WHERE p.id = $1 AND has_project_access(p.id, $2, 'member')",
             projectId,
             userId
         );
@@ -437,6 +454,8 @@ void ProjectEnvironmentController::createEnvironment(
             resp->setStatusCode(drogon::k404NotFound);
             callback(resp); return;
         }
+        const std::string orgId = projectRows[0]["organization_id"].is_null() ? "" : projectRows[0]["organization_id"].as<std::string>();
+        const bool isPersonal = projectRows[0]["is_personal"].as<bool>();
         const std::string name = toLower(trim((*body).get("name", "environment").asString()));
         const std::string branch = trim((*body).get("branch", "").asString());
         std::string executionMode = toLower(trim((*body).get("execution_mode", "local").asString()));
@@ -444,11 +463,13 @@ void ProjectEnvironmentController::createEnvironment(
         std::string remoteRuntimeType = toLower(trim((*body).get("remote_runtime_type", "docker").asString()));
         std::string remoteK8sExposure = toLower(trim((*body).get("remote_k8s_exposure", "nodeport").asString()));
         std::string runtimeScheme = toLower(trim((*body).get("runtime_scheme", "http").asString()));
+        const std::string targetClusterId = trim((*body).get("target_cluster_id", "").asString());
         normalizeRuntimePreferences(executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme);
         const auto envVars = parseEnvVars(*body);
         if (name.empty() || branch.empty() || !isSupportedExecutionMode(executionMode) ||
             !isSupportedRuntimeType(remoteRuntimeType) || !isSupportedK8sExposure(remoteK8sExposure) ||
-            !isSupportedRuntimeScheme(runtimeScheme) || !remoteConnectionBelongsToUser(txn, remoteConnectionId, userId)) {
+            !isSupportedRuntimeScheme(runtimeScheme) ||
+            !remoteConnectionBelongsToUser(txn, remoteConnectionId, userId, orgId, isPersonal)) {
             txn.commit();
             Json::Value err; err["error"] = "Invalid environment settings";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -457,9 +478,9 @@ void ProjectEnvironmentController::createEnvironment(
         }
         auto rows = txn.exec_params(
             "INSERT INTO project_environments "
-            "(project_id, name, branch, auto_deploy, require_ci, cleanup_previous_on_success, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme) "
-            "VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')::uuid, $9, $10, $11) "
-            "RETURNING id, project_id, name, branch, auto_deploy, require_ci, cleanup_previous_on_success, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, current_deployment_id, NULL::text AS current_deployment_status, NULL::text AS current_deployment_version, NULL::text AS current_commit_sha, NULL::text AS current_runtime_url, updated_at",
+            "(project_id, name, branch, auto_deploy, require_ci, cleanup_previous_on_success, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, target_cluster_id) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, '')::uuid, $9, $10, $11, NULLIF($12, '')::uuid) "
+            "RETURNING id, project_id, name, branch, auto_deploy, require_ci, cleanup_previous_on_success, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, target_cluster_id, current_deployment_id, NULL::text AS current_deployment_status, NULL::text AS current_deployment_version, NULL::text AS current_commit_sha, NULL::text AS current_runtime_url, updated_at",
             projectId,
             name,
             branch,
@@ -470,7 +491,8 @@ void ProjectEnvironmentController::createEnvironment(
             remoteConnectionId,
             remoteRuntimeType,
             remoteK8sExposure,
-            runtimeScheme
+            runtimeScheme,
+            targetClusterId
         );
         const std::string repoUrl = projectRows[0]["repo_url"].is_null() ? "" : projectRows[0]["repo_url"].as<std::string>();
         const std::string projectToken = projectRows[0]["github_pat"].is_null() ? "" : TokenCrypto::decrypt(projectRows[0]["github_pat"].as<std::string>());
@@ -521,9 +543,11 @@ void ProjectEnvironmentController::updateEnvironment(
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
         auto projectRows = txn.exec_params(
-            "SELECT p.repo_url, p.github_pat, u.github_access_token "
-            "FROM projects p JOIN users u ON p.user_id = u.id "
-            "WHERE p.id = $1 AND has_project_access(p.id, $2)",
+            "SELECT p.repo_url, p.github_pat, p.organization_id, COALESCE(o.is_personal, false) AS is_personal, u.github_access_token "
+            "FROM projects p "
+            "JOIN users u ON p.user_id = u.id "
+            "LEFT JOIN organizations o ON o.id = p.organization_id "
+            "WHERE p.id = $1 AND has_project_access(p.id, $2, 'member')",
             projectId,
             userId
         );
@@ -534,14 +558,17 @@ void ProjectEnvironmentController::updateEnvironment(
             resp->setStatusCode(drogon::k404NotFound);
             callback(resp); return;
         }
+        const std::string orgId = projectRows[0]["organization_id"].is_null() ? "" : projectRows[0]["organization_id"].as<std::string>();
+        const bool isPersonal = projectRows[0]["is_personal"].as<bool>();
         const bool hasAutoDeploy = (*body).isMember("auto_deploy");
         const bool hasRequireCi = (*body).isMember("require_ci");
         const bool hasCleanupPrevious = (*body).isMember("cleanup_previous_on_success");
         const bool hasRemoteConnection = (*body).isMember("remote_connection_id");
+        const bool hasTargetCluster = (*body).isMember("target_cluster_id");
         const bool hasEnvVars = (*body).isMember("env_vars");
         const auto envVars = parseEnvVars(*body);
         auto currentEnvRows = txn.exec_params(
-            "SELECT execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme "
+            "SELECT execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, target_cluster_id "
             "FROM project_environments WHERE id = $1 AND project_id = $2",
             environmentId,
             projectId
@@ -569,13 +596,16 @@ void ProjectEnvironmentController::updateEnvironment(
         std::string runtimeScheme = (*body).isMember("runtime_scheme")
             ? toLower(trim((*body).get("runtime_scheme", "").asString()))
             : currentEnvRows[0]["runtime_scheme"].as<std::string>();
+        std::string targetClusterId = hasTargetCluster
+            ? trim((*body).get("target_cluster_id", "").asString())
+            : (currentEnvRows[0]["target_cluster_id"].is_null() ? "" : currentEnvRows[0]["target_cluster_id"].as<std::string>());
         normalizeRuntimePreferences(executionMode, remoteConnectionId, remoteRuntimeType, remoteK8sExposure, runtimeScheme);
 
         if (!isSupportedExecutionMode(executionMode) ||
             !isSupportedRuntimeType(remoteRuntimeType) ||
             !isSupportedK8sExposure(remoteK8sExposure) ||
             !isSupportedRuntimeScheme(runtimeScheme) ||
-            !remoteConnectionBelongsToUser(txn, remoteConnectionId, userId)) {
+            !remoteConnectionBelongsToUser(txn, remoteConnectionId, userId, orgId, isPersonal)) {
             txn.commit();
             Json::Value err; err["error"] = "Invalid environment settings";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
@@ -593,9 +623,11 @@ void ProjectEnvironmentController::updateEnvironment(
             "remote_connection_id = NULLIF($10, '')::uuid, "
             "remote_runtime_type = $11, "
             "remote_k8s_exposure = $12, "
-            "runtime_scheme = $13, updated_at = NOW() "
+            "runtime_scheme = $13, "
+            "target_cluster_id = CASE WHEN $16 THEN NULLIF($17, '')::uuid ELSE target_cluster_id END, "
+            "updated_at = NOW() "
             "WHERE id = $14 AND project_id = $15 "
-            "RETURNING id, project_id, name, branch, auto_deploy, require_ci, cleanup_previous_on_success, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, current_deployment_id, NULL::text AS current_deployment_status, NULL::text AS current_deployment_version, NULL::text AS current_commit_sha, NULL::text AS current_runtime_url, updated_at",
+            "RETURNING id, project_id, name, branch, auto_deploy, require_ci, cleanup_previous_on_success, execution_mode, remote_connection_id, remote_runtime_type, remote_k8s_exposure, runtime_scheme, target_cluster_id, current_deployment_id, NULL::text AS current_deployment_status, NULL::text AS current_deployment_version, NULL::text AS current_commit_sha, NULL::text AS current_runtime_url, updated_at",
             (*body).get("name", "").asString(),
             (*body).get("branch", "").asString(),
             hasAutoDeploy,
@@ -610,7 +642,9 @@ void ProjectEnvironmentController::updateEnvironment(
             remoteK8sExposure,
             runtimeScheme,
             environmentId,
-            projectId
+            projectId,
+            hasTargetCluster,
+            targetClusterId
         );
         const std::string repoUrl = projectRows[0]["repo_url"].is_null() ? "" : projectRows[0]["repo_url"].as<std::string>();
         const std::string projectToken = projectRows[0]["github_pat"].is_null() ? "" : TokenCrypto::decrypt(projectRows[0]["github_pat"].as<std::string>());
@@ -624,6 +658,7 @@ void ProjectEnvironmentController::updateEnvironment(
         auto refreshedRows = txn.exec_params(
             "SELECT e.id, e.project_id, e.name, e.branch, e.auto_deploy, e.require_ci, e.cleanup_previous_on_success, "
             "e.execution_mode, e.remote_connection_id, e.remote_runtime_type, e.remote_k8s_exposure, e.runtime_scheme, "
+            "e.target_cluster_id, "
             "e.current_deployment_id, d.status AS current_deployment_status, d.version AS current_deployment_version, "
             "d.commit_sha AS current_commit_sha, d.runtime_url AS current_runtime_url, e.updated_at "
             "FROM project_environments e "
@@ -672,7 +707,7 @@ void ProjectEnvironmentController::deleteEnvironment(
     try {
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
-        if (!projectBelongsToUser(txn, projectId, userId)) {
+        if (!projectBelongsToUser(txn, projectId, userId, roles::kAdmin)) {
             txn.commit();
             Json::Value err; err["error"] = "Project not found";
             auto resp = drogon::HttpResponse::newHttpJsonResponse(err);

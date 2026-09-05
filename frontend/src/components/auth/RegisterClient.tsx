@@ -15,6 +15,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { GoogleAuthButton } from "@/components/auth/GoogleAuthButton";
 import { GitHubAuthButton } from "@/components/auth/GitHubAuthButton";
 import { Eye, EyeOff } from "lucide-react";
+import { AppIcon } from "@/lib/custom-icons";
 
 export function RegisterClient({
   googleClientId,
@@ -141,7 +142,7 @@ export function RegisterClient({
                 disabled={registerMutation.isPending}
                 aria-label={showPassword ? "Hide password" : "Show password"}
               >
-                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                {showPassword ? <AppIcon name="eye-off" fallback={EyeOff} className="h-4 w-4"  /> : <AppIcon name="eye" fallback={Eye} className="h-4 w-4"  />}
               </button>
             </div>
           </div>

@@ -203,6 +203,11 @@ std::string JwtHelper::extractTokenFromRequest(const drogon::HttpRequestPtr& req
         return authHeader.substr(7);
     }
 
+    const std::string queryToken = req->getParameter("token");
+    if (!queryToken.empty()) {
+        return queryToken;
+    }
+
     const std::string cookieValue = req->getCookie("token");
     if (cookieValue.empty()) {
         const std::string cookieHeader = req->getHeader("cookie");

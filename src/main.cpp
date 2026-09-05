@@ -218,13 +218,16 @@ bool hasAuthCookie(const drogon::HttpRequestPtr& req) {
 }
 
 bool hasCsrfHeader(const drogon::HttpRequestPtr& req) {
-    const std::string header = req->getHeader("X-stackpilot-CSRF");
-    const std::string mcpHeader = req->getHeader("X-stackpilot-MCP");
+    std::string header = req->getHeader("x-stackpilot-csrf");
+    if (header.empty()) header = req->getHeader("X-stackpilot-CSRF");
+    std::string mcpHeader = req->getHeader("x-stackpilot-mcp");
+    if (mcpHeader.empty()) mcpHeader = req->getHeader("X-stackpilot-MCP");
     return header == "1" || header == "true" || mcpHeader == "1" || mcpHeader == "true";
 }
 
 bool isTrustedWebhookPath(const drogon::HttpRequestPtr& req) {
-    return req->path() == "/api/v1/github/webhooks";
+    return req->path() == "/api/v1/github/webhooks" ||
+           req->path() == "/api/v1/ai/tools/execute";
 }
 
 bool isTrustedBrowserOrigin(const drogon::HttpRequestPtr& req,
@@ -247,7 +250,11 @@ bool isTrustedBrowserOrigin(const drogon::HttpRequestPtr& req,
 }
 
 std::string clientIp(const drogon::HttpRequestPtr& req, bool trustProxyHeaders) {
-    if (trustProxyHeaders) {
+    if (!req) {
+        return "unknown";
+    }
+    const std::string peerIp = req->peerAddr().toIp();
+    if (trustProxyHeaders && stackpilot::strings::isTrustedProxy(peerIp)) {
         const std::string forwardedFor = req->getHeader("X-Forwarded-For");
         if (!forwardedFor.empty()) {
             const auto comma = forwardedFor.find(',');
@@ -258,7 +265,7 @@ std::string clientIp(const drogon::HttpRequestPtr& req, bool trustProxyHeaders) 
             return trim(realIp);
         }
     }
-    return req->peerAddr().toIp();
+    return peerIp;
 }
 
 struct WindowCounter {
@@ -266,15 +273,52 @@ struct WindowCounter {
     int count = 0;
 };
 
+constexpr size_t kMaxRateLimitEntries = 50000;
 std::mutex rateLimitMutex;
 std::unordered_map<std::string, WindowCounter> rateLimitCounters;
+
+void pruneRateLimitCountersLocked(const std::chrono::steady_clock::time_point& now) {
+    if (rateLimitCounters.size() < kMaxRateLimitEntries) {
+        return;
+    }
+    for (auto it = rateLimitCounters.begin(); it != rateLimitCounters.end(); ) {
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - it->second.windowStart).count() >= 60) {
+            it = rateLimitCounters.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (rateLimitCounters.size() >= kMaxRateLimitEntries) {
+        std::vector<std::pair<std::chrono::steady_clock::time_point, std::string>> entries;
+        entries.reserve(rateLimitCounters.size());
+        for (const auto& [k, v] : rateLimitCounters) {
+            entries.emplace_back(v.windowStart, k);
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+        const size_t toRemove = rateLimitCounters.size() - 40000;
+        for (size_t i = 0; i < toRemove && i < entries.size(); ++i) {
+            rateLimitCounters.erase(entries[i].second);
+        }
+    }
+}
 
 bool isApiRateLimited(const std::string& key, int limitPerMinute, int& retryAfterSeconds) {
     if (limitPerMinute <= 0) return false;
 
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(rateLimitMutex);
-    auto& counter = rateLimitCounters[key];
+
+    auto it = rateLimitCounters.find(key);
+    if (it == rateLimitCounters.end()) {
+        if (rateLimitCounters.size() >= kMaxRateLimitEntries) {
+            pruneRateLimitCountersLocked(now);
+        }
+        it = rateLimitCounters.emplace(key, WindowCounter{now, 0}).first;
+    }
+
+    auto& counter = it->second;
     if (counter.count == 0 ||
         std::chrono::duration_cast<std::chrono::seconds>(now - counter.windowStart).count() >= 60) {
         counter.windowStart = now;
@@ -447,6 +491,7 @@ int main() {
 
     // Load config from file
     app.loadConfigFile("config.json");
+    app.setIdleConnectionTimeout(300);
 
     // ─── CORS Configuration ─────────────────────────────────────
     // 1. Intercept OPTIONS preflight BEFORE Drogon's router touches it

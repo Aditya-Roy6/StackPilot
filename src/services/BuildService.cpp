@@ -15,7 +15,9 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <unordered_set>
+#include <signal.h>
 
 namespace stackpilot {
 
@@ -129,6 +131,16 @@ bool shouldIncludeExcerpt(const std::filesystem::path& relativePath) {
     return ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".tsx";
 }
 
+bool hasCommonCodeExtension(const std::filesystem::path& path) {
+    const std::string ext = toLower(path.extension().string());
+    if (ext == ".env" || ext == ".lock" || ext == ".json" || ext == ".yml" || ext == ".yaml" ||
+        ext == ".toml" || ext == ".ini" || ext == ".conf" || ext == ".config" || ext == ".md" ||
+        ext == ".rst" || ext == ".txt") {
+        return false;
+    }
+    return ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".tsx";
+}
+
 bool isSafeTarEntryName(const std::string& rawName) {
     std::string name = rawName;
     while (!name.empty() && (name.back() == '\r' || name.back() == '\n')) {
@@ -137,6 +149,15 @@ bool isSafeTarEntryName(const std::string& rawName) {
     if (name.empty() || name.front() == '/' || name.find('\\') != std::string::npos ||
         name.find('\0') != std::string::npos) {
         return false;
+    }
+    while (name.rfind("./", 0) == 0) {
+        name.erase(0, 2);
+    }
+    while (!name.empty() && name.back() == '/') {
+        name.pop_back();
+    }
+    if (name.empty() || name == ".") {
+        return true;
     }
     std::stringstream stream(name);
     std::string part;
@@ -240,11 +261,24 @@ rewrite_conflicting_application_ports() {
   fi
   return "$changed"
 }
+sed -i -E 's/^([[:space:]]*)container_name:/\1# [stackpilot-isolated] container_name:/g' )sh" + composeFileArg + R"sh( 2>/dev/null || true
 compose_up_exit=0
 compose_up_output=$($compose_cmd -f )sh" + composeFileArg + " -p " + projectArg + R"sh( up -d --build --remove-orphans 2>&1) || compose_up_exit=$?
 printf '%s\n' "$compose_up_output"
 if [ "$compose_up_exit" -ne 0 ]; then
-  if printf '%s\n' "$compose_up_output" | grep -Eqi 'address already in use|ports are not available|only one usage of each socket address|bind:'; then
+  if printf '%s\n' "$compose_up_output" | grep -Eqi 'Conflict\. The container name|is already in use by container'; then
+    echo "Resolving container name conflicts and re-isolating stack..."
+    conflicting_ids=$(printf '%s\n' "$compose_up_output" | grep -oE 'in use by container "[a-f0-9]+"' | awk -F'"' '{print $2}' || true)
+    for cid in $conflicting_ids; do
+      [ -n "$cid" ] && docker rm -f "$cid" 2>/dev/null || true
+    done
+    conflicting_names=$(printf '%s\n' "$compose_up_output" | grep -oE 'The container name "/[^"]+"' | awk -F'"' '{print $2}' | tr -d '/' || true)
+    for cname in $conflicting_names; do
+      [ -n "$cname" ] && docker rm -f "$cname" 2>/dev/null || true
+    done
+    sed -i -E 's/^([[:space:]]*)container_name:/\1# [stackpilot-isolated] container_name:/g' )sh" + composeFileArg + R"sh( 2>/dev/null || true
+    $compose_cmd -f )sh" + composeFileArg + " -p " + projectArg + R"sh( up -d --build --remove-orphans
+  elif printf '%s\n' "$compose_up_output" | grep -Eqi 'address already in use|ports are not available|only one usage of each socket address|bind:|port is already allocated'; then
     rewrite_conflicting_application_ports || true
     if grep -Eq 'STACKPILOT_HTTP_PORT|STACKPILOT_HTTPS_PORT' )sh" + composeFileArg + R"sh( 2>/dev/null; then
       old_http_port=$(read_env_value STACKPILOT_HTTP_PORT)
@@ -257,6 +291,17 @@ if [ "$compose_up_exit" -ne 0 ]; then
       echo "__STACKPILOT_PORT_ADJUSTED__=STACKPILOT_HTTPS_PORT:${old_https_port:-443}:${https_port}"
       echo "Host port conflict detected; retrying Compose with STACKPILOT_HTTP_PORT=$http_port and STACKPILOT_HTTPS_PORT=$https_port"
     fi
+    conflicting_ports=$(printf '%s\n' "$compose_up_output" | grep -oE 'Bind for [^:]+:([0-9]+) failed' | awk -F':' '{print $2}' | awk '{print $1}' || true)
+    if [ -z "$conflicting_ports" ]; then
+      conflicting_ports=$(printf '%s\n' "$compose_up_output" | grep -oE 'listen tcp4 [^:]+:([0-9]+): bind:' | awk -F':' '{print $2}' || true)
+    fi
+    for p in $conflicting_ports; do
+      if [ -n "$p" ]; then
+        np=$(choose_port $((p + 1)) 8082 8083 8084 8085 8088 8092 18080 18088 19000 13000 3002)
+        sed -i -E "s/([\"']?)${p}:([0-9]+)([\"']?)/\1${np}:\2\3/g" )sh" + composeFileArg + R"sh( 2>/dev/null || true
+        echo "Port conflict resolved: remapped host port $p -> $np in compose file"
+      fi
+    done
     $compose_cmd -f )sh" + composeFileArg + " -p " + projectArg + R"sh( up -d --build --remove-orphans
   else
     exit "$compose_up_exit"
@@ -579,6 +624,43 @@ bool isExcludedLocalSourceName(const std::string& name) {
 
 } // namespace
 
+std::mutex BuildService::buildPidsMutex_;
+std::unordered_map<std::string, pid_t> BuildService::activeBuildPids_;
+std::unordered_set<std::string> BuildService::canceledBuilds_;
+
+BuildService& BuildService::getInstance() {
+    static BuildService instance;
+    return instance;
+}
+
+bool BuildService::cancelBuild(const std::string& deploymentId) {
+    if (deploymentId.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(buildPidsMutex_);
+    canceledBuilds_.insert(deploymentId);
+    auto it = activeBuildPids_.find(deploymentId);
+    if (it != activeBuildPids_.end()) {
+        pid_t pid = it->second;
+        if (pid > 0) {
+            kill(-pid, SIGTERM);
+            kill(pid, SIGTERM);
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+        }
+        return true;
+    }
+    return true;
+}
+
+bool BuildService::isBuildCanceled(const std::string& deploymentId) const {
+    if (deploymentId.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(buildPidsMutex_);
+    return canceledBuilds_.find(deploymentId) != canceledBuilds_.end();
+}
+
 BuildService::BuildService()
     : workspaceRoot_("uploads/builds"),
       maxLogBytes_(200000),
@@ -704,14 +786,21 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
             " GIT_TERMINAL_PROMPT=0 ";
     }
 
+    {
+        std::lock_guard<std::mutex> lock(buildPidsMutex_);
+        canceledBuilds_.erase(deploymentId);
+    }
+
     const std::string branchArg = branch.empty() ? "" : (" --branch " + shellQuote(branch));
+    const std::string gitCloneFlags =
+        "git -c credential.helper= -c http.version=HTTP/1.1 -c http.postBuffer=524288000 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 -c core.compression=0 clone --depth 1 --progress";
     const std::string cloneCmd =
         credentialPrefix +
         "GIT_TERMINAL_PROMPT=0 " +
-        "git -c credential.helper= clone --depth 1" + branchArg + " " +
+        gitCloneFlags + branchArg + " " +
         shellQuote(repoUrl) + " " + shellQuote(sourceDir.string());
-    int cloneExit = runCommandCapture(cloneCmd, logFile, true, cloneTimeoutSeconds_, onLogLine);
-    if (cloneExit != 0 && !githubPat.empty() && isGitHubHttps && looksLikeGitHubAuthFailure(readFileBounded(logFile))) {
+    int cloneExit = runCommandCapture(cloneCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
+    if (cloneExit != 0 && !githubPat.empty() && isGitHubHttps && looksLikeGitHubAuthFailure(readFileBounded(logFile)) && !isBuildCanceled(deploymentId)) {
         appendLogLine(
             logFile,
             "Authenticated GitHub clone was rejected. Retrying once without credentials in case the repository is public.",
@@ -720,9 +809,9 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
         std::error_code cleanupEc;
         std::filesystem::remove_all(sourceDir, cleanupEc);
         const std::string publicCloneCmd =
-            "GIT_TERMINAL_PROMPT=0 git -c credential.helper= clone --depth 1" + branchArg + " " +
+            "GIT_TERMINAL_PROMPT=0 " + gitCloneFlags + branchArg + " " +
             shellQuote(repoUrl) + " " + shellQuote(sourceDir.string());
-        cloneExit = runCommandCapture(publicCloneCmd, logFile, true, cloneTimeoutSeconds_, onLogLine);
+        cloneExit = runCommandCapture(publicCloneCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
     }
     if (cloneExit != 0) {
         if (!askPassPath.empty()) {
@@ -730,9 +819,9 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
             std::filesystem::remove(askPassPath, cleanupEc);
             std::filesystem::remove(tokenPath, cleanupEc);
         }
-        result.error = "git clone failed";
+        result.error = isBuildCanceled(deploymentId) ? "Deployment was canceled by user" : "git clone failed";
         appendLogLine(logFile,
-                      "git clone failed with exit code " + std::to_string(cloneExit),
+                      isBuildCanceled(deploymentId) ? "Build was canceled by user" : ("git clone failed with exit code " + std::to_string(cloneExit)),
                       onLogLine);
         if (cloneExit == 124) {
             appendLogLine(logFile,
@@ -752,24 +841,58 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
         return result;
     }
 
+    if (isBuildCanceled(deploymentId)) {
+        if (!askPassPath.empty()) {
+            std::error_code cleanupEc;
+            std::filesystem::remove(askPassPath, cleanupEc);
+            std::filesystem::remove(tokenPath, cleanupEc);
+        }
+        result.error = "Deployment was canceled by user";
+        appendLogLine(logFile, result.error, onLogLine);
+        result.logs = readFileBounded(logFile);
+        return result;
+    }
+
     if (!checkoutCommit.empty()) {
         appendLogLine(logFile, "Checking out commit " + checkoutCommit, onLogLine);
         std::string checkoutCmd =
             "GIT_TERMINAL_PROMPT=0 git -C " + shellQuote(sourceDir.string()) +
             " checkout --detach " + shellQuote(checkoutCommit);
-        int checkoutExit = runCommandCapture(checkoutCmd, logFile, true, cloneTimeoutSeconds_, onLogLine);
-        if (checkoutExit != 0) {
-            appendLogLine(logFile, "Commit was not present in the shallow clone. Fetching exact commit.", onLogLine);
+        int checkoutExit = runCommandCapture(checkoutCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
+        if (checkoutExit != 0 && !isBuildCanceled(deploymentId)) {
+            appendLogLine(logFile, "Commit was not present in the shallow clone. Fetching from origin.", onLogLine);
             const std::string fetchPrefix =
                 (!githubPat.empty() && isGitHubHttps && !askPassPath.empty())
                     ? ("GIT_ASKPASS=" + shellQuote(askPassPath.string()) + " GIT_TERMINAL_PROMPT=0 ")
                     : "GIT_TERMINAL_PROMPT=0 ";
-            const std::string fetchCmd =
-                fetchPrefix + "git -C " + shellQuote(sourceDir.string()) +
-                " fetch --depth 1 origin " + shellQuote(checkoutCommit);
-            const int fetchExit = runCommandCapture(fetchCmd, logFile, true, cloneTimeoutSeconds_, onLogLine);
+
+            std::string fetchCmd;
+            if (checkoutCommit.length() < 40) {
+                // Short commit SHA (< 40 chars): Git wire protocol rejects `git fetch origin <shortSha>`.
+                // Fetch the branch or remote HEAD with depth 50 to resolve the short commit locally.
+                if (!branch.empty()) {
+                    fetchCmd = fetchPrefix + "git -C " + shellQuote(sourceDir.string()) +
+                               " fetch --depth 50 origin " + shellQuote(branch);
+                } else {
+                    fetchCmd = fetchPrefix + "git -C " + shellQuote(sourceDir.string()) +
+                               " fetch --depth 50 origin";
+                }
+            } else {
+                fetchCmd = fetchPrefix + "git -C " + shellQuote(sourceDir.string()) +
+                           " fetch --depth 1 origin " + shellQuote(checkoutCommit);
+            }
+
+            const int fetchExit = runCommandCapture(fetchCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
             if (fetchExit == 0) {
-                checkoutExit = runCommandCapture(checkoutCmd, logFile, true, cloneTimeoutSeconds_, onLogLine);
+                checkoutExit = runCommandCapture(checkoutCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
+            } else if (checkoutCommit.length() >= 40 && !branch.empty() && !isBuildCanceled(deploymentId)) {
+                // Fallback: if fetching exact SHA was disallowed by remote, fetch branch with depth 50
+                const std::string fallbackFetchCmd = fetchPrefix + "git -C " + shellQuote(sourceDir.string()) +
+                                                     " fetch --depth 50 origin " + shellQuote(branch);
+                const int fallbackFetchExit = runCommandCapture(fallbackFetchCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
+                if (fallbackFetchExit == 0) {
+                    checkoutExit = runCommandCapture(checkoutCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
+                }
             }
         }
         if (checkoutExit != 0) {
@@ -778,8 +901,8 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
                 std::filesystem::remove(askPassPath, cleanupEc);
                 std::filesystem::remove(tokenPath, cleanupEc);
             }
-            result.error = "git checkout failed";
-            appendLogLine(logFile, "Unable to checkout requested commit " + checkoutCommit, onLogLine);
+            result.error = isBuildCanceled(deploymentId) ? "Deployment was canceled by user" : "git checkout failed";
+            appendLogLine(logFile, isBuildCanceled(deploymentId) ? "Build was canceled by user" : ("Unable to checkout requested commit " + checkoutCommit), onLogLine);
             result.logs = readFileBounded(logFile);
             return result;
         }
@@ -788,6 +911,13 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
         std::error_code cleanupEc;
         std::filesystem::remove(askPassPath, cleanupEc);
         std::filesystem::remove(tokenPath, cleanupEc);
+    }
+
+    if (isBuildCanceled(deploymentId)) {
+        result.error = "Deployment was canceled by user";
+        appendLogLine(logFile, result.error, onLogLine);
+        result.logs = readFileBounded(logFile);
+        return result;
     }
 
     return buildFromPreparedSource(deploymentId, sourceDir, logFile, version, envVars, onLogLine);
@@ -902,6 +1032,11 @@ BuildResult BuildService::buildFromArtifact(const std::string& deploymentId,
     BuildResult result;
     namespace fs = std::filesystem;
 
+    {
+        std::lock_guard<std::mutex> lock(buildPidsMutex_);
+        canceledBuilds_.erase(deploymentId);
+    }
+
     std::error_code ec;
     const fs::path archive = fs::weakly_canonical(artifactPath, ec);
     if (ec || !fs::exists(archive, ec) || !fs::is_regular_file(archive, ec)) {
@@ -946,9 +1081,18 @@ BuildResult BuildService::buildFromArtifact(const std::string& deploymentId,
     const std::string extractCommand =
         "tar --no-same-owner --no-same-permissions --delay-directory-restore -xf " +
         shellQuote(archive.string()) + " -C " + shellQuote(sourceDir.string());
-    const int extractExit = runCommandCapture(extractCommand, logFile, true, cloneTimeoutSeconds_, onLogLine);
+    const int extractExit = runCommandCapture(extractCommand, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
     if (extractExit != 0) {
-        result.error = extractExit == 124 ? "Source artifact extraction timed out" : "Source artifact extraction failed";
+        result.error = isBuildCanceled(deploymentId)
+            ? "Deployment was canceled by user"
+            : (extractExit == 124 ? "Source artifact extraction timed out" : "Source artifact extraction failed");
+        appendLogLine(logFile, result.error, onLogLine);
+        result.logs = readFileBounded(logFile);
+        return result;
+    }
+
+    if (isBuildCanceled(deploymentId)) {
+        result.error = "Deployment was canceled by user";
         appendLogLine(logFile, result.error, onLogLine);
         result.logs = readFileBounded(logFile);
         return result;
@@ -1032,6 +1176,7 @@ BuildResult BuildService::buildAndRunOnRemoteDocker(const std::string& deploymen
         projectSlug = "project";
     }
     const std::string containerName = "stackpilot-" + projectSlug + "-" + sanitizeName(deploymentId).substr(0, 8);
+    result.remoteContainerName = containerName;
 
     std::vector<std::pair<std::string, std::string>> sshEnvVars;
     for (const auto& envVar : envVars) {
@@ -1116,6 +1261,19 @@ BuildResult BuildService::buildArtifactAndRunOnRemoteDocker(const std::string& d
                                                             const std::vector<BuildEnvVar>& envVars,
                                                             LogCallback onLogLine) const {
     BuildResult result;
+    std::string projectSlug = sanitizeName(projectName);
+    if (projectSlug.size() > 32) {
+        projectSlug.resize(32);
+        while (!projectSlug.empty() && projectSlug.back() == '-') {
+            projectSlug.pop_back();
+        }
+    }
+    if (projectSlug.empty()) {
+        projectSlug = "project";
+    }
+    const std::string containerName = "stackpilot-" + projectSlug + "-" + sanitizeName(deploymentId).substr(0, 8);
+    result.remoteContainerName = containerName;
+
     namespace fs = std::filesystem;
 
     std::error_code ec;
@@ -1239,9 +1397,11 @@ BuildResult BuildService::buildGeneratedSourceAndRunOnRemoteDocker(const std::st
     const std::string tarCommand =
         "tar --format=ustar --no-xattrs --no-acls -cf " + shellQuote(archive.string()) +
         " -C " + shellQuote(generatedSource.string()) + " .";
-    const int tarExit = runCommandCapture(tarCommand, logFile, true, std::max(60, cloneTimeoutSeconds_), onLogLine);
+    const int tarExit = runCommandCapture(tarCommand, logFile, true, std::max(60, cloneTimeoutSeconds_), onLogLine, deploymentId);
     if (tarExit != 0) {
-        result.error = tarExit == 124 ? "Generated application packaging timed out" : "Generated application packaging failed";
+        result.error = isBuildCanceled(deploymentId)
+            ? "Deployment was canceled by user"
+            : (tarExit == 124 ? "Generated application packaging timed out" : "Generated application packaging failed");
         appendLogLine(logFile, result.error, onLogLine);
         result.logs = readFileBounded(logFile);
         return result;
@@ -1364,6 +1524,13 @@ BuildResult BuildService::buildFromPreparedSource(const std::string& deploymentI
                                                   LogCallback onLogLine) const {
     BuildResult result;
 
+    if (isBuildCanceled(deploymentId)) {
+        result.error = "Deployment was canceled by user";
+        appendLogLine(logFile, result.error, onLogLine);
+        result.logs = readFileBounded(logFile);
+        return result;
+    }
+
     injectBuildEnvironmentFiles(sourceDir, envVars, onLogLine);
     if (!envVars.empty()) {
         appendLogLine(logFile, "Injected project environment variables into build context", nullptr);
@@ -1435,7 +1602,8 @@ BuildResult BuildService::buildFromPreparedSource(const std::string& deploymentI
             logFile,
             true,
             std::max(buildTimeoutSeconds_, 120),
-            onLogLine
+            onLogLine,
+            deploymentId
         );
 
         result.logs = readFileBounded(logFile);
@@ -1450,9 +1618,11 @@ BuildResult BuildService::buildFromPreparedSource(const std::string& deploymentI
         result.imageName = "compose:" + composeProject;
 
         if (composeExit != 0) {
-            result.error = result.logs.find("__STACKPILOT_COMPOSE_MISSING__") != std::string::npos
-                ? "Docker Compose is not available to the StackPilot backend"
-                : (composeExit == 124 ? "Docker Compose deploy timed out" : "Docker Compose deploy failed");
+            result.error = isBuildCanceled(deploymentId)
+                ? "Deployment was canceled by user"
+                : (result.logs.find("__STACKPILOT_COMPOSE_MISSING__") != std::string::npos
+                    ? "Docker Compose is not available to the StackPilot backend"
+                    : (composeExit == 124 ? "Docker Compose deploy timed out" : "Docker Compose deploy failed"));
             appendLogLine(logFile, result.error, onLogLine);
             result.logs = readFileBounded(logFile);
             result.success = false;
@@ -1491,15 +1661,15 @@ BuildResult BuildService::buildFromPreparedSource(const std::string& deploymentI
         if (onLogLine) onLogLine(buildMsg);
     }
 
-    const int buildExit = runCommandCapture(buildCmd, logFile, true, buildTimeoutSeconds_, onLogLine);
+    const int buildExit = runCommandCapture(buildCmd, logFile, true, buildTimeoutSeconds_, onLogLine, deploymentId);
 
     result.imageName = imageName;
     result.logs = readFileBounded(logFile);
 
     if (buildExit != 0) {
-        result.error = "docker build failed";
+        result.error = isBuildCanceled(deploymentId) ? "Deployment was canceled by user" : "docker build failed";
         appendLogLine(logFile,
-                      "docker build failed with exit code " + std::to_string(buildExit),
+                      isBuildCanceled(deploymentId) ? "Build was canceled by user" : ("docker build failed with exit code " + std::to_string(buildExit)),
                       onLogLine);
         if (buildExit == 124) {
             appendLogLine(logFile,
@@ -1785,43 +1955,136 @@ int BuildService::runCommandCapture(const std::string& command,
                                     const std::filesystem::path& outputFile,
                                     bool append,
                                     int timeoutSeconds,
-                                    LogCallback onLogLine) const {
-    // We use popen to read the command output line by line
-    // Redirect stderr to stdout so we catch everything
+                                    LogCallback onLogLine,
+                                    const std::string& deploymentId) const {
+    if (!deploymentId.empty()) {
+        std::lock_guard<std::mutex> lock(buildPidsMutex_);
+        if (canceledBuilds_.find(deploymentId) != canceledBuilds_.end()) {
+            appendLogLine(outputFile, "Build was canceled by user", onLogLine);
+            return 130;
+        }
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return -1;
+    }
+
     std::string wrapped =
         "timeout " + std::to_string(timeoutSeconds) + "s sh -lc " +
         shellQuote(command + " 2>&1");
-    
-    FILE* pipe = popen(wrapped.c_str(), "r");
-    if (!pipe) {
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
         return -1;
+    }
+
+    if (pid == 0) {
+        // Child process: setpgid so this process and all its children form a distinct group
+        setpgid(0, 0);
+
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        execl("/bin/sh", "sh", "-c", wrapped.c_str(), (char*)NULL);
+        _exit(127);
+    }
+
+    // Parent process: also setpgid to avoid race before child executes
+    setpgid(pid, pid);
+    close(pipefd[1]);
+
+    if (!deploymentId.empty()) {
+        std::lock_guard<std::mutex> lock(buildPidsMutex_);
+        if (canceledBuilds_.find(deploymentId) != canceledBuilds_.end()) {
+            kill(-pid, SIGTERM);
+            kill(pid, SIGTERM);
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+        } else {
+            activeBuildPids_[deploymentId] = pid;
+        }
     }
 
     std::ofstream logFile(outputFile, append ? std::ios::app : std::ios::trunc);
     char buffer[4096];
-    
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        // Write to log file
-        logFile << buffer << std::flush;
-        
-        // Notify callback for WebSocket broadcast
+    std::string accumulator;
+    char lastDelimiter = '\0';
+
+    auto flushLine = [&logFile, &onLogLine](std::string& line) {
+        logFile << line << '\n' << std::flush;
         if (onLogLine) {
-            std::string line = buffer;
-            // Remove trailing newline for the callback if present
-            if (!line.empty() && line.back() == '\n') {
-                line.pop_back();
-            }
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
             onLogLine(line);
+        }
+        line.clear();
+    };
+
+    while (true) {
+        ssize_t bytesRead = read(pipefd[0], buffer, sizeof(buffer));
+        if (bytesRead < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (bytesRead == 0) {
+            break;
+        }
+
+        for (ssize_t i = 0; i < bytesRead; ++i) {
+            char c = buffer[i];
+            if (c == '\r') {
+                flushLine(accumulator);
+                lastDelimiter = '\r';
+            } else if (c == '\n') {
+                if (lastDelimiter == '\r') {
+                    // Part of CRLF sequence where CR already flushed the line; do not duplicate
+                    lastDelimiter = '\n';
+                } else {
+                    flushLine(accumulator);
+                    lastDelimiter = '\n';
+                }
+            } else {
+                accumulator.push_back(c);
+                lastDelimiter = c;
+            }
+        }
+
+        // If an accumulator has content after a chunk, flush it so clients receive real-time updates
+        if (!accumulator.empty()) {
+            flushLine(accumulator);
         }
     }
 
-    int rawExitCode = pclose(pipe);
-    int exitCode = rawExitCode;
-    if (WIFEXITED(rawExitCode)) {
-        exitCode = WEXITSTATUS(rawExitCode);
+    // Flush any remaining content in accumulator
+    if (!accumulator.empty()) {
+        flushLine(accumulator);
+    }
+
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+
+    if (!deploymentId.empty()) {
+        std::lock_guard<std::mutex> lock(buildPidsMutex_);
+        activeBuildPids_.erase(deploymentId);
+    }
+
+    int exitCode = -1;
+    if (WIFEXITED(status)) {
+        exitCode = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        exitCode = 128 + WTERMSIG(status);
     }
 
     if (exitCode != 0) {
@@ -1951,25 +2214,87 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
     std::string generated;
 
     if (hasFile(sourceDir, "package.json")) {
-        const bool nextApp = isNextJsApp(sourceDir);
-        const bool hasBuildScript = hasPackageScript(sourceDir / "package.json", "build");
-
-        generated =
-            "FROM node:20-alpine\n"
-            "WORKDIR /app\n"
-            "COPY package*.json ./\n"
-            "RUN npm ci || npm install\n"
-            "COPY . .\n";
-
-        if (nextApp || hasBuildScript) {
-            generated +=
-                "RUN if [ -f next.config.js ] || [ -f next.config.mjs ] || [ -f next.config.ts ] || "
-                "node -e \"const fs=require('fs');const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));if(!(pkg.scripts&&pkg.scripts.build)) process.exit(1)\"; then npm run build; fi\n";
+        const std::filesystem::path packageJsonPath = sourceDir / "package.json";
+        Json::Value packageJson;
+        bool parsedPackage = false;
+        {
+            std::ifstream in(packageJsonPath);
+            if (in.is_open()) {
+                Json::CharReaderBuilder builder;
+                builder["collectComments"] = false;
+                std::string errors;
+                parsedPackage = Json::parseFromStream(builder, in, &packageJson, &errors) && packageJson.isObject();
+            }
         }
 
-        generated +=
-            "EXPOSE 3000\n"
-            "CMD [\"sh\", \"-c\", \"node -e \\\"const p=require('./package.json');process.exit(p.scripts&&p.scripts.start?0:1)\\\" && npm start || node server.js || node index.js || node app.js\"]\n";
+        const bool hasNextConfig = hasFile(sourceDir, "next.config.js") ||
+                                   hasFile(sourceDir, "next.config.mjs") ||
+                                   hasFile(sourceDir, "next.config.ts") ||
+                                   hasFile(sourceDir, "next.config.cjs");
+        const bool hasNuxtConfig = hasFile(sourceDir, "nuxt.config.js") ||
+                                   hasFile(sourceDir, "nuxt.config.mjs") ||
+                                   hasFile(sourceDir, "nuxt.config.ts") ||
+                                   hasFile(sourceDir, "nuxt.config.cjs");
+        const bool nextApp = hasNextConfig || isNextJsApp(sourceDir);
+        const bool nuxtApp = hasNuxtConfig;
+
+        bool hasBuildScript = false;
+        bool hasStartScript = false;
+        bool hasVite = false;
+
+        if (parsedPackage) {
+            const Json::Value& scripts = packageJson["scripts"];
+            if (scripts.isObject()) {
+                hasBuildScript = scripts.isMember("build") && scripts["build"].isString() && !scripts["build"].asString().empty();
+                hasStartScript = scripts.isMember("start") && scripts["start"].isString() && !scripts["start"].asString().empty();
+            }
+            auto hasDep = [](const Json::Value& deps, const std::string& name) {
+                return deps.isObject() && deps.isMember(name);
+            };
+            hasVite = hasDep(packageJson["dependencies"], "vite") ||
+                      hasDep(packageJson["devDependencies"], "vite");
+        } else {
+            hasBuildScript = hasPackageScript(packageJsonPath, "build");
+            hasStartScript = hasPackageScript(packageJsonPath, "start");
+        }
+
+        const bool isStaticSpa = (!nextApp && !nuxtApp) && ((hasBuildScript && !hasStartScript) || hasVite);
+
+        if (isStaticSpa) {
+            appendLogLine(logFile, "Detected Static SPA (Vite/React/Vue/Svelte/Astro). Generating Nginx multi-stage Dockerfile.", onLogLine);
+            generated =
+                "FROM node:20-alpine AS builder\n"
+                "WORKDIR /app\n"
+                "COPY package*.json ./\n"
+                "RUN npm ci || npm install\n"
+                "COPY . .\n"
+                "RUN npm run build\n\n"
+                "FROM nginx:alpine\n"
+                "COPY --from=builder /app/dist /usr/share/nginx/html\n"
+                "RUN if [ ! -d /usr/share/nginx/html ] || [ -z \"$(ls -A /usr/share/nginx/html 2>/dev/null)\" ]; then \\\n"
+                "      cp -r /app/build/* /usr/share/nginx/html/ 2>/dev/null || true; \\\n"
+                "    fi\n"
+                "RUN printf 'server {\\n    listen 80;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html;\\n    location / {\\n        try_files $uri $uri/ /index.html;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf\n"
+                "EXPOSE 80\n"
+                "CMD [\"nginx\", \"-g\", \"daemon off;\"]\n";
+        } else {
+            generated =
+                "FROM node:20-alpine\n"
+                "WORKDIR /app\n"
+                "COPY package*.json ./\n"
+                "RUN npm ci || npm install\n"
+                "COPY . .\n";
+
+            if (nextApp || hasBuildScript) {
+                generated +=
+                    "RUN if [ -f next.config.js ] || [ -f next.config.mjs ] || [ -f next.config.ts ] || "
+                    "node -e \"const fs=require('fs');const pkg=JSON.parse(fs.readFileSync('package.json','utf8'));if(!(pkg.scripts&&pkg.scripts.build)) process.exit(1)\"; then npm run build; fi\n";
+            }
+
+            generated +=
+                "EXPOSE 3000\n"
+                "CMD [\"sh\", \"-c\", \"node -e \\\"const p=require('./package.json');process.exit(p.scripts&&p.scripts.start?0:1)\\\" && npm start || node server.js || node index.js || node app.js\"]\n";
+        }
     } else if (hasFile(sourceDir, "requirements.txt") || hasFile(sourceDir, "pyproject.toml") ||
                hasFile(sourceDir, "app.py") || hasFile(sourceDir, "main.py") || hasPythonScript(sourceDir)) {
         if (hasFile(sourceDir, "requirements.txt")) {

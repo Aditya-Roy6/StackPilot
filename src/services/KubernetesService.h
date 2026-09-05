@@ -54,6 +54,8 @@ struct KubernetesRuntimeInfo {
 
 class KubernetesService {
 public:
+    static KubernetesService& getInstance();
+
     KubernetesService();
 
     /**
