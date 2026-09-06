@@ -30,6 +30,7 @@ interface MobileSimulatorDialogProps {
   deploymentTitle: string;
   runtimeUrl: string;
   archetype?: string;
+  deploymentId?: string;
 }
 
 type DeviceModel = "iphone16" | "pixel9" | "tablet";
@@ -40,6 +41,7 @@ export function MobileSimulatorDialog({
   deploymentTitle,
   runtimeUrl,
   archetype,
+  deploymentId,
 }: MobileSimulatorDialogProps) {
   const [device, setDevice] = useState<DeviceModel>("iphone16");
   const [orientation, setOrientation] = useState<"portrait" | "landscape">("portrait");
@@ -170,8 +172,19 @@ export function MobileSimulatorDialog({
                 {showQr ? "Hide QR" : "Scan on Phone"}
               </Button>
 
-              {/* External open */}
-              {runtimeUrl && (
+              {/* Dedicated Studio route or direct open */}
+              {deploymentId ? (
+                <a
+                  href={`/preview/${deploymentId}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md border border-primary/40 bg-primary/10 px-2.5 text-xs font-medium text-primary hover:bg-primary/20 transition-colors"
+                  title="Open Dedicated Full-Window Mobile Studio"
+                >
+                  <AppIcon name="external-link" fallback={ExternalLink} className="h-3.5 w-3.5" />
+                  Open Studio Tab ↗
+                </a>
+              ) : runtimeUrl ? (
                 <a
                   href={runtimeUrl}
                   target="_blank"
@@ -181,7 +194,7 @@ export function MobileSimulatorDialog({
                   <AppIcon name="external-link" fallback={ExternalLink} className="h-3.5 w-3.5" />
                   Open Tab
                 </a>
-              )}
+              ) : null}
             </div>
           </div>
         </DialogHeader>

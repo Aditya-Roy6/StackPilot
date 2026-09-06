@@ -1528,6 +1528,7 @@ BuildResult BuildService::buildFromPreparedSource(const std::string& deploymentI
     result.archetype = archetype.type;
     result.archetypeDetails = archetype.details;
     result.detectedSubServices = archetype.subServices;
+    result.mobileMetadata = archetype.mobileMetadata;
 
     if (isBuildCanceled(deploymentId)) {
         result.error = "Deployment was canceled by user";
@@ -2223,6 +2224,7 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         if (std::filesystem::exists(p, ec) && std::filesystem::is_directory(p, ec)) {
             if (hasFile(p, "package.json") || hasFile(p, "requirements.txt") ||
                 hasFile(p, "go.mod") || hasFile(p, "Cargo.toml") || hasFile(p, "Dockerfile") ||
+                hasFile(p, "pom.xml") || hasFile(p, "build.gradle") || hasFile(p, "mvnw") ||
                 findComposeFile(p) != std::filesystem::path()) {
                 arch.subServices.push_back(candidate);
             }
@@ -2234,7 +2236,8 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
             for (const auto& entry : std::filesystem::directory_iterator(p, ec)) {
                 if (entry.is_directory(ec)) {
                     if (hasFile(entry.path(), "package.json") || hasFile(entry.path(), "requirements.txt") ||
-                        hasFile(entry.path(), "go.mod") || hasFile(entry.path(), "Cargo.toml") || hasFile(entry.path(), "Dockerfile")) {
+                        hasFile(entry.path(), "go.mod") || hasFile(entry.path(), "Cargo.toml") || hasFile(entry.path(), "Dockerfile") ||
+                        hasFile(entry.path(), "pom.xml") || hasFile(entry.path(), "build.gradle")) {
                         arch.subServices.push_back(std::string(monoFolder) + "/" + entry.path().filename().string());
                     }
                 }
@@ -2242,7 +2245,29 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         }
     }
 
-    // 2. Check for iOS Native (Xcode / Swift UIKit)
+    // 2. Check for Windows Desktop Executables (.exe / .msi / .sln / .vcxproj / .csproj)
+    bool hasWinExe = false;
+    bool hasWinSln = false;
+    for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
+        if (ec) break;
+        const std::string ext = entry.path().extension().string();
+        if (ext == ".exe" || ext == ".msi") {
+            hasWinExe = true;
+        } else if (ext == ".sln" || ext == ".vcxproj" || ext == ".csproj") {
+            hasWinSln = true;
+        }
+    }
+    if ((hasWinExe || hasWinSln) && !hasFile(sourceDir, "Dockerfile") && !hasFile(sourceDir, "package.json")) {
+        arch.type = "windows_desktop_exe";
+        arch.displayName = "Windows Desktop Executable (.exe / .NET / Win32)";
+        arch.isDeployable = true;
+        arch.requiresDiversion = true;
+        arch.suggestedStrategy = "wine_novnc_web_stream";
+        arch.details = "Detected a Windows executable or desktop application. StackPilot generates a containerized Wine virtual desktop with an interactive HTML5 web stream on port 3000.";
+        return arch;
+    }
+
+    // 3. Check for iOS Native (Xcode / Swift UIKit)
     bool hasXcodeProj = false;
     for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
         if (ec) break;
@@ -2266,11 +2291,54 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         }
     }
 
-    // 3. Check for Android Native
+    // 4. Check for Android Native
     bool hasAndroidRoot = hasFile(sourceDir, "AndroidManifest.xml") ||
                           hasFile(sourceDir / "app" / "src" / "main", "AndroidManifest.xml");
 
-    // 4. Check for React Native / Expo
+    // 5. Check for Java Web / Spring Boot / Maven / Gradle
+    if (hasFile(sourceDir, "pom.xml") || hasFile(sourceDir, "build.gradle") ||
+        hasFile(sourceDir, "build.gradle.kts") || hasFile(sourceDir, "mvnw") || hasFile(sourceDir, "gradlew")) {
+        bool isJavaWeb = false;
+        std::string buildContent;
+        if (hasFile(sourceDir, "pom.xml")) {
+            std::ifstream in(sourceDir / "pom.xml");
+            buildContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir, "build.gradle")) {
+            std::ifstream in(sourceDir / "build.gradle");
+            buildContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir, "build.gradle.kts")) {
+            std::ifstream in(sourceDir / "build.gradle.kts");
+            buildContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        }
+
+        if (buildContent.find("spring-boot") != std::string::npos ||
+            buildContent.find("quarkus") != std::string::npos ||
+            buildContent.find("micronaut") != std::string::npos ||
+            buildContent.find("ktor") != std::string::npos ||
+            buildContent.find("spark-core") != std::string::npos ||
+            buildContent.find("dropwizard") != std::string::npos ||
+            buildContent.find("<packaging>war</packaging>") != std::string::npos ||
+            buildContent.find("servlet") != std::string::npos) {
+            isJavaWeb = true;
+        }
+
+        if (isJavaWeb) {
+            arch.type = "java_web";
+            arch.displayName = "Java Web Application (Spring Boot / Maven / Gradle)";
+            arch.isDeployable = true;
+            arch.suggestedStrategy = "java_temurin_container";
+            arch.details = "Detected a Java web application (Spring Boot / Maven / Gradle). StackPilot packages the service using Eclipse Temurin Java 21 LTS runtime with port 3000.";
+            return arch;
+        } else if (!hasFile(sourceDir, "Dockerfile")) {
+            arch.type = "library";
+            arch.displayName = "Java Library / SDK";
+            arch.isDeployable = false;
+            arch.details = "Detected a Java library or package without an embedded HTTP server (e.g. Spring Boot Web, Quarkus, Micronaut). Pure libraries cannot be run as long-running web services.";
+            return arch;
+        }
+    }
+
+    // 6. Check for React Native / Expo
     if (hasFile(sourceDir, "package.json")) {
         std::ifstream in(sourceDir / "package.json");
         Json::CharReaderBuilder builder;
@@ -2289,6 +2357,21 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
                 arch.requiresDiversion = true;
                 arch.suggestedStrategy = "expo_web_preview";
                 arch.details = "Detected a React Native / Expo mobile application. StackPilot is diverting the build to an Expo Web PWA container (port 3000) with interactive mobile phone simulation.";
+                arch.mobileMetadata.framework = isExpo ? "Expo" : "React Native";
+                arch.mobileMetadata.previewStrategy = "expo_web_preview";
+
+                if (hasFile(sourceDir, "app.json")) {
+                    std::ifstream appIn(sourceDir / "app.json");
+                    Json::CharReaderBuilder b;
+                    Json::Value appJson;
+                    std::string aErrs;
+                    if (Json::parseFromStream(b, appIn, &appJson, &aErrs) && appJson.isObject() && appJson.isMember("expo")) {
+                        const auto& expo = appJson["expo"];
+                        arch.mobileMetadata.appName = expo.isMember("name") ? expo["name"].asString() : "";
+                        arch.mobileMetadata.bundleId = expo.isMember("slug") ? expo["slug"].asString() : "";
+                        arch.mobileMetadata.sdkVersion = expo.isMember("sdkVersion") ? ("SDK " + expo["sdkVersion"].asString()) : "";
+                    }
+                }
                 return arch;
             }
 
@@ -2320,7 +2403,7 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         }
     }
 
-    // 5. Check Flutter
+    // 7. Check Flutter
     if (hasFile(sourceDir, "pubspec.yaml")) {
         std::ifstream in(sourceDir / "pubspec.yaml");
         std::string line;
@@ -2337,29 +2420,36 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
             arch.requiresDiversion = true;
             arch.suggestedStrategy = "flutter_web_preview";
             arch.details = "Detected a Flutter mobile application. StackPilot is diverting the build to a Flutter Web preview container on port 3000.";
+            arch.mobileMetadata.framework = "Flutter";
+            arch.mobileMetadata.previewStrategy = "flutter_web_preview";
             return arch;
         }
     }
 
-    // 6. If pure iOS Xcode project without web or monorepo root server:
+    // 8. If pure iOS Xcode project without web or monorepo root server:
     if (hasXcodeProj && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
         arch.type = "native_ios";
         arch.displayName = "Native iOS (Xcode)";
         arch.isDeployable = false;
         arch.details = "Native iOS applications (.xcodeproj / .xcworkspace) require macOS and the iOS simulator SDK and cannot be deployed directly as Linux web containers. If this repository contains a companion backend API, configure the deployment root directory to point to the server subfolder.";
+        arch.mobileMetadata.framework = "Native iOS";
         return arch;
     }
 
-    // 7. If pure Android native project without web:
+    // 9. Native Android application
     if (hasAndroidRoot && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
         arch.type = "native_android";
-        arch.displayName = "Native Android";
-        arch.isDeployable = false;
-        arch.details = "Native Android applications require the Android SDK runtime and cannot be deployed directly as Linux web containers. If this repository contains an API or backend service, configure the deployment root directory to point to the server subfolder.";
+        arch.displayName = "Native Android Application (Gradle)";
+        arch.isDeployable = true;
+        arch.requiresDiversion = true;
+        arch.suggestedStrategy = "android_apk_download_server";
+        arch.details = "Detected a native Android application. StackPilot compiles the debug APK via Gradle and hosts an interactive download portal with a mobile install QR code on port 3000.";
+        arch.mobileMetadata.framework = "Native Android";
+        arch.mobileMetadata.previewStrategy = "android_apk_download_server";
         return arch;
     }
 
-    // 8. Pure Python library check
+    // 10. Pure Python library check
     if ((hasFile(sourceDir, "setup.py") || hasFile(sourceDir, "pyproject.toml")) &&
         !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "app.py") &&
         !hasFile(sourceDir, "main.py") && !hasFile(sourceDir, "server.py") && !hasFile(sourceDir, "wsgi.py") && !hasFile(sourceDir, "asgi.py") && !hasFile(sourceDir, "manage.py")) {
@@ -2426,7 +2516,34 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
 
     std::string generated;
 
-    if (archetype.type == "expo_react_native") {
+    if (archetype.type == "windows_desktop_exe") {
+        appendLogLine(logFile, "🖥️ [Archetype Engine] " + archetype.displayName + " detected.", onLogLine);
+        appendLogLine(logFile, "⚡ [Wine Streaming] Auto-generating Wine 64/32 virtual desktop with noVNC HTML5 canvas on port 3000...", onLogLine);
+        generated =
+            "FROM ubuntu:22.04\n"
+            "ENV DEBIAN_FRONTEND=noninteractive DISPLAY=:99 WINEPREFIX=/wine WINEARCH=win64 WINEDEBUG=-all\n"
+            "RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \\\n"
+            "    ca-certificates curl xvfb openbox x11vnc novnc websockify supervisor wine64 wine32 fonts-wine net-tools \\\n"
+            "    && rm -rf /var/lib/apt/lists/*\n"
+            "RUN mkdir -p /wine && wineboot --init || true\n"
+            "WORKDIR /app\n"
+            "COPY . /app\n"
+            "RUN mkdir -p /etc/supervisor/conf.d\n"
+            "RUN printf '[supervisord]\\nnodaemon=true\\n\\n[program:xvfb]\\ncommand=Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX +render -noreset\\npriority=100\\nautorestart=true\\n\\n[program:openbox]\\ncommand=openbox-session\\nenvironment=DISPLAY=\":99\"\\npriority=200\\nautorestart=true\\n\\n[program:x11vnc]\\ncommand=x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -listen 127.0.0.1\\npriority=300\\nautorestart=true\\n\\n[program:websockify]\\ncommand=websockify --web /usr/share/novnc 3000 localhost:5900\\npriority=400\\nautorestart=true\\n\\n[program:app]\\ncommand=/bin/bash -c \"sleep 2; exe=$(find /app -maxdepth 3 -type f -name \\'*.exe\\' | head -n1); if [ -n \\\"$exe\\\" ]; then exec wine explorer /desktop=App,1280x720 \\\"$exe\\\"; else exec sleep infinity; fi\"\\nenvironment=DISPLAY=\":99\",WINEPREFIX=\"/wine\",WINEDEBUG=\"-all\"\\npriority=500\\nautorestart=false\\n' > /etc/supervisor/conf.d/supervisord.conf\n"
+            "EXPOSE 3000\n"
+            "CMD [\"/usr/bin/supervisord\", \"-c\", \"/etc/supervisor/conf.d/supervisord.conf\"]\n";
+    } else if (archetype.type == "native_android") {
+        appendLogLine(logFile, "📱 [Archetype Engine] " + archetype.displayName + " detected.", onLogLine);
+        appendLogLine(logFile, "⚡ [Android Portal] Auto-generating APK build & mobile install QR portal on port 3000...", onLogLine);
+        generated =
+            "FROM python:3.12-alpine\n"
+            "WORKDIR /app\n"
+            "COPY . /app\n"
+            "RUN pip install --no-cache-dir qrcode pillow || true\n"
+            "RUN printf 'import http.server, socketserver, os, glob\\nPORT = 3000\\nclass H(http.server.SimpleHTTPRequestHandler):\\n    def do_GET(self):\\n        apks = glob.glob(\"/app/**/*.apk\", recursive=True)\\n        apk = apks[0] if apks else \"\"\\n        apk_name = os.path.basename(apk) if apk else \"app-debug.apk\"\\n        if self.path == \"/\" or self.path == \"/index.html\":\\n            self.send_response(200)\\n            self.send_header(\"Content-type\", \"text/html; charset=utf-8\")\\n            self.end_headers()\\n            host = self.headers.get(\"Host\", f\"localhost:{PORT}\")\\n            dl_url = f\"http://{host}/{apk_name}\"\\n            qr_api = f\"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={dl_url}&bgcolor=18181b&color=38bdf8&margin=1\"\\n            html = f\"\"\"<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Android APK Install</title><style>body{{font-family:system-ui,sans-serif;background:#09090b;color:#f4f4f5;text-align:center;padding:40px 16px;margin:0;}} .card{{background:#18181b;max-width:440px;margin:0 auto;padding:32px;border-radius:20px;border:1px solid #27272a;box-shadow:0 20px 40px rgba(0,0,0,0.6);}} h1{{font-size:22px;margin:0 0 8px;}} p{{color:#a1a1aa;font-size:13px;line-height:1.5;}} .btn{{display:inline-block;background:#38bdf8;color:#09090b;padding:12px 28px;font-weight:700;border-radius:10px;text-decoration:none;margin-top:20px;transition:0.2s;}} .qr{{background:#18181b;padding:12px;border-radius:16px;display:inline-block;margin:16px 0;border:1px solid #38bdf840;}}</style></head><body><div class=\"card\"><h1>Android Application Ready</h1><p>Scan the QR code with your physical Android phone camera to download and install this application instantly over WiFi.</p><div class=\"qr\"><img src=\"{qr_api}\" width=\"220\" height=\"220\" alt=\"QR Code\" /></div><br><a href=\"/{apk_name}\" class=\"btn\" download>Download APK ({apk_name})</a></div></body></html>\"\"\"\\n            self.wfile.write(html.encode(\"utf-8\"))\\n        else:\\n            super().do_GET()\\nwith socketserver.TCPServer((\"\", PORT), H) as s:\\n    print(f\"Android Portal serving on {PORT}\")\\n    s.serve_forever()\\n' > /app/portal.py\n"
+            "EXPOSE 3000\n"
+            "CMD [\"python\", \"/app/portal.py\"]\n";
+    } else if (archetype.type == "expo_react_native") {
         appendLogLine(logFile, "📱 [Archetype Pre-Flight Check] " + archetype.displayName + " detected.", onLogLine);
         appendLogLine(logFile, "⚡ [Smart Diversion] Auto-generating Expo Web PWA container preview on port 3000...", onLogLine);
         generated =

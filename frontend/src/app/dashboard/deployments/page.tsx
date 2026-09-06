@@ -358,6 +358,21 @@ function deploymentRuntimeUrl(deployment: Deployment, runtime?: KubernetesRuntim
   return runtime?.runtime_url || deployment.runtime_url || deployment.runtime_snapshot?.runtime_url || "";
 }
 
+const MOBILE_ARCHETYPES = new Set([
+  "expo_react_native",
+  "expo_mobile",
+  "flutter_mobile",
+  "native_ios",
+  "ios_xcode",
+  "native_android",
+  "android_gradle",
+]);
+
+function isMobileDeployment(deployment: Deployment): boolean {
+  const archetype = deployment.runtime_snapshot?.archetype?.toLowerCase();
+  return Boolean(archetype && MOBILE_ARCHETYPES.has(archetype));
+}
+
 function defaultRuntimePortForDeployment(deployment: Deployment) {
   const name = deploymentDisplayName(deployment).toLowerCase();
   const image = `${deployment.image_name || ""} ${deployment.runtime_snapshot?.image_name || ""}`.toLowerCase();
@@ -1091,16 +1106,16 @@ export default function DeploymentsPage() {
                             AI SRE Heal
                           </Button>
                         )}
-                        {liveUrl && (
+                        {liveUrl && isMobileDeployment(dep) && (
                           <Button
-                            variant="ghost"
+                            variant="outline"
                             size="sm"
-                            onClick={() => setMobileSimulatorDeployment(dep)}
-                            className="shrink-0 text-muted-foreground hover:text-foreground hover:bg-muted"
-                            title="Interactive Smartphone Frame & QR Simulator"
+                            onClick={() => window.open(`/preview/${dep.id}`, "_blank")}
+                            className="shrink-0 gap-1.5 border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
+                            title="Open Interactive Mobile Device Studio in New Tab"
                           >
-                            <AppIcon name="smartphone" fallback={Smartphone} className="w-4 h-4 mr-1.5"  />
-                            Mobile
+                            <AppIcon name="smartphone" fallback={Smartphone} className="w-4 h-4 mr-1 text-primary"  />
+                            Mobile Preview ↗
                           </Button>
                         )}
                         {(dep.status === "pending" || dep.status === "failed") && (
@@ -1293,6 +1308,7 @@ export default function DeploymentsPage() {
         deploymentTitle={mobileSimulatorDeployment ? deploymentDisplayName(mobileSimulatorDeployment) : ""}
         runtimeUrl={mobileSimulatorDeployment ? deploymentRuntimeUrl(mobileSimulatorDeployment) : ""}
         archetype={mobileSimulatorDeployment?.runtime_snapshot?.archetype}
+        deploymentId={mobileSimulatorDeployment?.id}
       />
 
       <AiSreSelfHealingDialog

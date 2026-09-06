@@ -193,6 +193,16 @@ Json::Value runtimeSnapshot(const std::string& provider,
             subservices.append(s);
         }
         snapshot["detected_subservices"] = subservices;
+        if (!buildResult->mobileMetadata.framework.empty()) {
+            Json::Value mMeta(Json::objectValue);
+            mMeta["framework"] = buildResult->mobileMetadata.framework;
+            mMeta["app_name"] = buildResult->mobileMetadata.appName;
+            mMeta["bundle_id"] = buildResult->mobileMetadata.bundleId;
+            mMeta["sdk_version"] = buildResult->mobileMetadata.sdkVersion;
+            mMeta["preview_strategy"] = buildResult->mobileMetadata.previewStrategy;
+            mMeta["qr_target_url"] = buildResult->mobileMetadata.qrTargetUrl;
+            snapshot["mobile_metadata"] = mMeta;
+        }
     }
     return snapshot;
 }
@@ -1822,6 +1832,16 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                     subservices.append(s);
                 }
                 failSnapshot["detected_subservices"] = subservices;
+                if (!buildResult.mobileMetadata.framework.empty()) {
+                    Json::Value mMeta(Json::objectValue);
+                    mMeta["framework"] = buildResult.mobileMetadata.framework;
+                    mMeta["app_name"] = buildResult.mobileMetadata.appName;
+                    mMeta["bundle_id"] = buildResult.mobileMetadata.bundleId;
+                    mMeta["sdk_version"] = buildResult.mobileMetadata.sdkVersion;
+                    mMeta["preview_strategy"] = buildResult.mobileMetadata.previewStrategy;
+                    mMeta["qr_target_url"] = buildResult.mobileMetadata.qrTargetUrl;
+                    failSnapshot["mobile_metadata"] = mMeta;
+                }
             }
             updateTxn.exec_params(
                 "UPDATE deployments "

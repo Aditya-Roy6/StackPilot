@@ -22,12 +22,22 @@ struct BuildEnvVar {
     std::string value;
 };
 
+struct MobileMetadata {
+    std::string framework;
+    std::string appName;
+    std::string bundleId;
+    std::string sdkVersion;
+    std::string previewStrategy;
+    std::string qrTargetUrl;
+};
+
 struct RepositoryArchetype {
-    std::string type = "standard_web";       // "standard_web", "expo_react_native", "flutter_mobile", "native_ios", "native_android", "library", "monorepo"
+    std::string type = "standard_web";       // "standard_web", "expo_react_native", "flutter_mobile", "native_ios", "native_android", "windows_desktop_exe", "java_web", "library", "monorepo"
     std::string displayName = "Web Application";
-    std::string suggestedStrategy = "standard"; // "expo_web_preview", "flutter_web_preview", "monorepo_subservice", "unsupported_native"
+    std::string suggestedStrategy = "standard"; // "expo_web_preview", "flutter_web_preview", "wine_novnc_web_stream", "android_apk_download_server", "monorepo_subservice", "unsupported_native"
     std::vector<std::string> subServices;
     std::string details;
+    MobileMetadata mobileMetadata;
     bool requiresDiversion = false;
     bool isDeployable = true;
 };
@@ -48,6 +58,7 @@ struct BuildResult {
     std::string archetype;
     std::string archetypeDetails;
     std::vector<std::string> detectedSubServices;
+    MobileMetadata mobileMetadata;
 };
 
 typedef std::function<void(const std::string&)> LogCallback;

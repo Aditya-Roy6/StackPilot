@@ -307,18 +307,46 @@ void DeploymentController::getRootCauseAnalysis(
                 steps.append("Build the iOS native IPA using GitHub Actions macOS runner or Xcode Cloud.");
                 analysis["remediation_steps"] = steps;
             } else if (archetype == "native_android") {
-                analysis["category"] = "UNSUPPORTED_ARCHETYPE";
-                analysis["confidence"] = 99;
-                analysis["title"] = "Native Android Gradle Project Detected";
+                analysis["category"] = "MOBILE_DIVERSION";
+                analysis["confidence"] = 96;
+                analysis["title"] = "Native Android Gradle Application";
                 analysis["summary"] = archetypeDetails.empty()
-                    ? "StackPilot Linux build nodes cannot run Android application APKs as web services."
+                    ? "Native Android application detected. StackPilot builds the debug APK and serves an install portal with a mobile QR code."
                     : archetypeDetails;
                 analysis["culprit_file"] = "build.gradle / AndroidManifest.xml";
-                analysis["can_auto_repair"] = false;
-                analysis["repair_action"] = "divert_subservice";
+                analysis["can_auto_repair"] = true;
+                analysis["repair_action"] = "android_apk_download_server";
                 Json::Value steps(Json::arrayValue);
-                steps.append("Deploy the backend API sub-directory if this repository includes a server component.");
-                steps.append("Build the Android APK via an Android SDK CI workflow.");
+                steps.append("Compile debug APK using Gradle wrapper.");
+                steps.append("Host APK on port 3000 with dynamic scan-to-install QR code for physical phone testing.");
+                analysis["remediation_steps"] = steps;
+            } else if (archetype == "windows_desktop_exe") {
+                analysis["category"] = "DESKTOP_GUI_STREAM";
+                analysis["confidence"] = 98;
+                analysis["title"] = "Windows Desktop Application (.exe / Win32)";
+                analysis["summary"] = archetypeDetails.empty()
+                    ? "Windows executable detected. StackPilot generates a containerized Wine virtual desktop with an interactive HTML5 web stream."
+                    : archetypeDetails;
+                analysis["culprit_file"] = ".exe / .sln";
+                analysis["can_auto_repair"] = true;
+                analysis["repair_action"] = "wine_novnc_web_stream";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Package application into Wine 64/32 virtual framebuffer container with Openbox.");
+                steps.append("Stream graphical desktop over WebSockets and noVNC on port 3000.");
+                analysis["remediation_steps"] = steps;
+            } else if (archetype == "java_web") {
+                analysis["category"] = "JAVA_APPLICATION";
+                analysis["confidence"] = 96;
+                analysis["title"] = "Java Web Application (Spring Boot / Maven / Gradle)";
+                analysis["summary"] = archetypeDetails.empty()
+                    ? "Java application detected. Deploying with Eclipse Temurin Java 21 runtime on port 3000."
+                    : archetypeDetails;
+                analysis["culprit_file"] = "pom.xml / build.gradle";
+                analysis["can_auto_repair"] = true;
+                analysis["repair_action"] = "build_spring_boot";
+                Json::Value steps(Json::arrayValue);
+                steps.append("Compile fat JAR with Maven or Gradle wrapper.");
+                steps.append("Run with -Dserver.port=3000 in minimal Temurin JRE container.");
                 analysis["remediation_steps"] = steps;
             } else if (archetype == "library") {
                 analysis["category"] = "UNSUPPORTED_ARCHETYPE";
