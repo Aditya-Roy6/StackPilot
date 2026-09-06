@@ -1073,6 +1073,8 @@ def build_prompt(workflow: str, req: AgentRequest) -> str:
             "Deeply analyze the failed build/deployment logs, error stack traces, project file tree, and source file contents. "
             "Identify the exact root cause of failure (e.g., missing dependencies, configuration syntax errors, incompatible versions, "
             "missing Dockerfile directives, incorrect entrypoints, port mismatches, code bugs). "
+            "CRITICAL DOCKER BASE IMAGE RULE: NEVER use deprecated or non-existent base images like 'openjdk:11-jdk-alpine' or 'openjdk:11-jdk-slim' (these are dead/removed on Docker Hub). "
+            "Always use official modern images: for Java Maven source builds, use multi-stage builds with 'maven:3.9-eclipse-temurin-17' (builder) and 'eclipse-temurin:17-jre' (runner). "
             "Deeply reason step-by-step about the solution and output exact, surgically targeted file changes to fix the project. "
             "Every file change in structured_output.file_changes must contain the complete, corrected, and buildable code."
         ),
@@ -1087,7 +1089,10 @@ def build_prompt(workflow: str, req: AgentRequest) -> str:
         "generate_dockerfile": (
             "You are generating a Dockerfile from an actual source tree scan. Read the file list and excerpts before choosing a runtime. "
             "For Python projects, distinguish web apps from one-shot scripts. If there are multiple Python files, identify the best entrypoint "
-            "from filenames, README, imports, framework usage, and __main__ guards. Include exposed_port only for HTTP servers."
+            "from filenames, README, imports, framework usage, and __main__ guards. Include exposed_port only for HTTP servers. "
+            "CRITICAL BASE IMAGE RULE: NEVER use deprecated or dead Docker Hub images like 'openjdk:*-alpine' or 'openjdk:*-slim'. "
+            "Always use official, active images: for Java use 'eclipse-temurin:17-jdk' or 'eclipse-temurin:21-jdk' (or multi-stage 'maven:3.9-eclipse-temurin-17' if compiling from source); "
+            "for Node use 'node:20-alpine'; for Python use 'python:3.11-slim' or 'python:3.12-slim'."
         ),
         "analyze_build_failure": (
             "Analyze the failed deployment/build logs. Identify root cause, safe fix steps, likely files to inspect, "
@@ -1596,13 +1601,33 @@ async def stream_agent_reply(request: AgentRequest) -> AsyncIterator[str]:
         sys_prompt = (
             "You are StackPilot Agent — a production-grade autonomous AI copilot and platform engineer (similar to Antigravity and Cursor). "
             "You have deep expertise in software engineering, DevOps, cloud infrastructure, containerization, debugging, and architecture.\n\n"
-            "Capabilities & Guidelines:\n"
-            "1. Integrated Terminal & Proactive Tool Use: You have an integrated workspace terminal (`terminal_run_command`), file inspection tools (`workspace_list_files`, `workspace_read_file`), and file editing tools (`workspace_edit_file`, `workspace_write_file`, `workspace_trigger_rebuild`). When the user asks you to analyze, test, verify, or investigate code or deployments, PROACTIVELY USE THESE TOOLS to run commands and inspect real files before giving your final answer!\n"
-            "   NOTE ON TERMINAL & OS: The integrated terminal executes with native PowerShell according to the host OS. Use PowerShell cmdlets or cross-platform commands (e.g. `Get-Content package.json`, `cat package.json`, `Select-String`, `Get-ChildItem`, `git status`, `npm test`, `node -v`). Do NOT call Unix-only utilities like `od` or `hexdump` or bash-only pipelines that do not work in PowerShell.\n"
-            "2. Strict Code Formatting in Code Blocks: Every piece of code, configuration, JSON, command, or script MUST be enclosed in proper fenced code blocks with language tags (e.g. ```json, ```powershell, ```dockerfile, ```bash, ```javascript). Never dump raw unstructured code or unformatted file text.\n"
-            "3. Depth & Production Quality: Provide thorough, in-depth technical explanations. Structure your answers with clear sections, badges, findings, and concrete code/command examples. Never give shallow one-sentence summaries.\n"
-            "4. Helpful & Versatile: Answer programming questions, DevOps concepts, code debugging, and platform tasks helpfully.\n"
-            "5. Tone: Confident, professional, clear, and well-formatted in markdown."
+            "Core Directives & Unlimited Iteration Rules:\n"
+            "1. UNLIMITED PERSISTENT HEALING & VERIFICATION: When tasked with repairing, building, or getting a service running, you have an UNLIMITED action budget. "
+            "You MUST NOT stop until the deployment is verified LIVE and running (status 'running' or 'ready'). "
+            "If a rebuild fails, immediately read the latest logs, apply the next fix, trigger rebuild (`workspace_trigger_rebuild`), and verify again (`wait_for_deployment`). "
+            "Iterate continuously through as many turns as needed until the project is 100% healthy and functioning!\n"
+            "2. CRITICAL DOCKER BASE IMAGE COMPATIBILITY: NEVER use deprecated or non-existent Docker Hub images like 'openjdk:*-alpine' or 'openjdk:*-slim' (these are dead/removed on Docker Hub and fail immediately). "
+            "Always use official active images:\n"
+            "   - Java: Use Eclipse Temurin ('eclipse-temurin:17-jdk', 'eclipse-temurin:21-jdk', or 'eclipse-temurin:11-jdk').\n"
+            "   - Java from source (Maven): Always use a multi-stage Dockerfile:\n"
+            "     FROM maven:3.9-eclipse-temurin-17 AS build\n"
+            "     WORKDIR /app\n"
+            "     COPY . .\n"
+            "     RUN mvn clean package -DskipTests\n"
+            "     FROM eclipse-temurin:17-jre\n"
+            "     WORKDIR /app\n"
+            "     COPY --from=build /app/target/*.jar app.jar\n"
+            "     EXPOSE 3000\n"
+            "     ENV PORT=3000\n"
+            "     CMD [\"java\", \"-jar\", \"app.jar\"]\n"
+            "   - Node.js: Use 'node:20-alpine' or 'node:20-bookworm-slim'.\n"
+            "   - Python: Use 'python:3.11-slim' or 'python:3.12-slim'.\n"
+            "   - Go: Use 'golang:1.22-alpine' as builder and 'alpine:latest' as runner.\n"
+            "3. Integrated Terminal & Proactive Tool Use: You have an integrated workspace terminal (`terminal_run_command`), file inspection tools (`workspace_list_files`, `workspace_read_file`), and file editing tools (`workspace_edit_file`, `workspace_write_file`, `workspace_trigger_rebuild`). PROACTIVELY USE THESE TOOLS to run commands and inspect real files before giving your final answer!\n"
+            "   NOTE ON TERMINAL & OS: The target workspace is inside a Linux container or host PowerShell. Use cross-platform utilities (`cat`, `ls`, `grep`, `find`) or PowerShell cmdlets (`Get-Content`, `Get-ChildItem`). NEVER invoke Windows-specific legacy cmd.exe commands like 'FindStr' or 'type' which fail on Linux.\n"
+            "4. Strict Code Formatting in Code Blocks: Every piece of code, configuration, JSON, command, or script MUST be enclosed in proper fenced code blocks with language tags (e.g. ```json, ```powershell, ```dockerfile, ```bash, ```javascript). Never dump raw unstructured code or unformatted file text.\n"
+            "5. Depth & Production Quality: Provide thorough, in-depth technical explanations. Structure your answers with clear sections, badges, findings, and concrete code/command examples.\n"
+            "6. Tone: Confident, professional, clear, and well-formatted in markdown."
         )
 
         if command_name in {"/repair", "/fix"}:
@@ -1708,13 +1733,29 @@ async def stream_agent_reply(request: AgentRequest) -> AsyncIterator[str]:
         reasoning_parts.append(arch_thought)
         yield _sse({"type": "reasoning", "delta": arch_thought})
     
-    # Tool loop limit (allow up to 25 autonomous reasoning & tool execution turns)
-    for iteration in range(25):
-        # When nearing the iteration ceiling, omit tools so the model delivers its final report
-        use_tools = AGENT_TOOLS if (request.workflow_type == "agent_chat" and iteration < 22) else None
+    # Autonomous agent loop: UNLIMITED iterative workspace actions until the deployment is verified healthy & running
+    MAX_AGENTIC_ITERATIONS = 1000  # Virtually unlimited loop to persistently iterate and heal
+    for iteration in range(MAX_AGENTIC_ITERATIONS):
+        # Tools remain available continuously on every turn so the agent can iterate without interruption
+        use_tools = AGENT_TOOLS if request.workflow_type == "agent_chat" else None
+
+        # Compact older tool outputs to preserve token budget across unlimited iterations
+        compacted_messages = []
+        num_msgs = len(messages)
+        for m_idx, m in enumerate(messages):
+            if m.get("role") == "tool" and m_idx < (num_msgs - 16):
+                content_str = str(m.get("content", ""))
+                if len(content_str) > 300:
+                    compacted_messages.append({
+                        **m,
+                        "content": content_str[:250] + "... [earlier output truncated for context optimization]"
+                    })
+                    continue
+            compacted_messages.append(m)
+
         payload = chat_payload(
             model,
-            messages=messages,
+            messages=compacted_messages,
             temperature=0.2 if request.model_mode == "fast" else 0.1,
             model_mode=request.model_mode,
             stream=True,

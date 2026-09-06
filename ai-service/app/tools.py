@@ -257,9 +257,13 @@ async def execute_tool_call(tool_name: str, arguments: Dict[str, Any], user_id: 
             resp.raise_for_status()
             resp_json = resp.json()
             if isinstance(resp_json, dict) and resp_json.get("status") in {"written", "edited"}:
-                resp_json["next_step_hint"] = "File changes applied to workspace. You can now call workspace_trigger_rebuild with deployment_id to rebuild, or synthesize your final diagnosis and report to the user."
+                resp_json["next_step_hint"] = "File changes applied to workspace. You can now call workspace_trigger_rebuild with deployment_id to rebuild, or continue modifying files."
             elif isinstance(resp_json, dict) and resp_json.get("status") == "rebuild_queued":
-                resp_json["next_step_hint"] = "Rebuild has been queued. You MUST now call wait_for_deployment with deployment_id to wait for the build to complete and verify it reaches running status."
+                resp_json["next_step_hint"] = "Rebuild has been queued. You MUST now call wait_for_deployment with deployment_id to monitor the build until completion."
+            elif isinstance(resp_json, dict) and resp_json.get("status") in {"failed", "error", "crash_loop_backoff"}:
+                resp_json["next_step_hint"] = "Deployment failed. Do NOT stop. Read the error in 'recent_logs', apply the next targeted fix using workspace_write_file or workspace_edit_file, and trigger rebuild again. Iterate until status is 'running'."
+            elif isinstance(resp_json, dict) and resp_json.get("status") in {"running", "ready"}:
+                resp_json["next_step_hint"] = "Deployment is verified LIVE and running! Project is fully healed. Deliver your final report."
             return resp_json
     except Exception as e:
         return {"error": f"Tool execution failed: {str(e)}"}
