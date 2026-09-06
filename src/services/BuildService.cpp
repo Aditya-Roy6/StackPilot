@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <unordered_set>
 #include <signal.h>
+#include <regex>
 
 namespace stackpilot {
 
@@ -2291,9 +2292,64 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         }
     }
 
-    // 4. Check for Android Native
-    bool hasAndroidRoot = hasFile(sourceDir, "AndroidManifest.xml") ||
-                          hasFile(sourceDir / "app" / "src" / "main", "AndroidManifest.xml");
+    // 4. Check for Native Android Application (Gradle / Manifest)
+    bool isAndroidApp = hasFile(sourceDir, "AndroidManifest.xml") ||
+                        hasFile(sourceDir / "app" / "src" / "main", "AndroidManifest.xml") ||
+                        hasFile(sourceDir / "src" / "main", "AndroidManifest.xml");
+    std::string androidBundleId;
+    std::string androidSdkVersion;
+
+    if (!hasFile(sourceDir, "Dockerfile")) {
+        std::string bgContent;
+        if (hasFile(sourceDir, "build.gradle")) {
+            std::ifstream in(sourceDir / "build.gradle");
+            bgContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir, "build.gradle.kts")) {
+            std::ifstream in(sourceDir / "build.gradle.kts");
+            bgContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir / "app", "build.gradle")) {
+            std::ifstream in(sourceDir / "app" / "build.gradle");
+            bgContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        }
+
+        if (bgContent.find("com.android.application") != std::string::npos ||
+            bgContent.find("com.android.library") != std::string::npos ||
+            bgContent.find("apply plugin: 'android'") != std::string::npos ||
+            bgContent.find("apply plugin: \"android\"") != std::string::npos ||
+            bgContent.find("android {") != std::string::npos) {
+            isAndroidApp = true;
+        }
+
+        if (isAndroidApp) {
+            // Extract namespace / applicationId
+            std::regex nsRegex(R"((?:namespace|applicationId)\s*=?\s*["']([^"']+)["'])");
+            std::smatch m;
+            if (std::regex_search(bgContent, m, nsRegex) && m.size() > 1) {
+                androidBundleId = m[1].str();
+            }
+
+            // Extract targetSdk / compileSdk
+            std::regex sdkRegex(R"((?:compileSdk|compileSdkVersion|targetSdk|targetSdkVersion)\s*=?\s*([0-9]+))");
+            if (std::regex_search(bgContent, m, sdkRegex) && m.size() > 1) {
+                androidSdkVersion = "API " + m[1].str();
+            }
+        }
+    }
+
+    if (isAndroidApp && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
+        arch.type = "native_android";
+        arch.displayName = "Native Android Application (Gradle)";
+        arch.isDeployable = true;
+        arch.requiresDiversion = true;
+        arch.suggestedStrategy = "android_apk_download_server";
+        arch.details = "Detected a native Android application. StackPilot compiles the debug APK via Gradle and hosts an interactive download portal with a mobile install QR code on port 3000.";
+        arch.mobileMetadata.framework = "Native Android";
+        arch.mobileMetadata.bundleId = androidBundleId.empty() ? "com.android.app" : androidBundleId;
+        arch.mobileMetadata.appName = androidBundleId.empty() ? "Android App" : androidBundleId;
+        arch.mobileMetadata.sdkVersion = androidSdkVersion.empty() ? "API 34 (Android 14)" : androidSdkVersion;
+        arch.mobileMetadata.previewStrategy = "android_apk_download_server";
+        return arch;
+    }
 
     // 5. Check for Java Web / Spring Boot / Maven / Gradle
     if (hasFile(sourceDir, "pom.xml") || hasFile(sourceDir, "build.gradle") ||
@@ -2436,18 +2492,6 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         return arch;
     }
 
-    // 9. Native Android application
-    if (hasAndroidRoot && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
-        arch.type = "native_android";
-        arch.displayName = "Native Android Application (Gradle)";
-        arch.isDeployable = true;
-        arch.requiresDiversion = true;
-        arch.suggestedStrategy = "android_apk_download_server";
-        arch.details = "Detected a native Android application. StackPilot compiles the debug APK via Gradle and hosts an interactive download portal with a mobile install QR code on port 3000.";
-        arch.mobileMetadata.framework = "Native Android";
-        arch.mobileMetadata.previewStrategy = "android_apk_download_server";
-        return arch;
-    }
 
     // 10. Pure Python library check
     if ((hasFile(sourceDir, "setup.py") || hasFile(sourceDir, "pyproject.toml")) &&

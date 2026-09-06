@@ -248,6 +248,7 @@ void DeploymentJournal::hydrateRuntimeFields(Json::Value& dep, const pqxx::row& 
     dep["remote_container_name"] = remoteContainerName;
     dep["runtime_paused"] = row["runtime_paused"].is_null() ? false : row["runtime_paused"].as<bool>();
     dep["can_delete_image"] = !imageName.empty();
+    dep["runtime_snapshot"] = snapshot.isObject() ? snapshot : Json::Value(Json::objectValue);
 }
 
 Json::Value DeploymentJournal::loadSummary(const std::string& deploymentId) {

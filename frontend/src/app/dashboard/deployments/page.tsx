@@ -1106,16 +1106,16 @@ export default function DeploymentsPage() {
                             AI SRE Heal
                           </Button>
                         )}
-                        {liveUrl && isMobileDeployment(dep) && (
+                        {isMobileDeployment(dep) && (
                           <Button
                             variant="outline"
                             size="sm"
                             onClick={() => window.open(`/preview/${dep.id}`, "_blank")}
-                            className="shrink-0 gap-1.5 border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
+                            className="shrink-0 gap-1.5 border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 font-medium"
                             title="Open Interactive Mobile Device Studio in New Tab"
                           >
                             <AppIcon name="smartphone" fallback={Smartphone} className="w-4 h-4 mr-1 text-primary"  />
-                            Mobile Preview ↗
+                            Mobile Studio ↗
                           </Button>
                         )}
                         {(dep.status === "pending" || dep.status === "failed") && (

@@ -1350,6 +1350,80 @@ void DeploymentController::listUserDeployments(
     }
 }
 
+void DeploymentController::getDeployment(
+    const drogon::HttpRequestPtr& req,
+    std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+    const std::string& deploymentId
+) {
+    std::string userId = extractUserId(req);
+    if (userId.empty()) {
+        Json::Value err; err["error"] = "Unauthorized";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k401Unauthorized);
+        callback(resp); return;
+    }
+
+    try {
+        auto& db = Database::getInstance();
+        auto conn = db.getConnection();
+        pqxx::work txn(*conn);
+
+        auto result = txn.exec_params(
+            "SELECT d.id, d.project_id, p.name AS project_name, p.repo_url, d.status, d.version, d.commit_hash, "
+            "d.environment_id, e.name AS environment_name, d.branch, d.commit_sha, d.trigger_source, "
+            "d.github_delivery_id, d.ci_required, d.ci_status, d.image_name, "
+            "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
+            "d.desired_replicas, d.runtime_url, d.runtime_exposure, d.runtime_provider, d.remote_container_name, "
+            "d.runtime_paused, d.runtime_snapshot::text AS runtime_snapshot, d.created_at "
+            "FROM deployments d "
+            "JOIN projects p ON d.project_id = p.id "
+            "LEFT JOIN project_environments e ON d.environment_id = e.id "
+            "WHERE d.id = $1 AND has_project_access(p.id, $2) "
+            "LIMIT 1",
+            deploymentId, userId
+        );
+        txn.commit();
+
+        if (result.empty()) {
+            Json::Value err; err["error"] = "Deployment not found";
+            auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+            resp->setStatusCode(drogon::k404NotFound);
+            callback(resp); return;
+        }
+
+        const auto& row = result[0];
+        Json::Value dep;
+        dep["id"] = row["id"].as<std::string>();
+        dep["project_id"] = row["project_id"].as<std::string>();
+        dep["project_name"] = row["project_name"].as<std::string>();
+        dep["repo_url"] = row["repo_url"].is_null() ? "" : row["repo_url"].as<std::string>();
+        dep["status"] = row["status"].as<std::string>();
+        dep["version"] = row["version"].as<std::string>();
+        dep["commit_hash"] = row["commit_hash"].as<std::string>();
+        dep["environment_id"] = row["environment_id"].is_null() ? "" : row["environment_id"].as<std::string>();
+        dep["environment_name"] = row["environment_name"].is_null() ? "" : row["environment_name"].as<std::string>();
+        dep["branch"] = row["branch"].is_null() ? "" : row["branch"].as<std::string>();
+        dep["commit_sha"] = row["commit_sha"].is_null() ? "" : row["commit_sha"].as<std::string>();
+        dep["trigger_source"] = row["trigger_source"].is_null() ? "manual" : row["trigger_source"].as<std::string>();
+        dep["github_delivery_id"] = row["github_delivery_id"].is_null() ? "" : row["github_delivery_id"].as<std::string>();
+        dep["ci_required"] = row["ci_required"].is_null() ? false : row["ci_required"].as<bool>();
+        dep["ci_status"] = row["ci_status"].is_null() ? "not_required" : row["ci_status"].as<std::string>();
+        DeploymentJournal::hydrateRuntimeFields(dep, row);
+        dep["created_at"] = row["created_at"].as<std::string>();
+
+        Json::Value resp_body = dep;
+        resp_body["data"] = dep;
+        callback(drogon::HttpResponse::newHttpJsonResponse(resp_body));
+
+    } catch (const std::exception& e) {
+        spdlog::error("Get deployment error: {}", e.what());
+        Json::Value err; err["error"] = "Internal server error";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k500InternalServerError);
+        callback(resp);
+    }
+}
+
 void DeploymentController::triggerBuild(
     const drogon::HttpRequestPtr& req,
     std::function<void(const drogon::HttpResponsePtr&)>&& callback,

@@ -14,6 +14,7 @@ public:
     ADD_METHOD_TO(DeploymentController::createDeployment, "/api/v1/projects/{project_id}/deployments", drogon::Post);
     ADD_METHOD_TO(DeploymentController::listDeployments, "/api/v1/projects/{project_id}/deployments", drogon::Get);
     ADD_METHOD_TO(DeploymentController::listUserDeployments, "/api/v1/deployments", drogon::Get);
+    ADD_METHOD_TO(DeploymentController::getDeployment, "/api/v1/deployments/{deployment_id}", drogon::Get);
     ADD_METHOD_TO(DeploymentController::triggerBuild, "/api/v1/deployments/{deployment_id}/trigger", drogon::Post);
     ADD_METHOD_TO(DeploymentController::cancelDeployment, "/api/v1/deployments/{id}/cancel", drogon::Post);
     ADD_METHOD_TO(DeploymentController::getDeploymentLogs, "/api/v1/deployments/{deployment_id}/logs", drogon::Get);
@@ -42,6 +43,9 @@ public:
                          const std::string& projectId);
     void listUserDeployments(const drogon::HttpRequestPtr& req,
                              std::function<void(const drogon::HttpResponsePtr&)>&& callback);
+    void getDeployment(const drogon::HttpRequestPtr& req,
+                       std::function<void(const drogon::HttpResponsePtr&)>&& callback,
+                       const std::string& deploymentId);
     void triggerBuild(const drogon::HttpRequestPtr& req,
                       std::function<void(const drogon::HttpResponsePtr&)>&& callback,
                       const std::string& deploymentId);
