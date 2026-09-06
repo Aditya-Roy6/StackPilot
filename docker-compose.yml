@@ -276,6 +276,7 @@ services:
     volumes:
       - ./frontend:/app
       - /app/node_modules
+      - /app/.next
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:
