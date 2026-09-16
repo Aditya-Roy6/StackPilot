@@ -197,7 +197,7 @@ TEST(RunCommand, PollsReadinessBeforeReportingHealthy) {
     EXPECT_CONTAINS(cmd, "Container crashed on startup:");
     EXPECT_CONTAINS(cmd, "docker logs --tail 50 \"$container\"");
     EXPECT_CONTAINS(cmd, "curl -s -o /dev/null");
-    EXPECT_CONTAINS(cmd, "nc -z 127.0.0.1 \"$host_port\"");
+    EXPECT_CONTAINS(cmd, "curl -s -o /dev/null -w \\\"%{http_code}\\\"");
     EXPECT_CONTAINS(cmd, "__STACKPILOT_LOCAL_DOCKER_RUNNING__");
     EXPECT_CONTAINS(cmd, "__STACKPILOT_LOCAL_DOCKER_PORT__=$host_port");
 }
