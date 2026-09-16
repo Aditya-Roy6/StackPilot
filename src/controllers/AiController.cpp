@@ -1,8 +1,10 @@
 #include "AiController.h"
 #include "../utils/BlockingTaskRunner.h"
+#include "../utils/StringUtils.h"
 
 #include "../db/Database.h"
 #include "../services/AiServiceClient.h"
+#include "../services/BuildService.h"
 #include "../services/JobQueueService.h"
 #include "../utils/AiRedaction.h"
 #include "../utils/AuditLogger.h"
@@ -15,8 +17,9 @@
 #include <pqxx/pqxx>
 #include <spdlog/spdlog.h>
 #include <openssl/bio.h>
-#include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +39,31 @@
 namespace stackpilot {
 
 namespace {
+
+std::string normalizeDeploymentId(pqxx::work& txn, const std::string& inputId, const std::string& userId) {
+    std::string clean = strings::trim(inputId);
+    while (clean.size() >= 3 && clean.substr(clean.size() - 3) == "...") {
+        clean = clean.substr(0, clean.size() - 3);
+    }
+    clean = strings::trim(clean);
+    if (clean.empty()) return "";
+    if (clean.size() == 36 && clean.find('-') != std::string::npos) {
+        return clean; // Already a full UUID
+    }
+    if (clean.size() >= 8) {
+        try {
+            auto rows = txn.exec_params(
+                "SELECT d.id::text FROM deployments d JOIN projects p ON d.project_id = p.id "
+                "WHERE d.id::text LIKE $1 || '%' AND (p.user_id = $2 OR has_project_access(p.id, $2)) "
+                "ORDER BY d.created_at DESC LIMIT 1",
+                clean, userId);
+            if (!rows.empty() && !rows[0][0].is_null()) {
+                return rows[0][0].as<std::string>();
+            }
+        } catch (...) {}
+    }
+    return clean;
+}
 
 std::string envOrDefault(const char* key, const std::string& fallback) {
     const char* value = std::getenv(key);
@@ -373,7 +401,7 @@ Json::Value projectContext(pqxx::work& txn, const std::string& userId, const std
 
 Json::Value deploymentContext(pqxx::work& txn, const std::string& userId, const std::string& deploymentId) {
     const auto rows = txn.exec_params(
-        "SELECT d.id, d.project_id, d.status, d.version, d.commit_hash, d.logs, d.image_name, "
+        "SELECT d.id, d.project_id, d.status, d.version, d.commit_hash, d.logs, d.branch, d.image_name, "
         "d.runtime_provider, d.runtime_url, d.runtime_exposure, d.remote_container_name, "
         "d.k8s_namespace, d.k8s_deployment_name, d.k8s_service_name, d.k8s_ingress_name, "
         "d.desired_replicas, d.runtime_paused, d.artifact_available, d.artifact_digest, "
@@ -389,7 +417,7 @@ Json::Value deploymentContext(pqxx::work& txn, const std::string& userId, const 
     }
     const auto& row = rows[0];
     Json::Value deployment(Json::objectValue);
-    for (const auto& name : {"id", "project_id", "status", "version", "commit_hash", "logs", "image_name",
+    for (const auto& name : {"id", "project_id", "status", "version", "commit_hash", "logs", "branch", "image_name",
                              "runtime_provider", "runtime_url", "runtime_exposure", "remote_container_name",
                              "k8s_namespace", "k8s_deployment_name", "k8s_service_name", "k8s_ingress_name",
                              "artifact_digest", "created_at", "updated_at", "project_name"}) {
@@ -651,6 +679,9 @@ Json::Value buildPayload(const Json::Value& prefs,
     }
     if (body.isMember("session_id")) {
         payload["session_id"] = body["session_id"];
+    }
+    if (body.isMember("images")) {
+        payload["images"] = body["images"];
     }
     return AiRedaction::redactJson(payload, maxContextBytes());
 }
@@ -931,7 +962,8 @@ void AiController::chatAgent(const drogon::HttpRequestPtr& req,
         Json::Value deployment(Json::objectValue);
         Json::Value payload(Json::objectValue);
         std::string projectId = body.isMember("project_id") ? body["project_id"].asString() : "";
-        const std::string deploymentId = body.isMember("deployment_id") ? body["deployment_id"].asString() : "";
+        std::string deploymentId = body.isMember("deployment_id") ? body["deployment_id"].asString() : "";
+        std::string workflowType = body.isMember("workflow_type") ? body["workflow_type"].asString() : "agent_chat";
         const std::string userMessage = AiRedaction::redactText(body["message"].asString(), maxContextBytes());
         std::string sessionId = body.isMember("session_id") ? body["session_id"].asString() : "";
         std::string sessionTitle;
@@ -947,48 +979,91 @@ void AiController::chatAgent(const drogon::HttpRequestPtr& req,
                 return;
             }
 
-            if (!deploymentId.empty()) {
-                deployment = deploymentContext(txn, userId, deploymentId);
-                if (deployment.isNull()) {
-                    sendError(callback, drogon::k404NotFound, "Deployment not found");
-                    return;
-                }
-                projectId = deployment["project_id"].asString();
-            }
-
-            if (!projectId.empty()) {
-                project = projectContext(txn, userId, projectId);
-                if (project.isNull()) {
-                    sendError(callback, drogon::k404NotFound, "Project not found");
-                    return;
-                }
-            }
-
+            // Backend Session Context Resolution:
+            // When body contains session_id:
+            // If deployment_id is empty or project_id is empty, query ai_sessions in PostgreSQL:
+            // SELECT deployment_id, project_id, session_type FROM ai_sessions WHERE id = $1
+            // If found, populate deployment_id and project_id and workflow_type!
             if (!sessionId.empty()) {
                 const auto sessions = txn.exec_params(
-                    "SELECT id, title, memory_summary, memory_graph::text "
-                    "FROM ai_sessions WHERE id = $1 AND user_id = $2 AND session_type = 'agent_chat'",
+                    "SELECT id, title, project_id, deployment_id, session_type, memory_summary, memory_graph::text "
+                    "FROM ai_sessions WHERE id = $1 AND (user_id = $2 OR has_project_access(project_id, $2))",
                     sessionId,
                     userId);
                 if (sessions.empty()) {
                     sendError(callback, drogon::k404NotFound, "AI chat not found");
                     return;
                 }
-                sessionTitle = sessions[0]["title"].as<std::string>();
-                memorySummary = sessions[0]["memory_summary"].as<std::string>();
-                memoryGraph = parseJson(sessions[0]["memory_graph"].as<std::string>());
+                const auto& sRow = sessions[0];
+                if (deploymentId.empty() && !sRow["deployment_id"].is_null()) {
+                    deploymentId = sRow["deployment_id"].as<std::string>();
+                }
+                if (projectId.empty() && !sRow["project_id"].is_null()) {
+                    projectId = sRow["project_id"].as<std::string>();
+                }
+                if (!sRow["session_type"].is_null() && !sRow["session_type"].as<std::string>().empty()) {
+                    workflowType = sRow["session_type"].as<std::string>();
+                }
+                sessionTitle = sRow["title"].is_null() ? "" : sRow["title"].as<std::string>();
+                memorySummary = sRow["memory_summary"].is_null() ? "" : sRow["memory_summary"].as<std::string>();
+                memoryGraph = parseJson(sRow["memory_graph"].is_null() ? "" : sRow["memory_graph"].as<std::string>());
                 if (!memoryGraph.isObject()) {
                     memoryGraph = Json::Value(Json::objectValue);
                 }
             } else {
                 sessionTitle = chatTitleFromMessage(userMessage);
                 const auto rows = txn.exec_params(
-                    "INSERT INTO ai_sessions (user_id, project_id, title, session_type) "
-                    "VALUES ($1, NULLIF($2, '')::uuid, $3, 'agent_chat') RETURNING id",
+                    "INSERT INTO ai_sessions (user_id, project_id, title, session_type, deployment_id) "
+                    "VALUES ($1, NULLIF($2, '')::uuid, $3, $4, NULLIF($5, '')::uuid) RETURNING id",
                     userId,
                     projectId,
-                    sessionTitle);
+                    sessionTitle,
+                    workflowType.empty() ? "agent_chat" : workflowType,
+                    deploymentId);
                 sessionId = rows[0][0].as<std::string>();
+            }
+
+            // Query deployments table:
+            // SELECT d.id, d.status, d.logs, d.branch, p.id AS project_id, p.name AS project_name FROM deployments d JOIN projects p ON d.project_id = p.id WHERE d.id = $1
+            // Populate deployment JSON object (id, status, logs, branch) and project JSON object (id, name) so the AI service always receives complete deployment context!
+            if (!deploymentId.empty()) {
+                const auto dRows = txn.exec_params(
+                    "SELECT d.id, d.status, d.logs, d.branch, p.id AS project_id, p.name AS project_name "
+                    "FROM deployments d JOIN projects p ON d.project_id = p.id "
+                    "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))",
+                    deploymentId, userId);
+                if (dRows.empty()) {
+                    sendError(callback, drogon::k404NotFound, "Deployment not found");
+                    return;
+                }
+                deployment = deploymentContext(txn, userId, deploymentId);
+                if (deployment.isNull()) {
+                    deployment = Json::Value(Json::objectValue);
+                }
+                deployment["id"] = dRows[0]["id"].as<std::string>();
+                deployment["status"] = dRows[0]["status"].is_null() ? "" : dRows[0]["status"].as<std::string>();
+                deployment["logs"] = dRows[0]["logs"].is_null() ? "" : dRows[0]["logs"].as<std::string>();
+                deployment["branch"] = dRows[0]["branch"].is_null() ? "" : dRows[0]["branch"].as<std::string>();
+                if (projectId.empty() && !dRows[0]["project_id"].is_null()) {
+                    projectId = dRows[0]["project_id"].as<std::string>();
+                }
+                if (!project.isObject()) {
+                    project = Json::Value(Json::objectValue);
+                }
+                project["id"] = dRows[0]["project_id"].as<std::string>();
+                project["name"] = dRows[0]["project_name"].is_null() ? "" : dRows[0]["project_name"].as<std::string>();
+            }
+
+            if (!projectId.empty()) {
+                Json::Value fullProject = projectContext(txn, userId, projectId);
+                if (!fullProject.isNull()) {
+                    for (const auto& key : fullProject.getMemberNames()) {
+                        project[key] = fullProject[key];
+                    }
+                } else if (project.isNull() || !project.isMember("id")) {
+                    sendError(callback, drogon::k404NotFound, "Project not found");
+                    return;
+                }
             }
 
             const auto historyRows = txn.exec_params(
@@ -999,6 +1074,9 @@ void AiController::chatAgent(const drogon::HttpRequestPtr& req,
                 sessionId);
             body["history"] = buildHistory(historyRows);
             body["session_id"] = sessionId;
+            body["project_id"] = projectId;
+            body["deployment_id"] = deploymentId;
+            body["workflow_type"] = workflowType;
 
             const auto userMessageRows = txn.exec_params(
                 "INSERT INTO ai_messages (session_id, role, content) VALUES ($1, 'user', $2) RETURNING id",
@@ -1019,6 +1097,12 @@ void AiController::chatAgent(const drogon::HttpRequestPtr& req,
 
         payload = buildPayload(prefs, body, project, deployment);
         payload["user_id"] = userId;
+        payload["workflow_type"] = workflowType;
+        payload["project_id"] = projectId;
+        payload["deployment_id"] = deploymentId;
+        payload["deployment"] = deployment;
+        payload["project"] = project;
+
         Json::Value result = runWorkflow("/chat/agent", payload, providerOverrides(prefs));
         std::string runId;
         const std::string assistantMessage = result.isMember("summary") ? result["summary"].asString() : compactJson(result);
@@ -1026,7 +1110,7 @@ void AiController::chatAgent(const drogon::HttpRequestPtr& req,
 
         {
             pqxx::work txn(*conn);
-            runId = insertAiRun(txn, userId, "agent_chat", payload, result,
+            runId = insertAiRun(txn, userId, workflowType, payload, result,
                                 result.isMember("error") ? result["error"].asString() : "");
             linkAiRun(txn, runId, projectId, deploymentId);
             storeArtifacts(txn, runId, result);
@@ -1097,19 +1181,47 @@ void AiController::listSessions(const drogon::HttpRequestPtr& req,
         pqxx::work txn(*conn);
         const auto rows = txn.exec_params(
             "SELECT s.id, s.title, s.session_type, s.project_id, s.memory_summary, s.last_model, "
+            "COALESCE(s.status, 'active') AS status, "
+            "s.deployment_id, "
             "s.created_at, s.updated_at, "
             "(SELECT COUNT(*) FROM ai_messages m WHERE m.session_id = s.id) AS message_count, "
-            "COALESCE((SELECT m.content FROM ai_messages m WHERE m.session_id = s.id ORDER BY m.created_at DESC LIMIT 1), '') AS preview "
-            "FROM ai_sessions s WHERE s.user_id = $1 AND s.session_type IN ('agent_chat', 'project_chat') "
+            "COALESCE((SELECT SUBSTRING(m.content FROM 1 FOR 2000) FROM ai_messages m WHERE m.session_id = s.id ORDER BY m.created_at DESC LIMIT 1), '') AS preview "
+            "FROM ai_sessions s WHERE s.user_id = $1 AND s.session_type IN ('agent_chat', 'project_chat', 'sre_incident') "
             "ORDER BY s.updated_at DESC LIMIT 100",
             userId);
+
+        auto sanitizePreview = [](std::string text) -> std::string {
+            if (text.empty()) return "";
+            try {
+                static const std::regex dataUriRegex(R"(data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]+)");
+                text = std::regex_replace(text, dataUriRegex, "[image snapshot]");
+            } catch (...) {}
+            for (char& c : text) {
+                if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+            }
+            try {
+                static const std::regex spaceRegex(R"(\s+)");
+                text = std::regex_replace(text, spaceRegex, " ");
+            } catch (...) {}
+            size_t first = text.find_first_not_of(' ');
+            if (first == std::string::npos) return "";
+            text = text.substr(first);
+            if (text.size() > 250) {
+                text = text.substr(0, 247) + "...";
+            }
+            return text;
+        };
+
         Json::Value sessions(Json::arrayValue);
         for (const auto& row : rows) {
             Json::Value session(Json::objectValue);
-            for (const auto& name : {"id", "title", "session_type", "created_at", "updated_at", "memory_summary", "last_model", "preview"}) {
+            for (const auto& name : {"id", "title", "session_type", "created_at", "updated_at", "memory_summary", "last_model", "status"}) {
                 session[name] = row[name].is_null() ? "" : row[name].as<std::string>();
             }
+            std::string rawPreview = row["preview"].is_null() ? "" : row["preview"].as<std::string>();
+            session["preview"] = sanitizePreview(rawPreview);
             session["project_id"] = row["project_id"].is_null() ? "" : row["project_id"].as<std::string>();
+            session["deployment_id"] = row["deployment_id"].is_null() ? "" : row["deployment_id"].as<std::string>();
             session["message_count"] = row["message_count"].as<int>();
             sessions.append(session);
         }
@@ -1137,7 +1249,8 @@ void AiController::getSession(const drogon::HttpRequestPtr& req,
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
         const auto sessions = txn.exec_params(
-            "SELECT id, title, session_type, project_id, memory_summary, memory_graph::text, last_model, created_at, updated_at "
+            "SELECT id, title, session_type, project_id, memory_summary, memory_graph::text, last_model, "
+            "COALESCE(status, 'active') AS status, deployment_id, created_at, updated_at "
             "FROM ai_sessions WHERE id = $1 AND user_id = $2",
             sessionId,
             userId);
@@ -1148,10 +1261,11 @@ void AiController::getSession(const drogon::HttpRequestPtr& req,
 
         const auto& row = sessions[0];
         Json::Value session(Json::objectValue);
-        for (const auto& name : {"id", "title", "session_type", "created_at", "updated_at", "memory_summary", "last_model"}) {
+        for (const auto& name : {"id", "title", "session_type", "created_at", "updated_at", "memory_summary", "last_model", "status"}) {
             session[name] = row[name].is_null() ? "" : row[name].as<std::string>();
         }
         session["project_id"] = row["project_id"].is_null() ? "" : row["project_id"].as<std::string>();
+        session["deployment_id"] = row["deployment_id"].is_null() ? "" : row["deployment_id"].as<std::string>();
         session["memory_graph"] = parseJson(row["memory_graph"].as<std::string>());
 
         const auto messagesRows = txn.exec_params(
@@ -1682,7 +1796,12 @@ void AiController::repairDeployment(const drogon::HttpRequestPtr& req,
                             relPath.find("package.json") != std::string::npos ||
                             relPath.find("nginx") != std::string::npos ||
                             relPath.find(".env") != std::string::npos ||
-                            relPath.find("requirements.txt") != std::string::npos) {
+                            relPath.find("requirements.txt") != std::string::npos ||
+                            relPath.find("build.gradle") != std::string::npos ||
+                            relPath.find("pom.xml") != std::string::npos ||
+                            relPath.find("conveyor.conf") != std::string::npos ||
+                            relPath.find("Cargo.toml") != std::string::npos ||
+                            relPath.find("go.mod") != std::string::npos) {
                             std::ifstream f(entry.path());
                             if (f.is_open()) {
                                 std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -1757,7 +1876,26 @@ void AiController::repairDeployment(const drogon::HttpRequestPtr& req,
             }
         }
 
-        // If no file changes were generated, do not queue an unrepaired deployment build
+        // If no file changes were generated, check if the project lacks a Dockerfile and auto-generate
+        if (appliedChanges.empty()) {
+            if (!std::filesystem::exists(sourceDir / "Dockerfile")) {
+                BuildService fallbackBs;
+                std::string genReason;
+                std::filesystem::path buildLogPath = std::filesystem::path("uploads/builds") / deploymentId / "build.log";
+                if (fallbackBs.ensureDockerfile(sourceDir, buildLogPath, genReason, nullptr)) {
+                    Json::Value autoChange;
+                    autoChange["path"] = "Dockerfile";
+                    autoChange["action"] = "create";
+                    autoChange["description"] = "StackPilot AI SRE auto-generated optimized container Dockerfile";
+                    appliedChanges.append(autoChange);
+                    result["summary"] = "AI identified missing container configuration. StackPilot auto-generated an optimized Dockerfile.";
+                    result["structured_output"]["summary"] = result["summary"];
+                    result["status"] = "success";
+                }
+            }
+        }
+
+        // If still no file changes were generated, do not queue an unrepaired deployment build
         if (appliedChanges.empty()) {
             result["status"] = "no_changes";
             if (!result.isMember("summary") || result["summary"].asString().empty()) {
@@ -2029,10 +2167,12 @@ int runCommandCaptureExitHelper(const std::string& command, std::string& output)
 }
 
 std::filesystem::path resolveSourceWorkspace(pqxx::work& txn, const std::string& userId,
-                                            const std::string& depId, const std::string& projId,
+                                            std::string depId, const std::string& projId,
                                             std::string& err) {
     namespace fs = std::filesystem;
     err.clear();
+
+    depId = normalizeDeploymentId(txn, depId, userId);
 
     if (!depId.empty()) {
         auto ownerCheck = txn.exec_params(
@@ -2113,13 +2253,17 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                                    std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
     // Accept requests from internal AI service token OR authenticated user session
     const char* serviceToken = std::getenv("STACKPILOT_AI_SERVICE_TOKEN");
+    std::string expectedToken = (serviceToken && *serviceToken) ? serviceToken : "";
     std::string reqToken = req->getHeader("x-stackpilot-service-token");
     if (reqToken.empty()) {
         reqToken = req->getHeader("X-StackPilot-Service-Token");
     }
 
     std::string userId;
-    bool isService = (serviceToken && *serviceToken && reqToken == serviceToken);
+    bool isService = false;
+    if (!expectedToken.empty() && !reqToken.empty() && reqToken.size() == expectedToken.size()) {
+        isService = (CRYPTO_memcmp(reqToken.data(), expectedToken.data(), expectedToken.size()) == 0);
+    }
     if (!isService) {
         userId = extractUserId(req);
         if (userId.empty()) {
@@ -2160,7 +2304,7 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
         }
     }
 
-    BlockingTaskRunner::run([toolName, userId, args, callback{std::move(callback)}]() {
+    BlockingTaskRunner::run([toolName, userId, args, callback{std::move(callback)}]() mutable {
         try {
             auto conn = Database::getInstance().getConnection();
             pqxx::work txn(*conn);
@@ -2168,7 +2312,8 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
             Json::Value result(Json::objectValue);
 
             if (toolName == "get_deployment_status") {
-                std::string depId = args["deployment_id"].asString();
+                std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 const auto rows = txn.exec_params(
                     "SELECT d.id, d.status, d.runtime_url, p.name as project_name, d.created_at "
                     "FROM deployments d JOIN projects p ON d.project_id = p.id "
@@ -2211,8 +2356,46 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                     projs.append(p);
                 }
                 result["projects"] = projs;
+            } else if (toolName == "get_session_context") {
+                std::string sessId = args.isMember("session_id") ? args["session_id"].asString() : "";
+                if (!sessId.empty()) {
+                    const auto rows = txn.exec_params(
+                        "SELECT id, project_id, deployment_id, session_type, status FROM ai_sessions WHERE id = $1",
+                        sessId);
+                    if (!rows.empty()) {
+                        result["session_id"] = rows[0]["id"].as<std::string>();
+                        result["project_id"] = rows[0]["project_id"].is_null() ? "" : rows[0]["project_id"].as<std::string>();
+                        result["deployment_id"] = rows[0]["deployment_id"].is_null() ? "" : rows[0]["deployment_id"].as<std::string>();
+                        result["session_type"] = rows[0]["session_type"].as<std::string>();
+                        result["status"] = rows[0]["status"].as<std::string>();
+                        std::string depId = result["deployment_id"].asString();
+                        std::string projId = result["project_id"].asString();
+                        if (depId.empty() && !projId.empty()) {
+                            const auto dLatest = txn.exec_params(
+                                "SELECT id, status, logs FROM deployments WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1",
+                                projId);
+                            if (!dLatest.empty()) {
+                                depId = dLatest[0]["id"].as<std::string>();
+                                result["deployment_id"] = depId;
+                                result["deployment_status"] = dLatest[0]["status"].as<std::string>();
+                                result["logs"] = dLatest[0]["logs"].is_null() ? "" : dLatest[0]["logs"].as<std::string>();
+                            }
+                        } else if (!depId.empty()) {
+                            const auto dRows = txn.exec_params("SELECT status, logs FROM deployments WHERE id = $1", depId);
+                            if (!dRows.empty()) {
+                                result["deployment_status"] = dRows[0]["status"].as<std::string>();
+                                result["logs"] = dRows[0]["logs"].is_null() ? "" : dRows[0]["logs"].as<std::string>();
+                            }
+                        }
+                    } else {
+                        result["error"] = "Session not found";
+                    }
+                } else {
+                    result["error"] = "Missing session_id";
+                }
             } else if (toolName == "workspace_list_files") {
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 std::string projId = args.isMember("project_id") ? args["project_id"].asString() : "";
                 std::string subPath = args.isMember("path") ? args["path"].asString() : "";
 
@@ -2246,6 +2429,7 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                 }
             } else if (toolName == "workspace_read_file") {
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 std::string projId = args.isMember("project_id") ? args["project_id"].asString() : "";
                 std::string filePath = args["file_path"].asString();
 
@@ -2278,6 +2462,7 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                 }
             } else if (toolName == "workspace_write_file") {
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 std::string projId = args.isMember("project_id") ? args["project_id"].asString() : "";
                 std::string filePath = args["file_path"].asString();
                 std::string content = args["content"].asString();
@@ -2310,6 +2495,7 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                 }
             } else if (toolName == "workspace_edit_file") {
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 std::string projId = args.isMember("project_id") ? args["project_id"].asString() : "";
                 std::string filePath = args["file_path"].asString();
                 std::string target = args["target"].asString();
@@ -2351,11 +2537,24 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
             } else if (toolName == "terminal_run_command") {
                 std::string cmd = args["command"].asString();
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 std::string projId = args.isMember("project_id") ? args["project_id"].asString() : "";
 
                 std::string lowerCmd = cmd;
                 std::transform(lowerCmd.begin(), lowerCmd.end(), lowerCmd.begin(), ::tolower);
-                if (lowerCmd.find("rm -rf /") != std::string::npos ||
+                if (lowerCmd.find("apt-get") != std::string::npos ||
+                    lowerCmd.find("apt ") != std::string::npos ||
+                    lowerCmd.find("sudo ") != std::string::npos ||
+                    lowerCmd.find("yum ") != std::string::npos ||
+                    lowerCmd.find("pacman ") != std::string::npos ||
+                    lowerCmd.find("apk add") != std::string::npos) {
+                    result["status"] = "error";
+                    result["exit_code"] = 126;
+                    result["error"] = "System package manager commands ('apt-get', 'sudo', 'apk', 'yum') cannot be executed in the workspace terminal because the backend runs as an unprivileged process.";
+                    result["output"] = result["error"].asString() + "\nHint: To install packages or compilers, define them in a Dockerfile using 'workspace_write_file' or 'workspace_edit_file', then trigger a containerized build using 'workspace_trigger_rebuild'.";
+                    result["stderr"] = result["output"];
+                    result["hint"] = "Configure your dependencies in a Dockerfile and invoke workspace_trigger_rebuild.";
+                } else if (lowerCmd.find("rm -rf /") != std::string::npos ||
                     lowerCmd.find("mkfs") != std::string::npos ||
                     lowerCmd.find("reboot") != std::string::npos ||
                     lowerCmd.find("shutdown") != std::string::npos) {
@@ -2398,44 +2597,55 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                     }
                 }
             } else if (toolName == "workspace_trigger_rebuild") {
-                std::string depId = args["deployment_id"].asString();
+                std::string depId = normalizeDeploymentId(txn, args["deployment_id"].asString(), userId);
+                args["deployment_id"] = depId;
 
                 auto depRows = txn.exec_params(
                     "SELECT d.id FROM deployments d JOIN projects p ON d.project_id = p.id "
-                    "WHERE d.id = $1 AND p.user_id = $2", depId, userId);
+                    "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))", depId, userId);
                 if (depRows.empty()) {
-                    result["error"] = "Deployment not found or not owned by user";
+                    result["error"] = "Deployment not found or access denied";
                 } else {
                     namespace fs = std::filesystem;
                     fs::path sourceDir = fs::path("uploads/builds") / depId / "source";
                     if (!fs::exists(sourceDir)) {
                         result["error"] = "No source workspace found. The deployment must be built at least once before triggering a rebuild.";
                     } else {
-                        auto jobRows = txn.exec_params(
-                            "INSERT INTO deployment_jobs (deployment_id, user_id, type, status, metadata, created_at) "
-                            "VALUES ($1, $2, 'deployment_build', 'queued', '{\"ai_repair\": true}'::jsonb, NOW()) "
-                            "RETURNING id",
-                            depId, userId);
-                        std::string jobId = jobRows[0]["id"].as<std::string>();
-                        txn.exec_params(
-                            "UPDATE deployments SET status = 'queued', job_id = $1, updated_at = NOW() WHERE id = $2",
-                            jobId, depId);
+                        txn.commit();
+                        txnCommitted = true;
+
+                        std::string sessionId = args.isMember("session_id") ? args["session_id"].asString() : "";
+                        Json::Value meta(Json::objectValue);
+                        meta["ai_repair"] = true;
+                        if (!sessionId.empty()) {
+                            meta["ai_session_id"] = sessionId;
+                        }
+                        Json::StreamWriterBuilder writer;
+                        writer["indentation"] = "";
+                        std::string metaStr = Json::writeString(writer, meta);
+
+                        Json::Value job = JobQueueService::getInstance().enqueueDeploymentBuild(
+                            depId, userId,
+                            "AI rebuild queued from modified source workspace.",
+                            metaStr
+                        );
                         result["status"] = "rebuild_queued";
-                        result["job_id"] = jobId;
+                        result["deployment_id"] = depId;
+                        result["job_id"] = job["id"].asString();
                         result["message"] = "Rebuild from modified source queued successfully. The build will use your edited files without re-cloning.";
                     }
                 }
             } else if (toolName == "wait_for_deployment") {
+                std::string depId = normalizeDeploymentId(txn, args["deployment_id"].asString(), userId);
                 txn.commit();
                 txnCommitted = true;
 
-                std::string depId = args["deployment_id"].asString();
-                int timeoutSec = 90;
+                int timeoutSec = 180;
                 if (args.isMember("timeout_seconds")) {
                     if (args["timeout_seconds"].isInt()) {
-                        timeoutSec = std::clamp(args["timeout_seconds"].asInt(), 10, 180);
+                        timeoutSec = std::clamp(args["timeout_seconds"].asInt(), 10, 600);
                     } else if (args["timeout_seconds"].isString()) {
-                        try { timeoutSec = std::clamp(std::stoi(args["timeout_seconds"].asString()), 10, 180); } catch (...) {}
+                        try { timeoutSec = std::clamp(std::stoi(args["timeout_seconds"].asString()), 10, 600); } catch (...) {}
                     }
                 }
                 
@@ -2488,8 +2698,8 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                     result["message"] = "Deployment is live and running successfully!";
                 } else if (currentStatus == "failed" || currentStatus == "error" || currentStatus == "crash_loop_backoff") {
                     result["message"] = "Deployment failed. Inspect the logs in recent_logs to apply further fixes.";
-                    if (logs.size() > 2048) {
-                        result["recent_logs"] = logs.substr(logs.size() - 2048);
+                    if (logs.size() > 4096) {
+                        result["recent_logs"] = logs.substr(logs.size() - 4096);
                     } else {
                         result["recent_logs"] = logs;
                     }
@@ -2497,7 +2707,8 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                     result["message"] = "Deployment still in progress (" + currentStatus + ") after " + std::to_string(totalElapsed) + " seconds.";
                 }
             } else if (toolName == "get_deployment_logs") {
-                std::string depId = args["deployment_id"].asString();
+                std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 auto depRows = txn.exec_params(
                     "SELECT d.id, d.status, d.logs FROM deployments d JOIN projects p ON d.project_id = p.id "
                     "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))", depId, userId);
@@ -2515,7 +2726,8 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                     }
                 }
             } else if (toolName == "get_deployment_metrics") {
-                std::string depId = args["deployment_id"].asString();
+                std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 auto depRows = txn.exec_params(
                     "SELECT d.id, d.status, d.runtime_url FROM deployments d JOIN projects p ON d.project_id = p.id "
                     "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))", depId, userId);
@@ -2531,6 +2743,7 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                 }
             } else if (toolName == "scale_deployment") {
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 int replicas = 1;
                 if (args.isMember("replicas")) {
                     if (args["replicas"].isInt()) replicas = args["replicas"].asInt();
@@ -2554,28 +2767,29 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                 }
             } else if (toolName == "trigger_build") {
                 std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 auto depRows = txn.exec_params(
                     "SELECT d.id, d.project_id FROM deployments d JOIN projects p ON d.project_id = p.id "
                     "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))", depId, userId);
                 if (depRows.empty()) {
                     result["error"] = "Deployment not found or access denied";
                 } else {
-                    auto jobRows = txn.exec_params(
-                        "INSERT INTO deployment_jobs (deployment_id, user_id, type, status, metadata, created_at) "
-                        "VALUES ($1, $2, 'deployment_build', 'queued', '{\"triggered_by\":\"ai\"}'::jsonb, NOW()) "
-                        "RETURNING id",
-                        depId, userId);
-                    std::string jobId = jobRows[0]["id"].as<std::string>();
-                    txn.exec_params(
-                        "UPDATE deployments SET status = 'queued', job_id = $1, updated_at = NOW() WHERE id = $2",
-                        jobId, depId);
+                    txn.commit();
+                    txnCommitted = true;
+
+                    Json::Value job = JobQueueService::getInstance().enqueueDeploymentBuild(
+                        depId, userId,
+                        "Deployment build queued by AI assistant.",
+                        "{\"triggered_by\":\"ai\"}"
+                    );
                     result["status"] = "build_queued";
                     result["deployment_id"] = depId;
-                    result["job_id"] = jobId;
+                    result["job_id"] = job["id"].asString();
                     result["message"] = "Deployment build queued successfully.";
                 }
             } else if (toolName == "get_kubernetes_events") {
-                std::string depId = args["deployment_id"].asString();
+                std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 auto depRows = txn.exec_params(
                     "SELECT d.id, d.status, d.logs FROM deployments d JOIN projects p ON d.project_id = p.id "
                     "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))", depId, userId);
@@ -2587,7 +2801,8 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                     result["events"] = "Pod scheduled. Container initialized. Exit code recorded in logs.";
                 }
             } else if (toolName == "repair_deployment") {
-                std::string depId = args["deployment_id"].asString();
+                std::string depId = args.isMember("deployment_id") ? args["deployment_id"].asString() : "";
+                depId = normalizeDeploymentId(txn, depId, userId);
                 std::string problemDesc = args.isMember("problem_description") ? args["problem_description"].asString() : "";
                 
                 auto depRows = txn.exec_params(
@@ -2596,21 +2811,18 @@ void AiController::executeToolCall(const drogon::HttpRequestPtr& req,
                 if (depRows.empty()) {
                     result["error"] = "Deployment not found or access denied";
                 } else {
-                    // Trigger rebuild for ai_repair
-                    std::string projId = depRows[0]["project_id"].as<std::string>();
-                    auto jobRows = txn.exec_params(
-                        "INSERT INTO deployment_jobs (deployment_id, user_id, type, status, metadata, created_at) "
-                        "VALUES ($1, $2, 'deployment_build', 'queued', '{\"ai_repair\": true}'::jsonb, NOW()) "
-                        "RETURNING id",
-                        depId, userId);
-                    std::string jobId = jobRows[0]["id"].as<std::string>();
-                    txn.exec_params(
-                        "UPDATE deployments SET status = 'queued', job_id = $1, trigger_source = 'ai_repair', updated_at = NOW() WHERE id = $2",
-                        jobId, depId);
-                    result["status"] = "repair_queued";
+                    txn.commit();
+                    txnCommitted = true;
+
+                    Json::Value job = JobQueueService::getInstance().enqueueDeploymentBuild(
+                        depId, userId,
+                        "AI repair rebuild queued.",
+                        "{\"ai_repair\": true}"
+                    );
+                    result["status"] = "rebuild_queued";
                     result["deployment_id"] = depId;
-                    result["job_id"] = jobId;
-                    result["message"] = "Autonomous repair rebuild queued. File changes have been scheduled for build.";
+                    result["job_id"] = job["id"].asString();
+                    result["message"] = "Autonomous repair rebuild queued. The build has been scheduled for the background worker.";
                 }
             } else {
                 result["error"] = "Unknown tool: " + toolName;

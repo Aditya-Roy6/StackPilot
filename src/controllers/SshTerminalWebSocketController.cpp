@@ -14,6 +14,7 @@
 #include <pty.h>
 #include <signal.h>
 #include <spdlog/spdlog.h>
+#include <trantor/utils/Logger.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -279,18 +280,24 @@ void SshTerminalWebSocketController::handleNewConnection(
         sendJson(conn, "ready", "SSH terminal connected");
 
         session->reader = std::thread([conn, session]() {
-            char buffer[4096];
-            while (!session->closed.load()) {
-                const ssize_t readBytes = ::read(session->masterFd, buffer, sizeof(buffer));
-                if (readBytes > 0) {
-                    conn->send(std::string(buffer, static_cast<size_t>(readBytes)));
-                    continue;
+            try {
+                char buffer[4096];
+                while (!session->closed.load()) {
+                    const ssize_t readBytes = ::read(session->masterFd, buffer, sizeof(buffer));
+                    if (readBytes > 0) {
+                        conn->send(std::string(buffer, static_cast<size_t>(readBytes)));
+                        continue;
+                    }
+                    break;
                 }
-                break;
-            }
-            if (!session->closed.exchange(true)) {
-                sendJson(conn, "closed", "SSH terminal closed");
-                conn->shutdown();
+                if (!session->closed.exchange(true)) {
+                    sendJson(conn, "closed", "SSH terminal closed");
+                    conn->shutdown();
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR << "SSH reader thread exception: " << e.what();
+            } catch (...) {
+                LOG_ERROR << "SSH reader thread unknown exception";
             }
         });
 

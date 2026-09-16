@@ -20,6 +20,21 @@ export type AgentStreamEvent =
       risk_level?: string;
       token?: string;
     }
+  | {
+      type: "subagent_start";
+      id?: string;
+      role?: string;
+      title?: string;
+      task?: string;
+      status?: string;
+    }
+  | {
+      type: "subagent_complete";
+      id?: string;
+      role?: string;
+      result?: string;
+      status?: string;
+    }
   | { type: "error"; error: string }
   | {
       type: "done";
@@ -41,12 +56,15 @@ export interface StreamAgentOptions {
   projectId?: string;
   deploymentId?: string;
   command?: string;
+  workflowType?: string;
   modelMode?: "fast" | "thinking";
   model?: string;
   provider?: string;
   project?: unknown;
   agentAccessMode?: "ask" | "auto_review" | "full_access";
   remoteTerminal?: "ask" | "allow";
+  images?: string[];
+  customUrl?: string;
   signal?: AbortSignal;
   onEvent: (event: AgentStreamEvent) => void;
 }
@@ -57,12 +75,15 @@ export async function streamAgentReply({
   projectId,
   deploymentId,
   command,
+  workflowType,
   modelMode = "fast",
   model,
   provider,
   project,
   agentAccessMode,
   remoteTerminal,
+  images,
+  customUrl,
   signal,
   onEvent,
 }: StreamAgentOptions): Promise<void> {
@@ -79,13 +100,17 @@ export async function streamAgentReply({
       ...(sessionId ? { session_id: sessionId } : {}),
       ...(projectId ? { project_id: projectId } : {}),
       ...(deploymentId ? { deployment_id: deploymentId } : {}),
+      ...(customUrl ? { custom_url: customUrl } : {}),
       ...(command ? { command } : {}),
+      ...(workflowType ? { workflow_type: workflowType } : {}),
       ...(model ? { model } : {}),
       ...(provider ? { provider } : {}),
       ...(project ? { project } : {}),
       ...(agentAccessMode ? { agent_access_mode: agentAccessMode } : {}),
       ...(remoteTerminal ? { remote_terminal: remoteTerminal } : {}),
+      ...(images && images.length > 0 ? { images } : {}),
       runtime: {
+        ...(customUrl ? { url: customUrl, custom_url: customUrl } : {}),
         permissions: {
           agent_access_mode: agentAccessMode || "ask",
           remote_terminal: remoteTerminal || "ask",

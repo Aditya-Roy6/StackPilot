@@ -5,14 +5,12 @@ import { AppIcon } from "@/lib/custom-icons";
 
 import { Button } from "@/components/ui/button";
 
-// This Next version passes `unstable_retry`, not `reset` — destructuring `reset`
-// yields undefined and the retry button throws on click.
 export default function AiAgentError({
   error,
-  unstable_retry,
+  reset,
 }: {
   error: Error & { digest?: string };
-  unstable_retry: () => void;
+  reset: () => void;
 }) {
   return (
     <div className="flex h-[calc(100dvh-8rem)] min-h-[32rem] items-center justify-center rounded-xl border border-border bg-card p-6 text-card-foreground">
@@ -29,7 +27,7 @@ export default function AiAgentError({
             <AppIcon name="arrow-left" fallback={ArrowLeft} className="h-4 w-4"  />
             Back
           </Button>
-          <Button type="button" onClick={() => unstable_retry()}>
+          <Button type="button" onClick={() => reset()}>
             <AppIcon name="rotate-ccw" fallback={RotateCcw} className="h-4 w-4"  />
             Reload
           </Button>

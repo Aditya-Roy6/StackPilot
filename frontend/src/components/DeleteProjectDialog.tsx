@@ -49,12 +49,22 @@ export function DeleteProjectDialog({ projectId, projectName }: DeleteProjectDia
     }
   });
 
-  const isConfirmed = confirmName === projectName;
+  const isConfirmed =
+    confirmName.trim() === projectName ||
+    confirmName.trim().toLowerCase() === projectName.trim().toLowerCase();
   const copyConfirmationText = async () => {
     try {
-      await navigator.clipboard.writeText(projectName);
-      setConfirmName(projectName);
-      toast.success("Confirmation text copied");
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(projectName);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = projectName;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textArea);
+      }
+      toast.success("Confirmation text copied to clipboard");
     } catch {
       toast.error("Unable to copy confirmation text");
     }
@@ -93,6 +103,12 @@ export function DeleteProjectDialog({ projectId, projectName }: DeleteProjectDia
           <Input
             value={confirmName}
             onChange={(e) => setConfirmName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && isConfirmed && !deleteMutation.isPending) {
+                e.preventDefault();
+                deleteMutation.mutate();
+              }
+            }}
             placeholder="Type project name here..."
             className="focus-visible:border-destructive focus-visible:ring-destructive/20"
           />

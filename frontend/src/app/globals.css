@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@xterm/xterm/css/xterm.css";
+@import "flowtoken/dist/styles.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -49,6 +50,26 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  /* Beautiful UI tokens */
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-surface: var(--surface);
+  --color-field: var(--field);
+  --color-inset: var(--inset);
+  --color-hover: var(--hover);
+  --color-hover-2: var(--hover-2);
+  --color-green: var(--green);
+  --color-red: var(--red);
+  --color-green-tint: var(--green-tint);
+  --color-red-tint: var(--red-tint);
+  --radius-control: 6px;
+  --radius-chip: 6px;
+  --shadow-hairline: 0 0 0 1px var(--line);
+  --shadow-btn: 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+  --shadow-overlay: 0 10px 30px -5px rgba(0, 0, 0, 0.4), 0 4px 12px -2px rgba(0, 0, 0, 0.25);
 }
 
 :root {
@@ -84,6 +105,22 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+
+  /* Beautiful UI tokens (Light Mode) */
+  --ink: oklch(0.145 0 0);
+  --ink-2: oklch(0.45 0 0);
+  --ink-3: oklch(0.65 0 0);
+  --line: oklch(0.922 0 0);
+  --line-strong: oklch(0.82 0 0);
+  --surface: #ffffff;
+  --field: oklch(0.97 0 0);
+  --inset: oklch(0.95 0 0);
+  --hover: oklch(0.96 0 0);
+  --hover-2: oklch(0.94 0 0);
+  --green: #10b981;
+  --red: #ef4444;
+  --green-tint: rgba(16, 185, 129, 0.12);
+  --red-tint: rgba(239, 68, 68, 0.12);
 }
 
 .dark {
@@ -113,6 +150,22 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+
+  /* Beautiful UI tokens (Dark Mode) */
+  --ink: oklch(0.985 0 0);
+  --ink-2: oklch(0.75 0 0);
+  --ink-3: oklch(0.55 0 0);
+  --line: oklch(1 0 0 / 12%);
+  --line-strong: oklch(1 0 0 / 22%);
+  --surface: oklch(0.18 0 0);
+  --field: oklch(0.22 0 0);
+  --inset: oklch(0.25 0 0);
+  --hover: oklch(1 0 0 / 6%);
+  --hover-2: oklch(1 0 0 / 10%);
+  --green: #34d399;
+  --red: #f87171;
+  --green-tint: rgba(52, 211, 153, 0.15);
+  --red-tint: rgba(248, 113, 113, 0.15);
 }
 
 @layer base {
@@ -675,6 +728,885 @@
   --sidebar-ring: #bd93f9;
 }
 
+/* ---------- Ant Design (Enterprise UI by Ant Group) ----------
+   Tokens & component patterns follow official https://ant.design/ specifications:
+   - Primary: #1677ff Daybreak Blue (geekblue/blue-6)
+   - Font: system typeface stack with Segoe UI / Roboto
+   - Base radius: 6px (sm: 4px, lg: 8px)
+   - Crisp 1px border dividers (#d9d9d9 & #f0f0f0)
+   - Structured cards with distinct header divider
+   - Signature subtle button/card/modal elevation shadows
+   - Daybreak Blue focus rings with 2px spread */
+[data-ui-theme="antd"] {
+  --app-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --radius: 0.375rem;
+
+  --background: #f5f5f5;
+  --foreground: rgba(0, 0, 0, 0.88);
+  --card: #ffffff;
+  --card-foreground: rgba(0, 0, 0, 0.88);
+  --popover: #ffffff;
+  --popover-foreground: rgba(0, 0, 0, 0.88);
+  --primary: #1677ff;
+  --primary-foreground: #ffffff;
+  --secondary: #f5f5f5;
+  --secondary-foreground: rgba(0, 0, 0, 0.88);
+  --muted: #f5f5f5;
+  --muted-foreground: rgba(0, 0, 0, 0.45);
+  --accent: #e6f4ff;
+  --accent-foreground: #1677ff;
+  --destructive: #ff4d4f;
+  --border: #d9d9d9;
+  --input: #d9d9d9;
+  --ring: #1677ff;
+  --sidebar: #ffffff;
+  --sidebar-foreground: rgba(0, 0, 0, 0.88);
+  --sidebar-primary: #1677ff;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e6f4ff;
+  --sidebar-accent-foreground: #1677ff;
+  --sidebar-border: #f0f0f0;
+  --sidebar-ring: #1677ff;
+
+  /* Ant Design tokens for Beautiful UI extensions */
+  --ink: rgba(0, 0, 0, 0.88);
+  --ink-2: rgba(0, 0, 0, 0.65);
+  --ink-3: rgba(0, 0, 0, 0.45);
+  --line: #d9d9d9;
+  --line-strong: #bfbfbf;
+  --surface: #ffffff;
+  --field: #ffffff;
+  --inset: #f5f5f5;
+  --hover: #f5f5f5;
+  --hover-2: #e6f4ff;
+  --green: #52c41a;
+  --red: #ff4d4f;
+  --green-tint: rgba(82, 196, 26, 0.12);
+  --red-tint: rgba(255, 77, 79, 0.12);
+}
+
+[data-ui-theme="antd"].dark {
+  --background: #000000;
+  --foreground: rgba(255, 255, 255, 0.85);
+  --card: #141414;
+  --card-foreground: rgba(255, 255, 255, 0.85);
+  --popover: #1f1f1f;
+  --popover-foreground: rgba(255, 255, 255, 0.85);
+  --primary: #1668dc;
+  --primary-foreground: #ffffff;
+  --secondary: #1f1f1f;
+  --secondary-foreground: rgba(255, 255, 255, 0.85);
+  --muted: #141414;
+  --muted-foreground: rgba(255, 255, 255, 0.45);
+  --accent: #111d2c;
+  --accent-foreground: #1668dc;
+  --destructive: #dc4446;
+  --border: #303030;
+  --input: #424242;
+  --ring: #1668dc;
+  --sidebar: #141414;
+  --sidebar-foreground: rgba(255, 255, 255, 0.85);
+  --sidebar-primary: #1668dc;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #111d2c;
+  --sidebar-accent-foreground: #1668dc;
+  --sidebar-border: #303030;
+  --sidebar-ring: #1668dc;
+
+  /* Ant Design Dark Beautiful UI tokens */
+  --ink: rgba(255, 255, 255, 0.85);
+  --ink-2: rgba(255, 255, 255, 0.65);
+  --ink-3: rgba(255, 255, 255, 0.45);
+  --line: #303030;
+  --line-strong: #424242;
+  --surface: #141414;
+  --field: #1f1f1f;
+  --inset: #141414;
+  --hover: #1f1f1f;
+  --hover-2: #111d2c;
+  --green: #49aa19;
+  --red: #dc4446;
+  --green-tint: rgba(73, 170, 25, 0.15);
+  --red-tint: rgba(220, 68, 70, 0.15);
+}
+
+/* Ant Design Component-level Overrides */
+/* 1. Cards: 8px radius, clean 1px border, subtle layered shadow */
+[data-ui-theme="antd"] [data-slot="card"] {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.03), 0 1px 6px -1px rgba(0, 0, 0, 0.02), 0 2px 4px 0 rgba(0, 0, 0, 0.02);
+}
+[data-ui-theme="antd"].dark [data-slot="card"] {
+  border-color: #303030;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+[data-ui-theme="antd"] [data-slot="card-header"] {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 20px;
+}
+[data-ui-theme="antd"] [data-slot="card-title"] {
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+[data-ui-theme="antd"] [data-slot="card-footer"] {
+  border-top: 1px solid var(--border);
+  background-color: transparent;
+  padding: 12px 20px;
+}
+
+/* 2. Buttons: 6px radius, subtle bottom edge shadow, crisp hover transition */
+[data-ui-theme="antd"] [data-slot="button"] {
+  border-radius: 6px;
+  font-weight: 400;
+  font-size: 14px;
+  transition: all 0.2s cubic-bezier(0.645, 0.045, 0.355, 1);
+}
+[data-ui-theme="antd"] [data-slot="button"]:not(:disabled):active {
+  transform: translateY(1px);
+}
+[data-ui-theme="antd"] [data-slot="button"].bg-primary {
+  box-shadow: 0 2px 0 rgba(5, 145, 255, 0.1);
+}
+[data-ui-theme="antd"] [data-slot="button"].bg-primary:hover {
+  background-color: #4096ff;
+}
+[data-ui-theme="antd"] [data-slot="button"].border-border:hover,
+[data-ui-theme="antd"] [data-slot="button"].border-input:hover {
+  border-color: #4096ff;
+  color: #4096ff;
+}
+
+/* 3. Inputs: 6px radius, clear border and focus halo */
+[data-ui-theme="antd"] [data-slot="input"],
+[data-ui-theme="antd"] input:not([type="checkbox"]):not([type="radio"]),
+[data-ui-theme="antd"] textarea,
+[data-ui-theme="antd"] select {
+  border-radius: 6px;
+  border-color: var(--border);
+  transition: all 0.2s cubic-bezier(0.645, 0.045, 0.355, 1);
+}
+[data-ui-theme="antd"] [data-slot="input"]:hover,
+[data-ui-theme="antd"] input:not([type="checkbox"]):not([type="radio"]):hover,
+[data-ui-theme="antd"] textarea:hover,
+[data-ui-theme="antd"] select:hover {
+  border-color: #4096ff;
+}
+[data-ui-theme="antd"] [data-slot="input"]:focus,
+[data-ui-theme="antd"] [data-slot="input"]:focus-visible,
+[data-ui-theme="antd"] input:not([type="checkbox"]):not([type="radio"]):focus,
+[data-ui-theme="antd"] textarea:focus,
+[data-ui-theme="antd"] select:focus {
+  border-color: #1677ff;
+  box-shadow: 0 0 0 2px rgba(5, 145, 255, 0.1);
+  outline: none;
+}
+
+/* 4. Badges / Tags: Ant Design tag style (4px radius, subtle border) */
+[data-ui-theme="antd"] [data-slot="badge"] {
+  border-radius: 4px;
+  font-weight: 400;
+  font-size: 12px;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  line-height: 20px;
+}
+[data-ui-theme="antd"] [data-slot="badge"].bg-primary {
+  background-color: #e6f4ff;
+  color: #0958d9;
+  border-color: #91caff;
+}
+[data-ui-theme="antd"].dark [data-slot="badge"].bg-primary {
+  background-color: #111d2c;
+  color: #1668dc;
+  border-color: #15325b;
+}
+
+/* 5. Dropdown menus & popovers: signature Ant Design floating elevation */
+[data-ui-theme="antd"] [data-slot="select-content"],
+[data-ui-theme="antd"] [data-slot="dropdown-menu-content"],
+[data-ui-theme="antd"] [data-slot="popover-content"] {
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12), 0 9px 28px 8px rgba(0, 0, 0, 0.05);
+  padding: 4px;
+}
+[data-ui-theme="antd"].dark [data-slot="select-content"],
+[data-ui-theme="antd"].dark [data-slot="dropdown-menu-content"],
+[data-ui-theme="antd"].dark [data-slot="popover-content"] {
+  box-shadow: 0 6px 16px 0 rgba(0, 0, 0, 0.35), 0 3px 6px -4px rgba(0, 0, 0, 0.45);
+}
+
+/* 6. Dialogs & Modals */
+[data-ui-theme="antd"] [data-slot="dialog-content"] {
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12), 0 9px 28px 8px rgba(0, 0, 0, 0.05);
+}
+
+/* 7. Tables: Clean header tint and bottom border */
+[data-ui-theme="antd"] [data-slot="table-header"] {
+  background-color: #fafafa;
+}
+[data-ui-theme="antd"].dark [data-slot="table-header"] {
+  background-color: #1d1d1d;
+}
+[data-ui-theme="antd"] [data-slot="table-head"] {
+  font-weight: 600;
+  color: var(--foreground);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px;
+}
+[data-ui-theme="antd"] [data-slot="table-row"] {
+  border-bottom: 1px solid var(--border);
+  transition: background-color 0.2s;
+}
+[data-ui-theme="antd"] [data-slot="table-cell"] {
+  padding: 12px 16px;
+}
+[data-ui-theme="antd"] [data-slot="table-row"]:hover {
+  background-color: #fafafa;
+}
+[data-ui-theme="antd"].dark [data-slot="table-row"]:hover {
+  background-color: #1d1d1d;
+}
+
+/* 8. Checkbox: 4px radius with Ant Design Daybreak Blue fill */
+[data-ui-theme="antd"] [data-slot="checkbox"] {
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  transition: all 0.2s;
+}
+[data-ui-theme="antd"] [data-slot="checkbox"]:hover {
+  border-color: #1677ff;
+}
+[data-ui-theme="antd"] [data-slot="checkbox"][data-checked] {
+  background-color: #1677ff;
+  border-color: #1677ff;
+}
+
+/* 9. Tabs: Line style with active Daybreak Blue indicator */
+[data-ui-theme="antd"] [data-slot="tabs-list"][data-variant="line"] {
+  border-bottom: 1px solid var(--border);
+}
+[data-ui-theme="antd"] [data-slot="tabs-trigger"] {
+  border-radius: 4px;
+  transition: color 0.2s ease-in-out;
+}
+[data-ui-theme="antd"] [data-slot="tabs-trigger"]:hover {
+  color: #4096ff;
+}
+[data-ui-theme="antd"] [data-slot="tabs-trigger"][data-active] {
+  color: #1677ff;
+}
+
+/* ============================================================
+   1. Browser Native (Vanilla Web / HTML 3.2 User-Agent)
+   ============================================================ */
+[data-ui-theme="browser"] {
+  --app-font-sans: "Times New Roman", Times, Georgia, serif;
+  --radius: 0px;
+
+  --background: #ffffff;
+  --foreground: #000000;
+  --card: #ffffff;
+  --card-foreground: #000000;
+  --popover: #ffffff;
+  --popover-foreground: #000000;
+  --primary: #0000ee;
+  --primary-foreground: #ffffff;
+  --secondary: #e9e9e9;
+  --secondary-foreground: #000000;
+  --muted: #e9e9e9;
+  --muted-foreground: #555555;
+  --accent: #dcdcdc;
+  --accent-foreground: #0000ee;
+  --destructive: #cc0000;
+  --border: #767676;
+  --input: #767676;
+  --ring: #0000ee;
+  --sidebar: #f0f0f0;
+  --sidebar-foreground: #000000;
+  --sidebar-primary: #0000ee;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e0e0e0;
+  --sidebar-accent-foreground: #000000;
+  --sidebar-border: #767676;
+  --sidebar-ring: #0000ee;
+
+  --ink: #000000;
+  --ink-2: #333333;
+  --ink-3: #555555;
+  --line: #767676;
+  --line-strong: #000000;
+  --surface: #ffffff;
+  --field: #ffffff;
+  --inset: #e9e9e9;
+  --hover: #dcdcdc;
+  --hover-2: #cccccc;
+  --green: #008000;
+  --red: #cc0000;
+  --green-tint: rgba(0, 128, 0, 0.15);
+  --red-tint: rgba(204, 0, 0, 0.15);
+}
+
+[data-ui-theme="browser"].dark {
+  --background: #121212;
+  --foreground: #e0e0e0;
+  --card: #1e1e1e;
+  --card-foreground: #e0e0e0;
+  --popover: #1e1e1e;
+  --popover-foreground: #e0e0e0;
+  --primary: #8ab4f8;
+  --primary-foreground: #121212;
+  --secondary: #2a2a2a;
+  --secondary-foreground: #e0e0e0;
+  --muted: #2a2a2a;
+  --muted-foreground: #9e9e9e;
+  --accent: #333333;
+  --accent-foreground: #8ab4f8;
+  --destructive: #cf6679;
+  --border: #555555;
+  --input: #555555;
+  --ring: #8ab4f8;
+  --sidebar: #181818;
+  --sidebar-foreground: #e0e0e0;
+  --sidebar-primary: #8ab4f8;
+  --sidebar-primary-foreground: #121212;
+  --sidebar-accent: #2a2a2a;
+  --sidebar-accent-foreground: #8ab4f8;
+  --sidebar-border: #555555;
+  --sidebar-ring: #8ab4f8;
+
+  --ink: #e0e0e0;
+  --ink-2: #b0b0b0;
+  --ink-3: #888888;
+  --line: #555555;
+  --line-strong: #777777;
+  --surface: #1e1e1e;
+  --field: #121212;
+  --inset: #2a2a2a;
+  --hover: #333333;
+  --hover-2: #444444;
+  --green: #81c784;
+  --red: #e57373;
+  --green-tint: rgba(129, 199, 132, 0.15);
+  --red-tint: rgba(229, 115, 115, 0.15);
+}
+
+[data-ui-theme="browser"] * {
+  transition: none !important;
+}
+[data-ui-theme="browser"] [data-slot="button"] {
+  border: 2px outset #dcdcdc;
+  background-color: #e9e9e9;
+  color: #000000;
+  border-radius: 0px !important;
+  box-shadow: none !important;
+  padding: 2px 8px;
+}
+[data-ui-theme="browser"].dark [data-slot="button"] {
+  border: 2px outset #555555;
+  background-color: #2a2a2a;
+  color: #e0e0e0;
+}
+[data-ui-theme="browser"] [data-slot="button"]:active {
+  border-style: inset;
+}
+[data-ui-theme="browser"] [data-slot="card"] {
+  border: 2px groove #dcdcdc;
+  border-radius: 0px !important;
+  box-shadow: none !important;
+}
+[data-ui-theme="browser"].dark [data-slot="card"] {
+  border: 2px groove #555555;
+}
+[data-ui-theme="browser"] [data-slot="input"],
+[data-ui-theme="browser"] input:not([type="checkbox"]):not([type="radio"]),
+[data-ui-theme="browser"] textarea,
+[data-ui-theme="browser"] select {
+  border: 2px inset #767676 !important;
+  border-radius: 0px !important;
+  background: #ffffff;
+  color: #000000;
+  box-shadow: none !important;
+}
+[data-ui-theme="browser"].dark [data-slot="input"],
+[data-ui-theme="browser"].dark input:not([type="checkbox"]):not([type="radio"]),
+[data-ui-theme="browser"].dark textarea,
+[data-ui-theme="browser"].dark select {
+  border: 2px inset #555555 !important;
+  background: #121212;
+  color: #e0e0e0;
+}
+[data-ui-theme="browser"] [data-slot="badge"] {
+  border: 1px solid #767676;
+  border-radius: 0px !important;
+  background: #e9e9e9;
+  color: #000000;
+  font-family: inherit;
+}
+[data-ui-theme="browser"].dark [data-slot="badge"] {
+  border-color: #555555;
+  background: #2a2a2a;
+  color: #e0e0e0;
+}
+
+/* ============================================================
+   2. Minimal Flat (Paper & Ink / Zero Shadows / High Speed)
+   ============================================================ */
+[data-ui-theme="minimal-flat"] {
+  --radius: 2px;
+  --background: #ffffff;
+  --foreground: #0a0a0a;
+  --card: #ffffff;
+  --card-foreground: #0a0a0a;
+  --popover: #ffffff;
+  --popover-foreground: #0a0a0a;
+  --primary: #0a0a0a;
+  --primary-foreground: #ffffff;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #0a0a0a;
+  --muted: #f4f4f5;
+  --muted-foreground: #71717a;
+  --accent: #f4f4f5;
+  --accent-foreground: #0a0a0a;
+  --destructive: #ef4444;
+  --border: #e4e4e7;
+  --input: #e4e4e7;
+  --ring: #0a0a0a;
+  --sidebar: #fafafa;
+  --sidebar-foreground: #0a0a0a;
+  --sidebar-primary: #0a0a0a;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #f4f4f5;
+  --sidebar-accent-foreground: #0a0a0a;
+  --sidebar-border: #e4e4e7;
+  --sidebar-ring: #0a0a0a;
+}
+[data-ui-theme="minimal-flat"].dark {
+  --background: #000000;
+  --foreground: #f4f4f5;
+  --card: #09090b;
+  --card-foreground: #f4f4f5;
+  --popover: #09090b;
+  --popover-foreground: #f4f4f5;
+  --primary: #f4f4f5;
+  --primary-foreground: #09090b;
+  --secondary: #18181b;
+  --secondary-foreground: #f4f4f5;
+  --muted: #18181b;
+  --muted-foreground: #a1a1aa;
+  --accent: #18181b;
+  --accent-foreground: #f4f4f5;
+  --destructive: #ef4444;
+  --border: #27272a;
+  --input: #27272a;
+  --ring: #f4f4f5;
+  --sidebar: #050505;
+  --sidebar-foreground: #f4f4f5;
+  --sidebar-primary: #f4f4f5;
+  --sidebar-primary-foreground: #09090b;
+  --sidebar-accent: #18181b;
+  --sidebar-accent-foreground: #f4f4f5;
+  --sidebar-border: #27272a;
+  --sidebar-ring: #f4f4f5;
+}
+[data-ui-theme="minimal-flat"] *,
+[data-ui-theme="minimal-flat"].dark * {
+  box-shadow: none !important;
+  transition: none !important;
+}
+
+/* ============================================================
+   3. Terminal CRT (Retro Phosphor Amber Console)
+   ============================================================ */
+[data-ui-theme="terminal-phosphor"],
+[data-ui-theme="terminal-phosphor"].dark {
+  --app-font-sans: var(--font-jetbrains-mono), "JetBrains Mono", ui-monospace, monospace;
+  --radius: 0px;
+
+  --background: #0a0800;
+  --foreground: #ffb000;
+  --card: #141000;
+  --card-foreground: #ffb000;
+  --popover: #141000;
+  --popover-foreground: #ffb000;
+  --primary: #ffb000;
+  --primary-foreground: #0a0800;
+  --secondary: #241c00;
+  --secondary-foreground: #ffb000;
+  --muted: #1f1800;
+  --muted-foreground: #b37d00;
+  --accent: #332800;
+  --accent-foreground: #ffb000;
+  --destructive: #ff3333;
+  --border: #664d00;
+  --input: #664d00;
+  --ring: #ffb000;
+  --sidebar: #0e0b00;
+  --sidebar-foreground: #ffb000;
+  --sidebar-primary: #ffb000;
+  --sidebar-primary-foreground: #0a0800;
+  --sidebar-accent: #241c00;
+  --sidebar-accent-foreground: #ffb000;
+  --sidebar-border: #664d00;
+  --sidebar-ring: #ffb000;
+
+  --ink: #ffb000;
+  --ink-2: #cc8c00;
+  --ink-3: #996900;
+  --line: #664d00;
+  --line-strong: #996900;
+  --surface: #141000;
+  --field: #0a0800;
+  --inset: #1f1800;
+  --hover: #241c00;
+  --hover-2: #332800;
+  --green: #ffb000;
+  --red: #ff3333;
+  --green-tint: rgba(255, 176, 0, 0.15);
+  --red-tint: rgba(255, 51, 51, 0.15);
+}
+[data-ui-theme="terminal-phosphor"] [data-slot="card"] {
+  border: 1px solid #664d00;
+  border-radius: 0px !important;
+  box-shadow: none !important;
+}
+[data-ui-theme="terminal-phosphor"] [data-slot="button"] {
+  border-radius: 0px !important;
+  border: 1px solid #ffb000;
+  letter-spacing: 0.05em;
+  box-shadow: none !important;
+}
+
+/* ============================================================
+   4. SRE Dense (High Contrast Ops)
+   ============================================================ */
+[data-ui-theme="high-contrast-dense"],
+[data-ui-theme="high-contrast-dense"].dark {
+  --radius: 4px;
+  --background: #000000;
+  --foreground: #ffffff;
+  --card: #0c0c0c;
+  --card-foreground: #ffffff;
+  --popover: #0c0c0c;
+  --popover-foreground: #ffffff;
+  --primary: #00ff66;
+  --primary-foreground: #000000;
+  --secondary: #1a1a1a;
+  --secondary-foreground: #ffffff;
+  --muted: #141414;
+  --muted-foreground: #8e8e8e;
+  --accent: #1e1e1e;
+  --accent-foreground: #00ff66;
+  --destructive: #ff3333;
+  --border: #2e2e2e;
+  --input: #2e2e2e;
+  --ring: #00ff66;
+  --sidebar: #060606;
+  --sidebar-foreground: #ffffff;
+  --sidebar-primary: #00ff66;
+  --sidebar-primary-foreground: #000000;
+  --sidebar-accent: #1a1a1a;
+  --sidebar-accent-foreground: #00ff66;
+  --sidebar-border: #2e2e2e;
+  --sidebar-ring: #00ff66;
+
+  --ink: #ffffff;
+  --ink-2: #cccccc;
+  --ink-3: #8e8e8e;
+  --line: #2e2e2e;
+  --line-strong: #4a4a4a;
+  --surface: #0c0c0c;
+  --field: #000000;
+  --inset: #141414;
+  --hover: #1a1a1a;
+  --hover-2: #242424;
+  --green: #00ff66;
+  --red: #ff3333;
+  --green-tint: rgba(0, 255, 102, 0.15);
+  --red-tint: rgba(255, 51, 51, 0.15);
+}
+
+/* ============================================================
+   5. Google Cloud M3 (Material 3 Expressive)
+   ============================================================ */
+[data-ui-theme="material-m3"] {
+  --app-font-sans: Roboto, "Google Sans", system-ui, sans-serif;
+  --radius: 0.75rem;
+
+  --background: #ffffff;
+  --foreground: #1f1f1f;
+  --card: #ffffff;
+  --card-foreground: #1f1f1f;
+  --popover: #ffffff;
+  --popover-foreground: #1f1f1f;
+  --primary: #1a73e8;
+  --primary-foreground: #ffffff;
+  --secondary: #f8f9fa;
+  --secondary-foreground: #1f1f1f;
+  --muted: #f1f3f4;
+  --muted-foreground: #5f6368;
+  --accent: #e8f0fe;
+  --accent-foreground: #1967d2;
+  --destructive: #d93025;
+  --border: #dadce0;
+  --input: #dadce0;
+  --ring: #1a73e8;
+  --sidebar: #f8f9fa;
+  --sidebar-foreground: #1f1f1f;
+  --sidebar-primary: #1a73e8;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e8f0fe;
+  --sidebar-accent-foreground: #1967d2;
+  --sidebar-border: #dadce0;
+  --sidebar-ring: #1a73e8;
+}
+[data-ui-theme="material-m3"].dark {
+  --background: #1f1f1f;
+  --foreground: #e3e3e3;
+  --card: #28292a;
+  --card-foreground: #e3e3e3;
+  --popover: #28292a;
+  --popover-foreground: #e3e3e3;
+  --primary: #8ab4f8;
+  --primary-foreground: #202124;
+  --secondary: #35363a;
+  --secondary-foreground: #e3e3e3;
+  --muted: #2d2e30;
+  --muted-foreground: #9aa0a6;
+  --accent: #35363a;
+  --accent-foreground: #8ab4f8;
+  --destructive: #f28b82;
+  --border: #444746;
+  --input: #444746;
+  --ring: #8ab4f8;
+  --sidebar: #242526;
+  --sidebar-foreground: #e3e3e3;
+  --sidebar-primary: #8ab4f8;
+  --sidebar-primary-foreground: #202124;
+  --sidebar-accent: #35363a;
+  --sidebar-accent-foreground: #8ab4f8;
+  --sidebar-border: #444746;
+  --sidebar-ring: #8ab4f8;
+}
+[data-ui-theme="material-m3"] [data-slot="button"] {
+  border-radius: 9999px;
+  font-weight: 500;
+}
+[data-ui-theme="material-m3"] [data-slot="badge"] {
+  border-radius: 9999px;
+}
+
+/* ============================================================
+   6. AWS Cloudscape (AWS Management Console)
+   ============================================================ */
+[data-ui-theme="aws-cloudscape"] {
+  --radius: 4px;
+  --background: #f2f3f3;
+  --foreground: #16191f;
+  --card: #ffffff;
+  --card-foreground: #16191f;
+  --popover: #ffffff;
+  --popover-foreground: #16191f;
+  --primary: #0073bb;
+  --primary-foreground: #ffffff;
+  --secondary: #eaeded;
+  --secondary-foreground: #16191f;
+  --muted: #eaeded;
+  --muted-foreground: #545b64;
+  --accent: #e9f3f9;
+  --accent-foreground: #0073bb;
+  --destructive: #d13212;
+  --border: #d5dbdb;
+  --input: #d5dbdb;
+  --ring: #0073bb;
+  --sidebar: #161f2e;
+  --sidebar-foreground: #ffffff;
+  --sidebar-primary: #ec7211;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #232f3e;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #232f3e;
+  --sidebar-ring: #ec7211;
+}
+[data-ui-theme="aws-cloudscape"].dark {
+  --background: #0f1b2a;
+  --foreground: #d1d5db;
+  --card: #161f2e;
+  --card-foreground: #d1d5db;
+  --popover: #161f2e;
+  --popover-foreground: #d1d5db;
+  --primary: #44b4d5;
+  --primary-foreground: #0f1b2a;
+  --secondary: #232f3e;
+  --secondary-foreground: #d1d5db;
+  --muted: #1d2c3f;
+  --muted-foreground: #879596;
+  --accent: #232f3e;
+  --accent-foreground: #44b4d5;
+  --destructive: #ff5252;
+  --border: #2e3e52;
+  --input: #2e3e52;
+  --ring: #44b4d5;
+  --sidebar: #0b131e;
+  --sidebar-foreground: #d1d5db;
+  --sidebar-primary: #ec7211;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #1d2c3f;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: #2e3e52;
+  --sidebar-ring: #ec7211;
+}
+[data-ui-theme="aws-cloudscape"] [data-slot="button"] {
+  border-radius: 4px;
+}
+[data-ui-theme="aws-cloudscape"] [data-slot="button"].bg-primary {
+  background-color: #ec7211;
+  border-color: #ec7211;
+  color: #ffffff;
+}
+[data-ui-theme="aws-cloudscape"] [data-slot="button"].bg-primary:hover {
+  background-color: #eb5f07;
+}
+
+/* ============================================================
+   7. IBM Carbon 11 (Strict 0px Grid)
+   ============================================================ */
+[data-ui-theme="ibm-carbon"] {
+  --app-font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+  --radius: 0px;
+
+  --background: #f4f4f4;
+  --foreground: #161616;
+  --card: #ffffff;
+  --card-foreground: #161616;
+  --popover: #ffffff;
+  --popover-foreground: #161616;
+  --primary: #0f62fe;
+  --primary-foreground: #ffffff;
+  --secondary: #e0e0e0;
+  --secondary-foreground: #161616;
+  --muted: #e0e0e0;
+  --muted-foreground: #525252;
+  --accent: #edf5ff;
+  --accent-foreground: #0f62fe;
+  --destructive: #da1e28;
+  --border: #e0e0e0;
+  --input: #8d8d8d;
+  --ring: #0f62fe;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #161616;
+  --sidebar-primary: #0f62fe;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e0e0e0;
+  --sidebar-accent-foreground: #0f62fe;
+  --sidebar-border: #e0e0e0;
+  --sidebar-ring: #0f62fe;
+}
+[data-ui-theme="ibm-carbon"].dark {
+  --background: #161616;
+  --foreground: #f4f4f4;
+  --card: #262626;
+  --card-foreground: #f4f4f4;
+  --popover: #262626;
+  --popover-foreground: #f4f4f4;
+  --primary: #0f62fe;
+  --primary-foreground: #ffffff;
+  --secondary: #393939;
+  --secondary-foreground: #f4f4f4;
+  --muted: #393939;
+  --muted-foreground: #8d8d8d;
+  --accent: #393939;
+  --accent-foreground: #78a9ff;
+  --destructive: #fa4d56;
+  --border: #393939;
+  --input: #525252;
+  --ring: #0f62fe;
+  --sidebar: #161616;
+  --sidebar-foreground: #f4f4f4;
+  --sidebar-primary: #0f62fe;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #393939;
+  --sidebar-accent-foreground: #78a9ff;
+  --sidebar-border: #393939;
+  --sidebar-ring: #0f62fe;
+}
+[data-ui-theme="ibm-carbon"] [data-slot="button"],
+[data-ui-theme="ibm-carbon"] [data-slot="card"],
+[data-ui-theme="ibm-carbon"] [data-slot="badge"],
+[data-ui-theme="ibm-carbon"] [data-slot="input"],
+[data-ui-theme="ibm-carbon"] select,
+[data-ui-theme="ibm-carbon"] textarea {
+  border-radius: 0px !important;
+}
+
+/* ============================================================
+   8. Microsoft Azure Fluent 2
+   ============================================================ */
+[data-ui-theme="azure-fluent"] {
+  --app-font-sans: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+  --radius: 4px;
+
+  --background: #faf9f8;
+  --foreground: #242424;
+  --card: #ffffff;
+  --card-foreground: #242424;
+  --popover: #ffffff;
+  --popover-foreground: #242424;
+  --primary: #0078d4;
+  --primary-foreground: #ffffff;
+  --secondary: #f3f2f1;
+  --secondary-foreground: #242424;
+  --muted: #f3f2f1;
+  --muted-foreground: #605e5c;
+  --accent: #eff6fc;
+  --accent-foreground: #0078d4;
+  --destructive: #a80000;
+  --border: #edebe9;
+  --input: #8a8886;
+  --ring: #0078d4;
+  --sidebar: #f3f2f1;
+  --sidebar-foreground: #242424;
+  --sidebar-primary: #0078d4;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #edebe9;
+  --sidebar-accent-foreground: #0078d4;
+  --sidebar-border: #edebe9;
+  --sidebar-ring: #0078d4;
+}
+[data-ui-theme="azure-fluent"].dark {
+  --background: #1b1a19;
+  --foreground: #f3f2f1;
+  --card: #252423;
+  --card-foreground: #f3f2f1;
+  --popover: #252423;
+  --popover-foreground: #f3f2f1;
+  --primary: #2886de;
+  --primary-foreground: #ffffff;
+  --secondary: #323130;
+  --secondary-foreground: #f3f2f1;
+  --muted: #292827;
+  --muted-foreground: #a19f9d;
+  --accent: #323130;
+  --accent-foreground: #2886de;
+  --destructive: #f1707b;
+  --border: #3b3a39;
+  --input: #484644;
+  --ring: #2886de;
+  --sidebar: #201f1e;
+  --sidebar-foreground: #f3f2f1;
+  --sidebar-primary: #2886de;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #323130;
+  --sidebar-accent-foreground: #2886de;
+  --sidebar-border: #3b3a39;
+  --sidebar-ring: #2886de;
+}
+
 /* ── Status verb shine ──────────────────────────────────────────
    The sweep on the "Thinking…" indicator. Uses background-clip so the
    highlight travels across the glyphs themselves rather than sitting in a
@@ -767,4 +1699,123 @@
   height: 100%;
 }
 
+/* ── Beautiful UI Animations & Utilities ────────────────────── */
+@keyframes shimmer-text {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animated-underline {
+  position: relative;
+  text-decoration: none;
+}
+.animated-underline::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  width: 0;
+  height: 1px;
+  background-color: currentColor;
+  transition: width 0.2s ease-in-out;
+}
+.animated-underline:hover::after {
+  width: 100%;
+}
+
+/* Flowtoken and SyntaxHighlighter dark theme guards */
+.prose-ai pre,
+pre[class*="language-"],
+div:has(> pre[class*="language-"]) {
+  background-color: var(--field) !important;
+  border-color: var(--line) !important;
+  color: var(--ink) !important;
+}
+
+.prose-ai pre code,
+code[class*="language-"] {
+  background-color: transparent !important;
+  color: inherit !important;
+}
+
+/* Ensure code blocks have subtle borders and rounded corners */
+pre[class*="language-"] {
+  border-radius: 8px !important;
+  border: 1px solid var(--line) !important;
+  background-color: var(--field) !important;
+}
+
+/* Flowtoken and Streaming Token Entrance Animations */
+@keyframes ft-blurIn {
+  0% {
+    opacity: 0;
+    filter: blur(6px);
+    transform: translateY(2px);
+  }
+  100% {
+    opacity: 1;
+    filter: blur(0px);
+    transform: translateY(0);
+  }
+}
+
+@keyframes ft-fadeIn {
+  0% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.animate-flow-blur-in {
+  animation: ft-blurIn 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: filter, opacity, transform;
+}
+
+/* Hide scrollbar for Chrome, Safari and Opera */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Hide scrollbar for IE, Edge and Firefox */
+.no-scrollbar {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;  /* Firefox */
+}
 

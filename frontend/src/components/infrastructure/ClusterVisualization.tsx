@@ -1166,12 +1166,12 @@ export function ClusterVisualization() {
             Pan, zoom, and click live Docker or Kubernetes resources. Claimed resources can be inspected, edited, restarted, or updated from YAML.
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 shrink-0">
           <Select value={targetConnectionId} onValueChange={(value) => setTargetConnectionId(value || "local")}>
-            <SelectTrigger className="h-10 min-w-[280px] justify-between">
+            <SelectTrigger className="h-10 w-[200px] sm:w-[240px] md:w-[260px] shrink-0 justify-between">
               <SelectValue placeholder="Select infrastructure target" />
             </SelectTrigger>
-            <SelectContent align="end" className="min-w-[280px]">
+            <SelectContent align="end" className="min-w-[240px]">
               <SelectItem value="local">Local StackPilot host</SelectItem>
               {sshConnections.map((connection) => (
                 <SelectItem key={connection.id} value={connection.id}>
@@ -1180,11 +1180,11 @@ export function ClusterVisualization() {
               ))}
             </SelectContent>
           </Select>
-          <Button variant="outline" onClick={() => inventoryQuery.refetch()} disabled={inventoryQuery.isFetching}>
+          <Button variant="outline" className="shrink-0 whitespace-nowrap" onClick={() => inventoryQuery.refetch()} disabled={inventoryQuery.isFetching}>
             {inventoryQuery.isFetching ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-2 h-4 w-4"  />}
             Refresh
           </Button>
-          <Link href="/dashboard/logging-monitoring/infrastructure" className={buttonVariants({ variant: "outline" })}>
+          <Link href="/dashboard/logging-monitoring/infrastructure" className={cn(buttonVariants({ variant: "outline" }), "shrink-0 whitespace-nowrap")}>
             <AppIcon name="network" fallback={Network} className="mr-2 h-4 w-4"  />
             Open Monitor
           </Link>
@@ -1207,13 +1207,13 @@ export function ClusterVisualization() {
         <Card
           ref={cardRef}
           className={cn(
-            "overflow-hidden",
+            "overflow-hidden gap-0 py-0",
             // The fullscreen element gets no page background of its own, so set one
             // and let the canvas shell take the remaining height.
             isFullscreen && "h-screen w-screen rounded-none bg-background py-0"
           )}
         >
-          <CardHeader className="border-b border-border">
+          <CardHeader className="border-b border-border py-3.5 px-4 sm:px-6">
             <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
               <div>
                 <CardTitle className="flex items-center gap-2">

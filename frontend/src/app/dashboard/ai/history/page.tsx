@@ -4,12 +4,14 @@ import Link from "next/link";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   ArrowLeft,
+  Check,
   Clock,
   Loader2,
   MessageSquare,
   Plus,
   RefreshCw,
   Trash2,
+  XCircle,
 } from "lucide-react";
 import { AppIcon } from "@/lib/custom-icons";
 
@@ -21,6 +23,8 @@ interface AiChatSession {
   id: string;
   title: string;
   session_type: string;
+  status?: string;
+  deployment_id?: string;
   preview?: string;
   message_count?: number;
   last_model?: string;
@@ -42,8 +46,35 @@ function formatDate(value: string) {
   }
 }
 
+function cleanPreview(text?: string | null): string {
+  if (!text) return "Continue this conversation.";
+  let cleaned = text
+    // Replace base64 data URIs
+    .replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[A-Za-z0-9+/=]+/gi, "[image snapshot]")
+    // Replace markdown headers
+    .replace(/^#+\s+/gm, "")
+    // Replace bold/italic markers
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(\*|_)(.*?)\1/g, "$2")
+    // Replace inline code backticks
+    .replace(/`([^`]+)`/g, "$1")
+    // Replace markdown links [text](url) -> text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    // Collapse newlines, carriage returns, and tabs into a single space
+    .replace(/[\r\n\t]+/g, " ")
+    // Collapse multiple consecutive spaces
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (cleaned.length > 220) {
+    cleaned = cleaned.slice(0, 217).trim() + "...";
+  }
+  return cleaned || "Continue this conversation.";
+}
+
 function sessionTypeLabel(type: string) {
   if (type === "project_chat") return "Project";
+  if (type === "sre_incident") return "AI SRE Healing";
   return "Agent";
 }
 
@@ -57,7 +88,13 @@ export default function AiHistoryPage() {
     },
     refetchOnMount: "always",
     refetchOnWindowFocus: true,
-    refetchInterval: 12000,
+    refetchInterval: (query) => {
+      const sessions = (query.state.data as AiChatSession[] | undefined) || [];
+      const hasActiveHealing = sessions.some(
+        (s) => s.session_type === "sre_incident" && s.status === "healing"
+      );
+      return hasActiveHealing ? 3000 : 12000;
+    },
   });
 
   const deleteSessionMutation = useMutation({
@@ -73,7 +110,7 @@ export default function AiHistoryPage() {
   const lastChat = sessions[0]?.updated_at;
 
   return (
-    <div className="mx-auto flex max-w-7xl flex-col gap-6">
+    <div className="mx-auto flex max-w-7xl flex-col gap-6 min-w-0 w-full overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <Link href="/dashboard/ai">
@@ -100,7 +137,7 @@ export default function AiHistoryPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-3 min-w-0">
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <AppIcon name="message-square" fallback={MessageSquare} className="h-4 w-4"  />
@@ -141,18 +178,43 @@ export default function AiHistoryPage() {
           </Link>
         </div>
       ) : (
-        <div className="grid gap-3">
+        <div className="grid gap-3 min-w-0">
           {sessions.map((session) => (
-            <div key={session.id} className="rounded-xl border border-border bg-card p-4 transition-colors hover:bg-accent/30">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <Link href={`/dashboard/ai?session_id=${session.id}`} className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="truncate text-lg font-semibold">{session.title || "Untitled chat"}</h2>
-                    <Badge variant="outline">{sessionTypeLabel(session.session_type)}</Badge>
-                    {session.last_model && <Badge variant="secondary" className="max-w-64 truncate">{session.last_model}</Badge>}
+            <div
+              key={session.id}
+              className="min-w-0 overflow-hidden rounded-xl border border-border bg-card p-4 transition-colors hover:bg-accent/30"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 min-w-0">
+                <Link href={`/dashboard/ai?session_id=${session.id}`} className="min-w-0 flex-1 overflow-hidden">
+                  <div className="flex flex-wrap items-center gap-2 min-w-0">
+                    <h2 className="truncate text-lg font-semibold min-w-0 max-w-full">{session.title || "Untitled chat"}</h2>
+                    <Badge variant="outline" className="shrink-0">{sessionTypeLabel(session.session_type)}</Badge>
+                    {session.session_type === "sre_incident" && session.status === "healing" && (
+                      <Badge variant="outline" className="shrink-0 gap-1 border-amber-500/40 bg-amber-500/10 text-amber-400">
+                        <AppIcon name="loader2" fallback={Loader2} className="h-3 w-3 animate-spin" />
+                        Healing in progress
+                      </Badge>
+                    )}
+                    {session.session_type === "sre_incident" && session.status === "healed" && (
+                      <Badge variant="outline" className="shrink-0 gap-1 border-emerald-500/40 bg-emerald-500/10 text-emerald-400">
+                        <AppIcon name="check" fallback={Check} className="h-3 w-3" />
+                        Healed & Live
+                      </Badge>
+                    )}
+                    {session.session_type === "sre_incident" && session.status === "failed" && (
+                      <Badge variant="outline" className="shrink-0 gap-1 border-red-500/40 bg-red-500/10 text-red-400">
+                        <AppIcon name="x-circle" fallback={XCircle} className="h-3 w-3" />
+                        Healing Failed
+                      </Badge>
+                    )}
+                    {session.last_model && (
+                      <Badge variant="secondary" className="max-w-64 truncate shrink-0">
+                        {session.last_model}
+                      </Badge>
+                    )}
                   </div>
-                  <p className="mt-2 line-clamp-2 text-sm text-muted-foreground">
-                    {session.preview || "Continue this conversation."}
+                  <p className="mt-2 line-clamp-2 text-sm text-muted-foreground break-all [overflow-wrap:anywhere] overflow-hidden">
+                    {cleanPreview(session.preview)}
                   </p>
                   <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                     <span>{session.message_count || 0} messages</span>
@@ -160,7 +222,7 @@ export default function AiHistoryPage() {
                     {(session.memory_summary || "").trim() && <span>Memory saved</span>}
                   </div>
                 </Link>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 shrink-0 self-end sm:self-start">
                   <Link href={`/dashboard/ai?session_id=${session.id}`}>
                     <Button variant="outline" size="sm">Continue</Button>
                   </Link>

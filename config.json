@@ -11,7 +11,7 @@
         "enable_session": false,
         "document_root": "./static",
         "upload_path": "uploads",
-        "max_connections": 100000,
+        "max_connections": 1000,
         "max_connections_per_ip": 0,
         "idle_connection_timeout": 300,
         "log": {

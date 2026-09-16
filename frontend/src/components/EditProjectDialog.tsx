@@ -216,6 +216,7 @@ function EditProjectForm({
   onCancel: () => void;
   onSaved: () => void;
 }) {
+  const queryClient = useQueryClient();
   const [name, setName] = useState(project.name);
   const [description, setDescription] = useState(project.description || "");
   const [repoUrl, setRepoUrl] = useState(project.repo_url || "");
@@ -491,6 +492,8 @@ const segmentedButtonActiveClass =
       return res.data as { message?: string };
     },
     onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      queryClient.invalidateQueries({ queryKey: ["project", project.id] });
       toast.success(data.message || "Project updated successfully");
       setDeletedEnvironmentIds([]);
       onSaved();

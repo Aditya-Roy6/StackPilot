@@ -24,7 +24,8 @@ public:
 
     Json::Value enqueueDeploymentBuild(const std::string& deploymentId,
                                        const std::string& userId,
-                                       const std::string& queuedLog = "Deployment queued for background worker.");
+                                       const std::string& queuedLog = "Deployment queued for background worker.",
+                                       const std::string& metadataJson = "{}");
 
 private:
     struct DeploymentJobRecord {

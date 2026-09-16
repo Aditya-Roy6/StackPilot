@@ -5,30 +5,24 @@ import { useParams, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import {
   Smartphone,
-  Tablet,
   RotateCw,
   ExternalLink,
   Copy,
   Check,
   QrCode,
-  RefreshCw,
   ArrowLeft,
   Wifi,
   BatteryCharging,
   Download,
-  Info,
-  CheckCircle2,
   Terminal,
-  Cloud,
-  ShieldCheck,
   Hash,
-  Layers,
+  Globe,
 } from "lucide-react";
-import { AppIcon } from "@/lib/custom-icons";
+import { ReactQRCode } from "@lglab/react-qr-code";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
 
 interface Deployment {
   id: string;
@@ -54,9 +48,10 @@ interface Deployment {
   };
 }
 
-type TestingMode = "simulator" | "download" | "qr" | "adb" | "cloud";
-type DeviceModel = "iphone16" | "pixel9" | "galaxy24" | "tablet";
+type TestingMode = "simulator" | "download" | "qr" | "adb";
+type DeviceModel = "pixel9" | "iphone16" | "tablet";
 type ZoomMode = "fit" | "100" | "75" | "50";
+type HostMode = "nip" | "ip" | "custom";
 
 interface DeviceSpec {
   name: string;
@@ -71,38 +66,27 @@ interface DeviceSpec {
 }
 
 const DEVICE_SPECS: Record<DeviceModel, DeviceSpec> = {
-  iphone16: {
-    name: "iPhone 16 Pro",
-    model: "iphone16",
-    portraitWidth: 393,
-    portraitHeight: 852,
-    screenRadius: "rounded-[48px]",
-    outerRadius: "rounded-[54px]",
-    bezelBorder: "border-[10px] border-zinc-700/80 shadow-[0_0_0_2px_rgba(255,255,255,0.1),0_25px_60px_-15px_rgba(0,0,0,0.9)]",
-    bezelColor: "bg-zinc-900",
-    notchType: "dynamic-island",
-  },
   pixel9: {
-    name: "Pixel 9 Pro",
+    name: "Pixel 9",
     model: "pixel9",
     portraitWidth: 412,
     portraitHeight: 860,
     screenRadius: "rounded-[38px]",
     outerRadius: "rounded-[46px]",
-    bezelBorder: "border-[9px] border-zinc-700/70 shadow-[0_0_0_2px_rgba(255,255,255,0.08),0_25px_60px_-15px_rgba(0,0,0,0.9)]",
-    bezelColor: "bg-zinc-900",
+    bezelBorder: "border-[9px] border-zinc-800 shadow-2xl",
+    bezelColor: "bg-zinc-950",
     notchType: "punch-hole",
   },
-  galaxy24: {
-    name: "Galaxy S24 Ultra",
-    model: "galaxy24",
-    portraitWidth: 412,
-    portraitHeight: 880,
-    screenRadius: "rounded-[28px]",
-    outerRadius: "rounded-[36px]",
-    bezelBorder: "border-[8px] border-zinc-600/80 shadow-[0_0_0_2px_rgba(255,255,255,0.08),0_25px_60px_-15px_rgba(0,0,0,0.9)]",
-    bezelColor: "bg-zinc-900",
-    notchType: "punch-hole",
+  iphone16: {
+    name: "iPhone 16",
+    model: "iphone16",
+    portraitWidth: 393,
+    portraitHeight: 852,
+    screenRadius: "rounded-[48px]",
+    outerRadius: "rounded-[54px]",
+    bezelBorder: "border-[10px] border-zinc-800 shadow-2xl",
+    bezelColor: "bg-zinc-950",
+    notchType: "dynamic-island",
   },
   tablet: {
     name: "iPad Mini",
@@ -111,8 +95,8 @@ const DEVICE_SPECS: Record<DeviceModel, DeviceSpec> = {
     portraitHeight: 960,
     screenRadius: "rounded-[24px]",
     outerRadius: "rounded-[30px]",
-    bezelBorder: "border-[14px] border-zinc-700/60 shadow-[0_0_0_2px_rgba(255,255,255,0.08),0_30px_70px_-20px_rgba(0,0,0,0.95)]",
-    bezelColor: "bg-zinc-900",
+    bezelBorder: "border-[14px] border-zinc-800 shadow-2xl",
+    bezelColor: "bg-zinc-950",
     notchType: "none",
   },
 };
@@ -131,7 +115,21 @@ export default function MobilePreviewStudioPage() {
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
   const [iframeKey, setIframeKey] = useState<number>(0);
   const [isLoadingIframe, setIsLoadingIframe] = useState<boolean>(true);
-  const [showQrPanel, setShowQrPanel] = useState<boolean>(true);
+  const [iframeError, setIframeError] = useState<boolean>(false);
+
+  // Network & nip.io settings to open on real phones
+  const [hostMode, setHostMode] = useState<HostMode>("nip");
+  const [customHost, setCustomHost] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      const saved = localStorage.getItem("stackpilot_phone_host");
+      if (saved) return saved;
+      const h = window.location.hostname;
+      if (h && h !== "localhost" && h !== "127.0.0.1") return h;
+    }
+    return "172.20.10.2";
+  });
+  const [isEditingHost, setIsEditingHost] = useState<boolean>(false);
+  const [hostInput, setHostInput] = useState<string>(customHost);
 
   const canvasRef = useRef<HTMLDivElement>(null);
 
@@ -143,7 +141,6 @@ export default function MobilePreviewStudioPage() {
         const res = await api.get(`/deployments/${deploymentId}`);
         return res.data?.data || res.data;
       } catch {
-        // Resilient fallback: lookup in user deployments
         const res = await api.get("/deployments");
         const list = res.data?.deployments || res.data?.data || [];
         return list.find((d: Deployment) => d.id === deploymentId) || null;
@@ -157,7 +154,7 @@ export default function MobilePreviewStudioPage() {
     deployment?.runtime_snapshot?.runtime_url ||
     "";
 
-  // Resolve runtime URL: default to port 3000 if not set
+  // Base runtime URL
   const runtimeUrl = useMemo(() => {
     if (rawRuntimeUrl) return rawRuntimeUrl;
     if (typeof window !== "undefined") {
@@ -167,32 +164,60 @@ export default function MobilePreviewStudioPage() {
     return "http://localhost:3000";
   }, [rawRuntimeUrl]);
 
+  // Compute phone-accessible network URL using nip.io / LAN IP
+  const phoneNetworkUrl = useMemo(() => {
+    try {
+      const url = new URL(runtimeUrl);
+      const port = url.port ? `:${url.port}` : "";
+      const pathname = url.pathname === "/" ? "" : url.pathname;
+      const search = url.search;
+
+      if (hostMode === "nip") {
+        const cleanHost = customHost.replace(/\.nip\.io$/, "").trim();
+        return `${url.protocol}//${cleanHost}.nip.io${port}${pathname}${search}`;
+      }
+      if (hostMode === "ip") {
+        const cleanHost = customHost.replace(/\.nip\.io$/, "").trim();
+        return `${url.protocol}//${cleanHost}${port}${pathname}${search}`;
+      }
+      if (hostMode === "custom") {
+        if (customHost.startsWith("http://") || customHost.startsWith("https://")) {
+          return `${customHost.replace(/\/$/, "")}${pathname}${search}`;
+        }
+        return `${url.protocol}//${customHost}${port}${pathname}${search}`;
+      }
+      return runtimeUrl;
+    } catch {
+      return runtimeUrl;
+    }
+  }, [runtimeUrl, hostMode, customHost]);
+
   const archetype = deployment?.runtime_snapshot?.archetype || "native_android";
   const mobileMetadata = deployment?.runtime_snapshot?.mobile_metadata;
   const isAndroid = archetype === "native_android" || archetype === "android_gradle";
 
-  const appName = mobileMetadata?.app_name || deployment?.project_name || "Android App";
+  const appName = mobileMetadata?.app_name || deployment?.project_name || "Mobile App";
   const bundleId = mobileMetadata?.bundle_id || "pl.czak.minimal";
   const sdkVersion = mobileMetadata?.sdk_version || "API 34 (Android 14)";
   const apkFileName = "app-debug.apk";
-  const apkDownloadUrl = `${runtimeUrl}/${apkFileName}`;
+  const phoneApkUrl = `${phoneNetworkUrl}/${apkFileName}`;
+
+  const [qrType, setQrType] = useState<"apk" | "web">("apk");
+  const activeQrTarget = qrType === "apk" && isAndroid ? phoneApkUrl : phoneNetworkUrl;
 
   const currentSpec = DEVICE_SPECS[device] || DEVICE_SPECS.pixel9;
+  const deviceWidth = orientation === "portrait" ? currentSpec.portraitWidth : currentSpec.portraitHeight;
+  const deviceHeight = orientation === "portrait" ? currentSpec.portraitHeight : currentSpec.portraitWidth;
 
-  const deviceWidth =
-    orientation === "portrait" ? currentSpec.portraitWidth : currentSpec.portraitHeight;
-  const deviceHeight =
-    orientation === "portrait" ? currentSpec.portraitHeight : currentSpec.portraitWidth;
-
-  // Auto-calculate fit zoom scale based on window height
+  // Auto-calculate fit zoom scale
   useEffect(() => {
     function recalculateFit() {
       if (!canvasRef.current) return;
       const canvasHeight = canvasRef.current.clientHeight;
       const canvasWidth = canvasRef.current.clientWidth;
 
-      const availHeight = Math.max(300, canvasHeight - 40);
-      const availWidth = Math.max(300, canvasWidth - 40);
+      const availHeight = Math.max(300, canvasHeight - 60);
+      const availWidth = Math.max(300, canvasWidth - 60);
 
       const scaleH = availHeight / (deviceHeight + 24);
       const scaleW = availWidth / (deviceWidth + 24);
@@ -204,7 +229,7 @@ export default function MobilePreviewStudioPage() {
     recalculateFit();
     window.addEventListener("resize", recalculateFit);
     return () => window.removeEventListener("resize", recalculateFit);
-  }, [deviceHeight, deviceWidth, showQrPanel, testMode]);
+  }, [deviceHeight, deviceWidth, testMode]);
 
   const currentScale = useMemo(() => {
     if (zoomMode === "100") return 1.0;
@@ -232,859 +257,610 @@ export default function MobilePreviewStudioPage() {
 
   const handleReload = () => {
     setIsLoadingIframe(true);
+    setIframeError(false);
     setIframeKey((prev) => prev + 1);
   };
 
-  const [qrType, setQrType] = useState<"apk" | "web">("apk");
-  const activeQrTarget = qrType === "apk" && isAndroid ? apkDownloadUrl : runtimeUrl;
-  const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=260x260&data=${encodeURIComponent(
-    activeQrTarget
-  )}&bgcolor=18181b&color=38bdf8&margin=1`;
+  const saveCustomHost = (host: string) => {
+    const trimmed = host.trim();
+    if (trimmed) {
+      setCustomHost(trimmed);
+      localStorage.setItem("stackpilot_phone_host", trimmed);
+      setIsEditingHost(false);
+      toast.success("Host address updated!");
+    }
+  };
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-zinc-950 font-sans text-zinc-100 select-none">
-      {/* Top Studio Navbar */}
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-zinc-900/90 px-4 backdrop-blur-md z-30">
-        <div className="flex items-center gap-3">
+      {/* Minimal Monochrome Header */}
+      <header className="flex h-12 shrink-0 items-center justify-between border-b border-zinc-800/80 bg-zinc-950 px-4 z-30">
+        {/* Left: Back button & Title */}
+        <div className="flex items-center gap-3 min-w-0">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => router.push("/dashboard/deployments")}
-            className="h-8 gap-1.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800"
-            title="Back to Deployments"
+            className="h-7 px-2 text-xs text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900 gap-1.5"
           >
-            <AppIcon name="arrow-left" fallback={ArrowLeft} className="h-4 w-4" />
-            <span className="hidden sm:inline text-xs font-medium">Deployments</span>
+            <ArrowLeft className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Deployments</span>
           </Button>
 
-          <div className="h-4 w-[1px] bg-zinc-800" />
+          <div className="h-3.5 w-px bg-zinc-800 shrink-0" />
 
-          <div className="flex items-center gap-2">
-            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/10 text-primary border border-primary/20">
-              <AppIcon name="smartphone" fallback={Smartphone} className="h-4 w-4" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold tracking-tight text-zinc-100">
-                  {appName}
-                </span>
-                <Badge
-                  variant="outline"
-                  className="border-emerald-500/30 bg-emerald-500/10 text-[10px] text-emerald-400 py-0 px-1.5"
-                >
-                  Live Testing
-                </Badge>
-                {isAndroid ? (
-                  <Badge
-                    variant="outline"
-                    className="border-amber-500/30 bg-amber-500/10 text-[10px] text-amber-400 py-0 px-1.5 hidden md:inline-flex"
-                  >
-                    Native Android (Gradle)
-                  </Badge>
-                ) : archetype === "expo_react_native" ? (
-                  <Badge
-                    variant="outline"
-                    className="border-sky-500/30 bg-sky-500/10 text-[10px] text-sky-400 py-0 px-1.5 hidden md:inline-flex"
-                  >
-                    Expo PWA
-                  </Badge>
-                ) : (
-                  <Badge
-                    variant="outline"
-                    className="border-cyan-500/30 bg-cyan-500/10 text-[10px] text-cyan-400 py-0 px-1.5 hidden md:inline-flex"
-                  >
-                    Flutter Web
-                  </Badge>
-                )}
-              </div>
-            </div>
+          <div className="flex items-center gap-2 min-w-0 truncate">
+            <span className="text-xs font-medium text-zinc-200 truncate">{appName}</span>
+            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono text-zinc-500 bg-zinc-900 border border-zinc-800 shrink-0">
+              {isAndroid ? "android" : archetype}
+            </span>
           </div>
         </div>
 
-        {/* Central Testing Mode Selection Tabs */}
-        <div className="flex items-center gap-1 rounded-xl border border-zinc-800 bg-zinc-950/80 p-1">
-          <Button
-            size="sm"
-            variant={testMode === "simulator" ? "secondary" : "ghost"}
+        {/* Center: Minimal Segmented Mode Switcher */}
+        <div className="flex items-center gap-0.5 rounded-lg border border-zinc-800/90 bg-zinc-900/60 p-0.5">
+          <button
+            type="button"
             onClick={() => setTestMode("simulator")}
-            className={`h-7 px-2.5 text-xs gap-1.5 transition-all ${
+            className={cn(
+              "h-6 px-2.5 rounded-md text-xs transition-all",
               testMode === "simulator"
                 ? "bg-zinc-800 text-zinc-100 font-medium shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200"
-            }`}
+            )}
           >
-            <Smartphone className="h-3.5 w-3.5 text-sky-400" />
-            <span>Simulator</span>
-          </Button>
+            Simulator
+          </button>
 
           {isAndroid && (
-            <Button
-              size="sm"
-              variant={testMode === "download" ? "secondary" : "ghost"}
+            <button
+              type="button"
               onClick={() => setTestMode("download")}
-              className={`h-7 px-2.5 text-xs gap-1.5 transition-all ${
+              className={cn(
+                "h-6 px-2.5 rounded-md text-xs transition-all",
                 testMode === "download"
                   ? "bg-zinc-800 text-zinc-100 font-medium shadow-sm"
                   : "text-zinc-400 hover:text-zinc-200"
-              }`}
+              )}
             >
-              <Download className="h-3.5 w-3.5 text-emerald-400" />
-              <span>Download APK</span>
-            </Button>
+              Download APK
+            </button>
           )}
 
-          <Button
-            size="sm"
-            variant={testMode === "qr" ? "secondary" : "ghost"}
+          <button
+            type="button"
             onClick={() => setTestMode("qr")}
-            className={`h-7 px-2.5 text-xs gap-1.5 transition-all ${
+            className={cn(
+              "h-6 px-2.5 rounded-md text-xs transition-all",
               testMode === "qr"
                 ? "bg-zinc-800 text-zinc-100 font-medium shadow-sm"
                 : "text-zinc-400 hover:text-zinc-200"
-            }`}
+            )}
           >
-            <QrCode className="h-3.5 w-3.5 text-amber-400" />
-            <span>Scan QR</span>
-          </Button>
+            QR Code
+          </button>
 
           {isAndroid && (
-            <Button
-              size="sm"
-              variant={testMode === "adb" ? "secondary" : "ghost"}
+            <button
+              type="button"
               onClick={() => setTestMode("adb")}
-              className={`h-7 px-2.5 text-xs gap-1.5 transition-all ${
+              className={cn(
+                "h-6 px-2.5 rounded-md text-xs transition-all",
                 testMode === "adb"
                   ? "bg-zinc-800 text-zinc-100 font-medium shadow-sm"
                   : "text-zinc-400 hover:text-zinc-200"
-              }`}
+              )}
             >
-              <Terminal className="h-3.5 w-3.5 text-violet-400" />
-              <span>ADB / Sideload</span>
-            </Button>
+              ADB Sideload
+            </button>
           )}
-
-          <Button
-            size="sm"
-            variant={testMode === "cloud" ? "secondary" : "ghost"}
-            onClick={() => setTestMode("cloud")}
-            className={`h-7 px-2.5 text-xs gap-1.5 transition-all ${
-              testMode === "cloud"
-                ? "bg-zinc-800 text-zinc-100 font-medium shadow-sm"
-                : "text-zinc-400 hover:text-zinc-200"
-            }`}
-          >
-            <Cloud className="h-3.5 w-3.5 text-primary" />
-            <span>Cloud Stream</span>
-          </Button>
         </div>
 
-        {/* Right Actions Cluster */}
-        <div className="flex items-center gap-2">
+        {/* Right: Actions */}
+        <div className="flex items-center gap-2 shrink-0">
           {testMode === "simulator" && (
             <Button
               variant="ghost"
               size="sm"
               onClick={handleReload}
-              className="h-8 w-8 p-0 text-zinc-400 hover:text-zinc-100"
-              title="Reload simulator iframe"
+              className="h-7 w-7 p-0 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900"
+              title="Reload simulator"
             >
-              <AppIcon name="refresh-cw" fallback={RefreshCw} className="h-3.5 w-3.5" />
+              <RotateCw className="h-3.5 w-3.5" />
             </Button>
           )}
 
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setShowQrPanel((prev) => !prev)}
-            className={`h-8 gap-1.5 text-xs ${
-              showQrPanel
-                ? "bg-primary/20 text-primary border border-primary/30"
-                : "text-zinc-400 hover:text-zinc-100"
-            }`}
-            title="Toggle Quick Specs & QR Dock"
-          >
-            <Layers className="h-3.5 w-3.5" />
-            <span className="hidden md:inline">Specs Dock</span>
-          </Button>
-
           <a
-            href={runtimeUrl}
+            href={phoneNetworkUrl}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-800 px-2.5 text-xs font-medium text-zinc-200 hover:bg-zinc-700"
-            title="Open raw web application in a new browser tab"
+            className="inline-flex h-7 items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 text-xs text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors"
+            title="Open runtime in new tab"
           >
-            <AppIcon name="external-link" fallback={ExternalLink} className="h-3.5 w-3.5" />
-            <span className="hidden lg:inline">Open Raw</span>
+            <ExternalLink className="h-3 w-3" />
+            <span className="hidden sm:inline text-[11px]">Open</span>
           </a>
         </div>
       </header>
 
-      {/* Main Studio Area: Dynamic Testing Views + Right Dock */}
-      <div className="flex flex-1 overflow-hidden relative">
-        {/* CENTER STAGE: Switches Based on Selected Option */}
+      {/* Main Content Area */}
+      <div className="flex-1 flex overflow-hidden relative">
         <div
           ref={canvasRef}
           className="flex-1 flex items-center justify-center p-4 overflow-y-auto relative bg-[radial-gradient(#27272a_1px,transparent_1px)] [background-size:20px_20px]"
         >
           {isFetchingDeployment ? (
-            <div className="flex flex-col items-center gap-3 text-zinc-500">
-              <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-              <span className="text-xs">Initializing Testing Studio...</span>
+            <div className="flex flex-col items-center gap-2 text-zinc-500 font-mono text-xs">
+              <div className="h-5 w-5 animate-spin rounded-full border border-zinc-400 border-t-transparent" />
+              <span>Loading deployment...</span>
             </div>
           ) : testMode === "simulator" ? (
             /* =======================================================================
-               OPTION 1: HARDWARE SIMULATOR WITH BEZELS
+               MINIMAL SIMULATOR VIEW
             ======================================================================= */
             <div className="flex flex-col items-center justify-center gap-3 w-full h-full">
-              {/* Simulator Subheader Controls */}
-              <div className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/80 px-3 py-1 shadow-md">
+              {/* Device Selector Controls */}
+              <div className="flex items-center gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/90 px-2.5 py-1 text-xs shadow-sm">
                 <div className="flex items-center gap-1">
-                  <Button
-                    size="sm"
-                    variant={device === "pixel9" ? "secondary" : "ghost"}
-                    onClick={() => setDevice("pixel9")}
-                    className={`h-6 px-2 text-[11px] ${
-                      device === "pixel9" ? "bg-zinc-800 text-zinc-100 font-medium" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    Pixel 9 Pro
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={device === "galaxy24" ? "secondary" : "ghost"}
-                    onClick={() => setDevice("galaxy24")}
-                    className={`h-6 px-2 text-[11px] ${
-                      device === "galaxy24" ? "bg-zinc-800 text-zinc-100 font-medium" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    Galaxy S24
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={device === "iphone16" ? "secondary" : "ghost"}
-                    onClick={() => setDevice("iphone16")}
-                    className={`h-6 px-2 text-[11px] ${
-                      device === "iphone16" ? "bg-zinc-800 text-zinc-100 font-medium" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    iPhone 16
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={device === "tablet" ? "secondary" : "ghost"}
-                    onClick={() => setDevice("tablet")}
-                    className={`h-6 px-2 text-[11px] ${
-                      device === "tablet" ? "bg-zinc-800 text-zinc-100 font-medium" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    Tablet
-                  </Button>
+                  {(Object.keys(DEVICE_SPECS) as DeviceModel[]).map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => setDevice(m)}
+                      className={cn(
+                        "h-6 px-2 rounded text-[11px] transition-colors",
+                        device === m
+                          ? "bg-zinc-800 text-zinc-100 font-medium"
+                          : "text-zinc-500 hover:text-zinc-300"
+                      )}
+                    >
+                      {DEVICE_SPECS[m].name}
+                    </button>
+                  ))}
                 </div>
 
-                <div className="h-3 w-[1px] bg-zinc-800 mx-1" />
+                <div className="h-3 w-px bg-zinc-800" />
 
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => setOrientation((prev) => (prev === "portrait" ? "landscape" : "portrait"))}
-                  className="h-6 px-1.5 text-[11px] text-zinc-400 hover:text-zinc-100"
-                  title="Rotate Device Orientation"
+                <button
+                  type="button"
+                  onClick={() => setOrientation(orientation === "portrait" ? "landscape" : "portrait")}
+                  className="h-6 px-1.5 rounded text-[11px] text-zinc-500 hover:text-zinc-200 transition-colors flex items-center gap-1"
+                  title="Rotate orientation"
                 >
-                  <AppIcon name="rotate-cw" fallback={RotateCw} className="h-3 w-3 mr-1" />
-                  {orientation === "portrait" ? "Portrait" : "Landscape"}
-                </Button>
+                  <RotateCw className="h-3 w-3" />
+                  <span className="capitalize">{orientation}</span>
+                </button>
 
-                <div className="h-3 w-[1px] bg-zinc-800 mx-1" />
+                <div className="h-3 w-px bg-zinc-800" />
 
-                {/* Zoom Scale controls */}
                 <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => setZoomMode("fit")}
-                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
-                      zoomMode === "fit" ? "bg-primary text-primary-foreground" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    Fit
-                  </button>
-                  <button
-                    onClick={() => setZoomMode("100")}
-                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
-                      zoomMode === "100" ? "bg-primary text-primary-foreground" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    100%
-                  </button>
-                  <button
-                    onClick={() => setZoomMode("75")}
-                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
-                      zoomMode === "75" ? "bg-primary text-primary-foreground" : "text-zinc-400 hover:text-zinc-200"
-                    }`}
-                  >
-                    75%
-                  </button>
+                  {(['fit', '100', '75'] as ZoomMode[]).map((z) => (
+                    <button
+                      key={z}
+                      type="button"
+                      onClick={() => setZoomMode(z)}
+                      className={cn(
+                        "rounded px-1.5 py-0.5 text-[10px] transition-colors",
+                        zoomMode === z ? "bg-zinc-800 text-zinc-200" : "text-zinc-500 hover:text-zinc-300"
+                      )}
+                    >
+                      {z === 'fit' ? 'Fit' : `${z}%`}
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              {/* Hardware Bezel Chassis */}
+              {/* Hardware Chassis */}
               <div
                 className="transition-transform duration-300 ease-out origin-center flex items-center justify-center"
                 style={{
                   transform: `scale(${currentScale})`,
-                  width: `${deviceWidth + 24}px`,
-                  height: `${deviceHeight + 24}px`,
+                  width: `${deviceWidth + 20}px`,
+                  height: `${deviceHeight + 20}px`,
                 }}
               >
                 <div
-                  className={`relative flex items-center justify-center ${currentSpec.outerRadius} ${currentSpec.bezelBorder} ${currentSpec.bezelColor} transition-all duration-300`}
+                  className={cn(
+                    "relative flex items-center justify-center transition-all duration-300",
+                    currentSpec.outerRadius,
+                    currentSpec.bezelBorder,
+                    currentSpec.bezelColor
+                  )}
                   style={{
                     width: `${deviceWidth}px`,
                     height: `${deviceHeight}px`,
                   }}
                 >
-                  <div className="absolute inset-0 rounded-[inherit] pointer-events-none ring-1 ring-white/10" />
-
-                  {/* Device Screen Viewport */}
+                  {/* Screen Viewport */}
                   <div
-                    className={`relative w-full h-full overflow-hidden bg-black ${currentSpec.screenRadius} flex flex-col`}
+                    className={cn(
+                      "relative w-full h-full overflow-hidden bg-black flex flex-col",
+                      currentSpec.screenRadius
+                    )}
                   >
                     {/* Status Bar */}
-                    <div className="relative z-20 flex h-10 w-full shrink-0 items-center justify-between px-6 pt-1 text-[12px] font-medium text-white/90">
-                      <span className="font-semibold tracking-tight">9:41</span>
-
+                    <div className="relative z-20 flex h-9 w-full shrink-0 items-center justify-between px-6 pt-1 text-[11px] font-mono text-zinc-400 select-none">
+                      <span>9:41</span>
                       {currentSpec.notchType === "dynamic-island" && (
-                        <div className="absolute left-1/2 top-2 -translate-x-1/2 flex h-7 w-28 items-center justify-between rounded-full bg-black px-2.5 shadow-md border border-zinc-800/80">
-                          <div className="h-2.5 w-2.5 rounded-full bg-zinc-900 border border-zinc-800" />
-                          <div className="h-2.5 w-2.5 rounded-full bg-emerald-500/80 animate-pulse" />
+                        <div className="absolute left-1/2 top-2 -translate-x-1/2 h-5 w-24 rounded-full bg-black border border-zinc-800 flex items-center justify-between px-2">
+                          <div className="h-2 w-2 rounded-full bg-zinc-900 border border-zinc-800" />
+                          <div className="h-1.5 w-1.5 rounded-full bg-zinc-600" />
                         </div>
                       )}
-
                       {currentSpec.notchType === "punch-hole" && (
-                        <div className="absolute left-1/2 top-2.5 -translate-x-1/2 h-3.5 w-3.5 rounded-full bg-black border border-zinc-800 shadow-inner" />
+                        <div className="absolute left-1/2 top-2 -translate-x-1/2 h-3 w-3 rounded-full bg-black border border-zinc-800" />
                       )}
-
-                      <div className="flex items-center gap-1.5 text-zinc-300">
+                      <div className="flex items-center gap-1.5 text-zinc-400">
                         <Wifi className="h-3 w-3" />
-                        <BatteryCharging className="h-3.5 w-3.5" />
+                        <BatteryCharging className="h-3 w-3" />
                       </div>
                     </div>
 
-                    {/* Live Mobile Web Application Viewport */}
+                    {/* Viewport Iframe */}
                     <div className="relative flex-1 w-full h-full bg-zinc-950 overflow-hidden">
                       {isLoadingIframe && (
-                        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-zinc-950/80 backdrop-blur-sm gap-2">
-                          <div className="h-6 w-6 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-                          <span className="text-xs text-zinc-400">Loading mobile runtime...</span>
+                        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-zinc-950/80 backdrop-blur-sm gap-2 text-zinc-500 font-mono text-xs">
+                          <div className="h-5 w-5 animate-spin rounded-full border border-zinc-400 border-t-transparent" />
+                          <span>Loading runtime...</span>
                         </div>
                       )}
 
-                      <iframe
-                        key={iframeKey}
-                        src={runtimeUrl}
-                        onLoad={() => setIsLoadingIframe(false)}
-                        title="StackPilot Mobile Simulator"
-                        className="w-full h-full border-0 bg-zinc-950"
-                        allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; microphone; midi; clipboard-read; clipboard-write;"
-                      />
+                      {iframeError ? (
+                        <div className="flex flex-col items-center justify-center h-full p-6 text-center text-zinc-500 font-mono text-xs gap-2">
+                          <Smartphone className="h-8 w-8 text-zinc-600 stroke-[1.5]" />
+                          <p className="text-zinc-300 font-medium">Container Offline or Non-Web</p>
+                          <p className="text-[11px] text-zinc-500 max-w-xs">
+                            {isAndroid
+                              ? "This is a Native Android binary. Use the Download APK or ADB Sideload tab to run on your device."
+                              : `Unable to connect to ${runtimeUrl}. The container may still be booting.`}
+                          </p>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={handleReload}
+                            className="mt-2 h-7 text-xs border-zinc-800 text-zinc-300 hover:bg-zinc-900"
+                          >
+                            <RotateCw className="h-3 w-3 mr-1.5" /> Retry Connection
+                          </Button>
+                        </div>
+                      ) : (
+                        <iframe
+                          key={iframeKey}
+                          src={runtimeUrl}
+                          onLoad={() => setIsLoadingIframe(false)}
+                          onError={() => setIframeError(true)}
+                          title="StackPilot Mobile Simulator"
+                          className="w-full h-full border-0 bg-zinc-950"
+                          allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; microphone; midi; clipboard-read; clipboard-write;"
+                        />
+                      )}
                     </div>
 
                     {/* Home Indicator */}
-                    <div className="relative z-20 flex h-5 w-full shrink-0 items-center justify-center pb-1">
-                      <div className="h-1 w-32 rounded-full bg-white/40" />
+                    <div className="relative z-20 flex h-4 w-full shrink-0 items-center justify-center pb-1">
+                      <div className="h-1 w-28 rounded-full bg-zinc-700" />
                     </div>
                   </div>
                 </div>
               </div>
+
+              {/* Bottom Network URL Indicator */}
+              <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-500">
+                <span>Phone accessible URL:</span>
+                <span className="text-zinc-300 bg-zinc-900 px-2 py-0.5 rounded border border-zinc-800">
+                  {phoneNetworkUrl}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleCopy(phoneNetworkUrl, "url")}
+                  className="text-zinc-400 hover:text-zinc-100 p-1 rounded hover:bg-zinc-900"
+                  title="Copy phone URL"
+                >
+                  {copiedUrl ? <Check className="h-3 w-3 text-zinc-200" /> : <Copy className="h-3 w-3" />}
+                </button>
+              </div>
             </div>
           ) : testMode === "download" ? (
             /* =======================================================================
-               OPTION 2: DIRECT APK DOWNLOAD CENTER
+               MINIMAL DOWNLOAD APK VIEW
             ======================================================================= */
-            <div className="max-w-2xl w-full flex flex-col gap-5 py-4">
-              <div className="rounded-2xl border border-zinc-800 bg-zinc-900/90 p-6 shadow-2xl backdrop-blur-sm">
+            <div className="max-w-xl w-full flex flex-col gap-4 py-4">
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/90 p-6 shadow-xl space-y-5">
                 <div className="flex items-start justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                      <Download className="h-6 w-6" />
-                    </div>
-                    <div>
-                      <h2 className="text-base font-bold text-zinc-100 flex items-center gap-2">
-                        <span>{appName}</span>
-                        <Badge variant="outline" className="border-emerald-500/40 bg-emerald-500/10 text-emerald-400 text-[10px]">
-                          Debug APK
-                        </Badge>
-                      </h2>
-                      <p className="text-xs text-zinc-400 mt-0.5 font-mono">{bundleId}</p>
-                    </div>
+                  <div>
+                    <h2 className="text-sm font-semibold text-zinc-100">{appName}</h2>
+                    <p className="text-xs font-mono text-zinc-500 mt-0.5">{bundleId}</p>
                   </div>
-
                   <a
-                    href={apkDownloadUrl}
+                    href={phoneApkUrl}
                     download={apkFileName}
-                    className="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-5 py-2.5 font-semibold text-xs text-zinc-950 hover:bg-emerald-400 transition-colors shadow-lg shadow-emerald-500/20"
+                    className="inline-flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-xs font-medium text-zinc-950 hover:bg-zinc-200 transition-colors shadow-sm"
                   >
-                    <Download className="h-4 w-4" />
+                    <Download className="h-3.5 w-3.5" />
                     <span>Download APK</span>
                   </a>
                 </div>
 
-                <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
-                    <span className="text-[10px] uppercase font-semibold text-zinc-500">Package Format</span>
-                    <p className="mt-1 text-xs font-medium text-zinc-200">Android APK</p>
+                {/* Spec details grid */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-2.5">
+                    <span className="text-[10px] text-zinc-500 uppercase">Format</span>
+                    <p className="mt-0.5 text-zinc-200 font-medium">Android APK</p>
                   </div>
-                  <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
-                    <span className="text-[10px] uppercase font-semibold text-zinc-500">Target SDK</span>
-                    <p className="mt-1 text-xs font-medium text-zinc-200">{sdkVersion}</p>
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-2.5">
+                    <span className="text-[10px] text-zinc-500 uppercase">Target SDK</span>
+                    <p className="mt-0.5 text-zinc-200 font-medium">{sdkVersion}</p>
                   </div>
-                  <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
-                    <span className="text-[10px] uppercase font-semibold text-zinc-500">Architecture</span>
-                    <p className="mt-1 text-xs font-medium text-zinc-200">Universal (arm64/x86)</p>
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-2.5">
+                    <span className="text-[10px] text-zinc-500 uppercase">Architecture</span>
+                    <p className="mt-0.5 text-zinc-200 font-medium">Universal</p>
                   </div>
-                  <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
-                    <span className="text-[10px] uppercase font-semibold text-zinc-500">Build Variant</span>
-                    <p className="mt-1 text-xs font-medium text-emerald-400">Gradle Debug</p>
-                  </div>
-                </div>
-
-                {/* Integrity & Checksum */}
-                <div className="mt-5 space-y-2 rounded-xl border border-zinc-800 bg-zinc-950 p-3.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="flex items-center gap-1.5 font-medium text-zinc-400">
-                      <Hash className="h-3.5 w-3.5 text-primary" />
-                      <span>SHA-256 Checksum Verification</span>
-                    </span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => handleCopy("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "cmd", "sha256")}
-                      className="h-6 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
-                    >
-                      {copiedCmd === "sha256" ? (
-                        <Check className="h-3 w-3 text-emerald-400 mr-1" />
-                      ) : (
-                        <Copy className="h-3 w-3 mr-1" />
-                      )}
-                      Copy Hash
-                    </Button>
-                  </div>
-                  <div className="font-mono text-[11px] text-zinc-400 break-all select-all bg-zinc-900/80 p-2 rounded-lg border border-zinc-800/60">
-                    e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+                  <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-2.5">
+                    <span className="text-[10px] text-zinc-500 uppercase">Variant</span>
+                    <p className="mt-0.5 text-zinc-200 font-medium">Debug</p>
                   </div>
                 </div>
 
                 {/* Sideload Guide */}
-                <div className="mt-5 border-t border-zinc-800/80 pt-5 space-y-3">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
-                    <ShieldCheck className="h-4 w-4 text-emerald-400" />
-                    <span>Android Sideloading Instructions</span>
-                  </h3>
-                  <div className="space-y-2 text-xs text-zinc-400">
-                    <div className="flex items-start gap-2.5">
-                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-[10px] font-bold text-zinc-200">
-                        1
-                      </span>
-                      <span>Download the APK to your phone or copy it via USB cable.</span>
-                    </div>
-                    <div className="flex items-start gap-2.5">
-                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-[10px] font-bold text-zinc-200">
-                        2
-                      </span>
-                      <span>Open your file manager or browser Downloads folder and tap <strong className="text-zinc-200">{apkFileName}</strong>.</span>
-                    </div>
-                    <div className="flex items-start gap-2.5">
-                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-[10px] font-bold text-zinc-200">
-                        3
-                      </span>
-                      <span>If prompted by Android, allow <strong className="text-zinc-200">&quot;Install unknown apps&quot;</strong> for that application in Settings.</span>
-                    </div>
-                    <div className="flex items-start gap-2.5">
-                      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-[10px] font-bold text-zinc-200">
-                        4
-                      </span>
-                      <span>Tap <strong className="text-emerald-400">&quot;Install&quot;</strong> and launch the application directly on your device.</span>
-                    </div>
+                <div className="border-t border-zinc-800 pt-4 space-y-2.5 text-xs text-zinc-400">
+                  <span className="text-[11px] font-medium text-zinc-300 uppercase tracking-wide">
+                    Sideloading Guide
+                  </span>
+                  <div className="space-y-1.5 font-mono text-[11px]">
+                    <p>1. Download the APK onto your Android device or transfer via USB.</p>
+                    <p>2. Open Files or Downloads on the phone and tap <strong>{apkFileName}</strong>.</p>
+                    <p>3. Allow "Install unknown apps" if prompted by Android Settings.</p>
+                    <p>4. Tap Install to run the application.</p>
                   </div>
                 </div>
               </div>
             </div>
           ) : testMode === "qr" ? (
             /* =======================================================================
-               OPTION 3: SCAN QR CODE WITH PHONE
+               BEAUTIFUL WHITE QR CODE VIEW (@lglab/react-qr-code + nip.io)
             ======================================================================= */
             <div className="max-w-md w-full flex flex-col items-center gap-4 py-4">
-              <div className="w-full rounded-2xl border border-zinc-800 bg-zinc-900/95 p-6 shadow-2xl backdrop-blur-sm text-center flex flex-col items-center">
-                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-400 border border-amber-500/30 mb-2">
-                  <QrCode className="h-6 w-6" />
-                </div>
-                <h2 className="text-base font-bold text-zinc-100">Scan QR Code with Phone</h2>
-                <p className="text-xs text-zinc-400 mt-1 max-w-sm">
-                  Point your physical device camera at this code to test without connecting any cables.
+              <div className="w-full rounded-2xl border border-zinc-800 bg-zinc-900/95 p-6 shadow-2xl text-center flex flex-col items-center">
+                <h2 className="text-sm font-semibold text-zinc-100">Scan with Phone Camera</h2>
+                <p className="text-xs text-zinc-400 mt-1 max-w-xs">
+                  Point your phone camera at this code to open directly over Wi-Fi.
                 </p>
 
-                {/* QR Target Switcher */}
+                {/* Android Target Switcher */}
                 {isAndroid && (
-                  <div className="mt-4 flex rounded-lg border border-zinc-800 bg-zinc-950 p-1 w-full max-w-xs">
+                  <div className="mt-3 flex rounded-lg border border-zinc-800 bg-zinc-950 p-0.5 w-full max-w-xs">
                     <button
+                      type="button"
                       onClick={() => setQrType("apk")}
-                      className={`flex-1 py-1 text-xs rounded font-medium transition-all ${
+                      className={cn(
+                        "flex-1 py-1 text-xs rounded font-medium transition-all",
                         qrType === "apk"
-                          ? "bg-primary text-primary-foreground shadow"
-                          : "text-zinc-400 hover:text-zinc-200"
-                      }`}
+                          ? "bg-zinc-800 text-zinc-100 shadow"
+                          : "text-zinc-500 hover:text-zinc-300"
+                      )}
                     >
                       Direct APK Download
                     </button>
                     <button
+                      type="button"
                       onClick={() => setQrType("web")}
-                      className={`flex-1 py-1 text-xs rounded font-medium transition-all ${
+                      className={cn(
+                        "flex-1 py-1 text-xs rounded font-medium transition-all",
                         qrType === "web"
-                          ? "bg-primary text-primary-foreground shadow"
-                          : "text-zinc-400 hover:text-zinc-200"
-                      }`}
+                          ? "bg-zinc-800 text-zinc-100 shadow"
+                          : "text-zinc-500 hover:text-zinc-300"
+                      )}
                     >
-                      Web Simulator
+                      Web App
                     </button>
                   </div>
                 )}
 
-                {/* High-Contrast QR Code */}
-                <div className="mt-5 rounded-2xl border border-zinc-800 bg-zinc-950 p-5 shadow-2xl">
-                  <div className="rounded-xl overflow-hidden border border-zinc-800 p-2 bg-zinc-900">
-                    <img
-                      src={qrImageUrl}
-                      alt="Physical Mobile Device QR Code"
-                      width={240}
-                      height={240}
-                      className="rounded-lg"
+                {/* Beautiful Pure-White QR Code with @lglab/react-qr-code */}
+                <div className="mt-5 rounded-2xl border border-zinc-800 bg-zinc-950 p-4 shadow-xl flex items-center justify-center">
+                  <div className="p-2 bg-zinc-950 rounded-xl border border-zinc-900 flex items-center justify-center">
+                    <ReactQRCode
+                      value={activeQrTarget}
+                      size={220}
+                      background="#09090b"
+                      dataModulesSettings={{
+                        color: "#FFFFFF",
+                        style: "rounded",
+                      }}
+                      finderPatternOuterSettings={{
+                        color: "#FFFFFF",
+                        style: "rounded-sm",
+                      }}
+                      finderPatternInnerSettings={{
+                        color: "#FFFFFF",
+                        style: "rounded-sm",
+                      }}
+                      marginSize={2}
                     />
-                  </div>
-                  <div className="mt-3 flex items-center justify-center gap-1.5 text-[11px] text-zinc-400">
-                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-                    <span>
-                      {qrType === "apk" && isAndroid
-                        ? "Downloads .apk directly on phone"
-                        : "Opens instant mobile browser preview"}
-                    </span>
                   </div>
                 </div>
 
-                {/* Target URL */}
-                <div className="mt-4 w-full flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-1.5 text-left">
-                  <span className="px-2 text-[10px] uppercase font-bold text-zinc-500">URL</span>
+                {/* Target URL with Copy Button */}
+                <div className="mt-4 w-full flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-1.5 text-left font-mono">
+                  <span className="px-1.5 text-[10px] uppercase font-bold text-zinc-500 shrink-0">URL</span>
                   <input
                     type="text"
                     readOnly
                     value={activeQrTarget}
-                    className="flex-1 bg-transparent px-1 text-xs text-zinc-300 outline-none font-mono select-all truncate"
+                    className="flex-1 bg-transparent px-1 text-xs text-zinc-300 outline-none select-all truncate"
                   />
                   <Button
                     size="sm"
                     variant="ghost"
                     onClick={() => handleCopy(activeQrTarget, "url")}
-                    className="h-7 px-2 text-zinc-400 hover:text-zinc-100"
+                    className="h-7 px-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-900 shrink-0"
                   >
-                    {copiedUrl ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+                    {copiedUrl ? <Check className="h-3.5 w-3.5 text-zinc-200" /> : <Copy className="h-3.5 w-3.5" />}
                   </Button>
                 </div>
-              </div>
-            </div>
-          ) : testMode === "adb" ? (
-            /* =======================================================================
-               OPTION 4: ADB COMMANDS & DEV TOOLS SIDELOAD
-            ======================================================================= */
-            <div className="max-w-2xl w-full flex flex-col gap-4 py-4">
-              <div className="rounded-2xl border border-zinc-800 bg-zinc-900/90 p-6 shadow-2xl backdrop-blur-sm space-y-5">
-                <div className="flex items-center gap-3">
-                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-500/10 text-violet-400 border border-violet-500/30">
-                    <Terminal className="h-6 w-6" />
-                  </div>
-                  <div>
-                    <h2 className="text-base font-bold text-zinc-100">ADB Sideload & Developer Terminal</h2>
-                    <p className="text-xs text-zinc-400 mt-0.5">
-                      Fast 1-click terminal commands to install and debug directly on connected Android devices.
-                    </p>
-                  </div>
-                </div>
 
-                {/* Command 1: Standard ADB install */}
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-zinc-300">1. Sideload APK to Connected Device</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => handleCopy(`adb install -r ${apkFileName}`, "cmd", "cmd-install")}
-                      className="h-6 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
-                    >
-                      {copiedCmd === "cmd-install" ? (
-                        <Check className="h-3 w-3 text-emerald-400 mr-1" />
-                      ) : (
-                        <Copy className="h-3 w-3 mr-1" />
-                      )}
-                      Copy
-                    </Button>
+                {/* Host & nip.io Network Resolver Controls */}
+                <div className="mt-4 w-full border-t border-zinc-800/80 pt-3 text-left space-y-2">
+                  <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                    <span>Network Address Mode</span>
+                    <div className="flex items-center gap-1 font-mono">
+                      <button
+                        type="button"
+                        onClick={() => setHostMode("nip")}
+                        className={cn(
+                          "px-2 py-0.5 rounded text-[10px] transition-colors",
+                          hostMode === "nip"
+                            ? "bg-zinc-800 text-zinc-100 font-medium"
+                            : "text-zinc-500 hover:text-zinc-300"
+                        )}
+                      >
+                        nip.io
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setHostMode("ip")}
+                        className={cn(
+                          "px-2 py-0.5 rounded text-[10px] transition-colors",
+                          hostMode === "ip"
+                            ? "bg-zinc-800 text-zinc-100 font-medium"
+                            : "text-zinc-500 hover:text-zinc-300"
+                        )}
+                      >
+                        LAN IP
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setHostMode("custom")}
+                        className={cn(
+                          "px-2 py-0.5 rounded text-[10px] transition-colors",
+                          hostMode === "custom"
+                            ? "bg-zinc-800 text-zinc-100 font-medium"
+                            : "text-zinc-500 hover:text-zinc-300"
+                        )}
+                      >
+                        Tunnel
+                      </button>
+                    </div>
                   </div>
-                  <pre className="p-2.5 rounded-lg bg-zinc-900 text-xs text-emerald-400 font-mono overflow-x-auto border border-zinc-800/80">
-                    adb install -r {apkFileName}
-                  </pre>
-                  <p className="text-[11px] text-zinc-500">
-                    Reinstalls the app while keeping all local cached state and preferences.
+
+                  {/* Host IP Config */}
+                  <div className="flex items-center gap-1.5 text-xs font-mono bg-zinc-950 p-1.5 rounded-lg border border-zinc-800">
+                    <Globe className="h-3.5 w-3.5 text-zinc-500 shrink-0 ml-1" />
+                    {isEditingHost ? (
+                      <div className="flex items-center gap-1 flex-1 min-w-0">
+                        <input
+                          type="text"
+                          value={hostInput}
+                          onChange={(e) => setHostInput(e.target.value)}
+                          placeholder="e.g. 172.20.10.2 or ngrok URL"
+                          className="flex-1 bg-transparent text-xs text-zinc-200 outline-none px-1 border-b border-zinc-700"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => saveCustomHost(hostInput)}
+                          className="px-2 py-0.5 text-[10px] rounded bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                        >
+                          Save
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-between flex-1 min-w-0 pr-1">
+                        <span className="text-zinc-400 text-[11px] truncate">
+                          {hostMode === "nip" ? `${customHost}.nip.io` : customHost}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setHostInput(customHost);
+                            setIsEditingHost(true);
+                          }}
+                          className="text-[10px] text-zinc-500 hover:text-zinc-300 underline"
+                        >
+                          Change IP
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-zinc-500 leading-normal">
+                    {hostMode === "nip"
+                      ? "Using nip.io: resolves host machine IP directly across local Wi-Fi or mobile hotspots."
+                      : hostMode === "ip"
+                      ? "Direct LAN IP: connect your phone to the same Wi-Fi network."
+                      : "Custom / Tunnel: paste an ngrok or public domain."}
                   </p>
-                </div>
-
-                {/* Command 2: Download & Install One-Liner */}
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-zinc-300">2. Download from StackPilot & Sideload in 1 Command</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() =>
-                        handleCopy(
-                          `curl -sLO ${apkDownloadUrl} && adb install -r ${apkFileName}`,
-                          "cmd",
-                          "cmd-curl-install"
-                        )
-                      }
-                      className="h-6 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
-                    >
-                      {copiedCmd === "cmd-curl-install" ? (
-                        <Check className="h-3 w-3 text-emerald-400 mr-1" />
-                      ) : (
-                        <Copy className="h-3 w-3 mr-1" />
-                      )}
-                      Copy
-                    </Button>
-                  </div>
-                  <pre className="p-2.5 rounded-lg bg-zinc-900 text-xs text-sky-400 font-mono overflow-x-auto border border-zinc-800/80">
-                    curl -sLO {apkDownloadUrl} &amp;&amp; adb install -r {apkFileName}
-                  </pre>
-                </div>
-
-                {/* Command 3: Launch Main Activity */}
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-zinc-300">3. Launch Application Intent</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() =>
-                        handleCopy(`adb shell monkey -p ${bundleId} -c android.intent.category.LAUNCHER 1`, "cmd", "cmd-launch")
-                      }
-                      className="h-6 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
-                    >
-                      {copiedCmd === "cmd-launch" ? (
-                        <Check className="h-3 w-3 text-emerald-400 mr-1" />
-                      ) : (
-                        <Copy className="h-3 w-3 mr-1" />
-                      )}
-                      Copy
-                    </Button>
-                  </div>
-                  <pre className="p-2.5 rounded-lg bg-zinc-900 text-xs text-amber-300 font-mono overflow-x-auto border border-zinc-800/80">
-                    adb shell monkey -p {bundleId} -c android.intent.category.LAUNCHER 1
-                  </pre>
-                </div>
-
-                {/* Command 4: Live Logcat */}
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-zinc-300">4. Tail Live Android Logs (Logcat)</span>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => handleCopy(`adb logcat --pid=$(adb shell pidof -s ${bundleId})`, "cmd", "cmd-logcat")}
-                      className="h-6 px-2 text-[11px] text-zinc-400 hover:text-zinc-100"
-                    >
-                      {copiedCmd === "cmd-logcat" ? (
-                        <Check className="h-3 w-3 text-emerald-400 mr-1" />
-                      ) : (
-                        <Copy className="h-3 w-3 mr-1" />
-                      )}
-                      Copy
-                    </Button>
-                  </div>
-                  <pre className="p-2.5 rounded-lg bg-zinc-900 text-xs text-zinc-300 font-mono overflow-x-auto border border-zinc-800/80">
-                    adb logcat --pid=$(adb shell pidof -s {bundleId})
-                  </pre>
                 </div>
               </div>
             </div>
           ) : (
             /* =======================================================================
-               OPTION 5: CLOUD STREAM & REMOTE EMULATION
+               MINIMAL ADB COMMANDS VIEW
             ======================================================================= */
-            <div className="max-w-xl w-full flex flex-col gap-4 py-4 text-center items-center">
-              <div className="w-full rounded-2xl border border-zinc-800 bg-zinc-900/90 p-8 shadow-2xl backdrop-blur-sm space-y-4">
-                <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10 text-primary border border-primary/30 mx-auto">
-                  <Cloud className="h-7 w-7" />
-                </div>
-                <h2 className="text-base font-bold text-zinc-100">Cloud Device Streaming</h2>
-                <p className="text-xs text-zinc-400 max-w-md mx-auto leading-relaxed">
-                  Run this mobile application directly in an isolated remote headless Android emulator container or stream it via WebRTC in your browser.
-                </p>
-
-                <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 text-left space-y-3">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-zinc-400">Streaming Engine:</span>
-                    <Badge variant="outline" className="border-primary/40 bg-primary/10 text-primary text-[10px]">
-                      WebRTC Android Bridge
-                    </Badge>
-                  </div>
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-zinc-400">Resolution:</span>
-                    <span className="font-mono text-zinc-200">1080 × 2400 @ 60 FPS</span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="text-zinc-400">Target URL:</span>
-                    <span className="font-mono text-zinc-200 truncate max-w-[200px]">{runtimeUrl}</span>
+            <div className="max-w-xl w-full flex flex-col gap-3 py-4">
+              <div className="rounded-xl border border-zinc-800 bg-zinc-900/90 p-5 shadow-xl space-y-4 text-xs font-mono">
+                <div className="flex items-center justify-between border-b border-zinc-800 pb-3">
+                  <div>
+                    <h2 className="text-sm font-semibold text-zinc-200 font-sans">ADB Sideload & Terminal</h2>
+                    <p className="text-[11px] text-zinc-500 mt-0.5">Commands for connected Android devices or emulators.</p>
                   </div>
                 </div>
 
-                <div className="pt-2 flex flex-col sm:flex-row gap-2 justify-center">
-                  <a
-                    href={runtimeUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-5 py-2.5 font-semibold text-xs text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg"
-                  >
-                    <ExternalLink className="h-4 w-4" />
-                    <span>Launch Cloud Stream</span>
-                  </a>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => setTestMode("simulator")}
-                    className="h-10 text-xs border-zinc-800 text-zinc-300 hover:bg-zinc-800"
-                  >
-                    Switch to Local Simulator
-                  </Button>
+                {/* Command 1 */}
+                <div className="space-y-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="flex items-center justify-between text-zinc-400 text-[11px]">
+                    <span>1. Install APK directly</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(`adb install -r ${apkFileName}`, "cmd", "cmd1")}
+                      className="hover:text-zinc-100 flex items-center gap-1"
+                    >
+                      {copiedCmd === "cmd1" ? <Check className="h-3 w-3 text-zinc-200" /> : <Copy className="h-3 w-3" />}
+                      <span>Copy</span>
+                    </button>
+                  </div>
+                  <pre className="text-zinc-200 bg-zinc-900 p-2 rounded text-[11px] overflow-x-auto">
+                    adb install -r {apkFileName}
+                  </pre>
+                </div>
+
+                {/* Command 2 */}
+                <div className="space-y-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="flex items-center justify-between text-zinc-400 text-[11px]">
+                    <span>2. Download from StackPilot & Install</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(`curl -sLO ${phoneApkUrl} && adb install -r ${apkFileName}`, "cmd", "cmd2")}
+                      className="hover:text-zinc-100 flex items-center gap-1"
+                    >
+                      {copiedCmd === "cmd2" ? <Check className="h-3 w-3 text-zinc-200" /> : <Copy className="h-3 w-3" />}
+                      <span>Copy</span>
+                    </button>
+                  </div>
+                  <pre className="text-zinc-200 bg-zinc-900 p-2 rounded text-[11px] overflow-x-auto">
+                    curl -sLO {phoneApkUrl} && adb install -r {apkFileName}
+                  </pre>
+                </div>
+
+                {/* Command 3 */}
+                <div className="space-y-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-3">
+                  <div className="flex items-center justify-between text-zinc-400 text-[11px]">
+                    <span>3. Launch Activity</span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(`adb shell monkey -p ${bundleId} -c android.intent.category.LAUNCHER 1`, "cmd", "cmd3")}
+                      className="hover:text-zinc-100 flex items-center gap-1"
+                    >
+                      {copiedCmd === "cmd3" ? <Check className="h-3 w-3 text-zinc-200" /> : <Copy className="h-3 w-3" />}
+                      <span>Copy</span>
+                    </button>
+                  </div>
+                  <pre className="text-zinc-200 bg-zinc-900 p-2 rounded text-[11px] overflow-x-auto">
+                    adb shell monkey -p {bundleId} -c android.intent.category.LAUNCHER 1
+                  </pre>
                 </div>
               </div>
             </div>
           )}
         </div>
-
-        {/* RIGHT DOCK: Quick Actions, Specifications & QR Code */}
-        {showQrPanel && (
-          <aside className="w-80 shrink-0 border-l border-zinc-800 bg-zinc-900/95 p-5 flex flex-col gap-5 overflow-y-auto z-20 backdrop-blur-md">
-            <div>
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold uppercase tracking-wider text-primary">
-                  Testing Center
-                </span>
-                <Badge
-                  variant="outline"
-                  className="border-primary/40 bg-primary/10 text-[10px] text-primary"
-                >
-                  Active
-                </Badge>
-              </div>
-              <p className="mt-1 text-xs text-zinc-400 leading-relaxed">
-                Seamlessly test and distribute across physical devices, emulators, or local sideload.
-              </p>
-            </div>
-
-            {/* Quick QR Card */}
-            <div className="flex flex-col items-center justify-center rounded-xl border border-zinc-800 bg-zinc-950 p-4 shadow-xl">
-              <div className="relative rounded-lg overflow-hidden border border-zinc-800 p-1 bg-zinc-900">
-                <img
-                  src={qrImageUrl}
-                  alt="Quick Mobile QR Code"
-                  width={200}
-                  height={200}
-                  className="rounded-md"
-                />
-              </div>
-
-              <div className="mt-3 flex items-center gap-1 text-[11px] text-zinc-400">
-                <CheckCircle2 className="h-3 w-3 text-emerald-400" />
-                <span>Camera scan ready</span>
-              </div>
-            </div>
-
-            {/* Quick Sideload APK button if Android */}
-            {isAndroid && (
-              <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 space-y-2">
-                <div className="flex items-center gap-2 text-xs font-semibold text-emerald-400">
-                  <Download className="h-4 w-4" />
-                  <span>Download APK ({apkFileName})</span>
-                </div>
-                <p className="text-[11px] text-zinc-300">
-                  Direct debug APK generated from Gradle build. Sideload directly to any Android device.
-                </p>
-                <a
-                  href={apkDownloadUrl}
-                  download={apkFileName}
-                  className="flex items-center justify-center gap-1.5 w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-semibold text-xs py-2 transition-colors shadow-sm"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  Download APK
-                </a>
-              </div>
-            )}
-
-            {/* Direct URL & Copy */}
-            <div className="space-y-2">
-              <label className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wider">
-                Deployment Runtime URL
-              </label>
-              <div className="flex items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 p-1.5">
-                <input
-                  type="text"
-                  readOnly
-                  value={runtimeUrl}
-                  className="flex-1 bg-transparent px-1.5 text-xs text-zinc-300 outline-none font-mono select-all truncate"
-                />
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => handleCopy(runtimeUrl, "url")}
-                  className="h-7 px-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800"
-                >
-                  {copiedUrl ? (
-                    <Check className="h-3.5 w-3.5 text-emerald-400" />
-                  ) : (
-                    <Copy className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-              </div>
-            </div>
-
-            {/* Archetype & Runtime Specs */}
-            <div className="rounded-xl border border-zinc-800 bg-zinc-950/60 p-3.5 space-y-2.5">
-              <div className="flex items-center gap-2 text-xs font-semibold text-zinc-300">
-                <Info className="h-3.5 w-3.5 text-primary" />
-                <span>Environment Specs</span>
-              </div>
-              <div className="space-y-1.5 text-[11px]">
-                <div className="flex justify-between text-zinc-400">
-                  <span>Archetype:</span>
-                  <span className="font-mono text-zinc-200 uppercase">{archetype}</span>
-                </div>
-                <div className="flex justify-between text-zinc-400">
-                  <span>Target SDK:</span>
-                  <span className="font-mono text-zinc-200">{sdkVersion}</span>
-                </div>
-                <div className="flex justify-between text-zinc-400">
-                  <span>Bundle ID:</span>
-                  <span className="font-mono text-zinc-200 truncate max-w-[140px]" title={bundleId}>{bundleId}</span>
-                </div>
-                <div className="flex justify-between text-zinc-400">
-                  <span>Viewport:</span>
-                  <span className="font-mono text-zinc-200">
-                    {deviceWidth} × {deviceHeight} px
-                  </span>
-                </div>
-                <div className="flex justify-between text-zinc-400">
-                  <span>Touch Emulation:</span>
-                  <span className="text-emerald-400 font-medium">Active</span>
-                </div>
-              </div>
-            </div>
-          </aside>
-        )}
       </div>
     </div>
   );

@@ -1034,12 +1034,12 @@ export function InfrastructureMonitor() {
             Observe, claim, and control Docker and Kubernetes resources on the StackPilot host or a saved SSH server.
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-nowrap items-center gap-2 shrink-0">
           <Select value={targetConnectionId} onValueChange={(value) => setTargetConnectionId(value || "local")}>
-            <SelectTrigger className="h-10 min-w-[300px] justify-between">
+            <SelectTrigger className="h-10 w-[200px] sm:w-[240px] md:w-[280px] shrink-0 justify-between">
               <span className="truncate">{targetLabel}</span>
             </SelectTrigger>
-            <SelectContent align="end" className="min-w-[280px]">
+            <SelectContent align="end" className="min-w-[240px]">
               <SelectItem value="local">
                 Local StackPilot host
               </SelectItem>
@@ -1073,7 +1073,7 @@ export function InfrastructureMonitor() {
           </Select>
           <Button
             variant="outline"
-            className="h-10 shrink-0"
+            className="h-10 shrink-0 whitespace-nowrap"
             onClick={() => inventoryQuery.refetch()}
             disabled={inventoryQuery.isFetching}
           >

@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
+import { usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import api from "@/lib/api";
 
@@ -39,12 +40,20 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     } catch {}
   }, []);
 
+  const pathname = usePathname();
+  const isAuthPage =
+    Boolean(pathname?.startsWith("/auth")) ||
+    pathname === "/login" ||
+    pathname === "/register" ||
+    pathname === "/forgot-password";
+
   const { data: organizations = [], isLoading, refetch } = useQuery({
     queryKey: ["organizations"],
     queryFn: async () => {
       const res = await api.get<{ organizations: Organization[] }>("/organizations");
       return res.data.organizations || [];
     },
+    enabled: !isAuthPage,
     staleTime: 30000,
   });
 

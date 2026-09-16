@@ -11,6 +11,9 @@ interface RemoteSshTerminalProps {
   connectionId: string;
   cwd: string;
   className?: string;
+  title?: string;
+  connectedInfo?: string;
+  onClose?: () => void;
 }
 
 function getTerminalWsUrl(connectionId: string, cwd: string) {
@@ -32,7 +35,14 @@ function tryParseControlMessage(data: string) {
   }
 }
 
-export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTerminalProps) {
+export function RemoteSshTerminal({
+  connectionId,
+  cwd,
+  className,
+  title,
+  connectedInfo,
+  onClose,
+}: RemoteSshTerminalProps) {
   const themeVersion = useCanvasThemeVersion();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -213,56 +223,73 @@ export function RemoteSshTerminal({ connectionId, cwd, className }: RemoteSshTer
     <div
       ref={rootRef}
       className={cn(
-        "flex h-full min-h-[320px] flex-col overflow-hidden rounded-xl border border-border bg-black",
+        "flex h-full min-h-[320px] flex-col overflow-hidden rounded-md border border-zinc-800 bg-[#0c0c0c] shadow-2xl",
         // In fullscreen the element is the whole viewport, so the rounded
         // corners and border would draw a box around the screen edge.
         isFullscreen && "min-h-0 rounded-none border-0",
         className
       )}
     >
-      <div className="flex items-center justify-between border-b border-white/10 bg-zinc-950 px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2 text-xs text-zinc-300">
-          <AppIcon name="terminal-icon" fallback={TerminalIcon} className="h-4 w-4 shrink-0"  />
-          <span className="truncate font-mono">{cwd}</span>
-          <span
-            className={cn(
-              "ml-2 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wide",
-              connectionState === "connected" && "bg-emerald-500/15 text-emerald-300",
-              connectionState === "connecting" && "bg-yellow-500/15 text-yellow-300",
-              connectionState === "closed" && "bg-zinc-500/15 text-zinc-300",
-              connectionState === "error" && "bg-red-500/15 text-red-300"
-            )}
-          >
-            {connectionState}
+      <div className="flex h-8 items-center justify-between border-b border-zinc-800 bg-[#18181b] px-2 select-none shrink-0">
+        <div className="flex min-w-0 items-center gap-2 text-xs text-white/90">
+          <svg className="h-3.5 w-3.5 shrink-0 text-sky-400" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M1.5 2A1.5 1.5 0 0 0 0 3.5v9A1.5 1.5 0 0 0 1.5 14h13a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 14.5 2h-13zm0 1h13a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-13a.5.5 0 0 1-.5-.5v-9a.5.5 0 0 1 .5-.5z"/>
+            <path d="m3.854 5.146 2.5 2.5a.5.5 0 0 1 0 .708l-2.5 2.5a.5.5 0 0 1-.708-.708L5.293 8 3.146 5.854a.5.5 0 1 1 .708-.708zm3 5.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/>
+          </svg>
+          <span className="font-normal font-sans text-xs text-white/90 truncate">
+            Windows PowerShell{connectedInfo ? ` - ${connectedInfo}` : title ? ` - ${title}` : ""}
           </span>
+          {connectionState !== "connected" && (
+            <span className="text-[11px] text-amber-300 font-normal">
+              ({connectionState})
+            </span>
+          )}
         </div>
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex shrink-0 items-center h-full">
           <Button
             type="button"
             size="sm"
             variant="ghost"
-            className="h-7 px-2 text-zinc-300 hover:bg-white/10 hover:text-white"
+            className="h-full rounded-none px-2.5 text-xs font-normal text-white/70 hover:bg-white/10 hover:text-white"
             onClick={() => setSessionKey((value) => value + 1)}
+            title="Reconnect session"
           >
-            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-1.5 h-3.5 w-3.5"  />
+            <AppIcon name="refresh-cw" fallback={RefreshCw} className="mr-1.5 h-3 w-3" />
             Reconnect
           </Button>
           <Button
             type="button"
-            size="sm"
+            size="icon"
             variant="ghost"
-            className="h-7 px-2 text-zinc-300 hover:bg-white/10 hover:text-white"
+            className="h-full w-10 rounded-none text-white/70 hover:bg-white/10 hover:text-white"
             onClick={toggleFullscreen}
-            title={isFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
-            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            title={isFullscreen ? "Restore" : "Maximize"}
+            aria-label={isFullscreen ? "Restore" : "Maximize"}
           >
-            {isFullscreen ? <AppIcon name="minimize2" fallback={Minimize2} className="h-3.5 w-3.5"  /> : <AppIcon name="maximize2" fallback={Maximize2} className="h-3.5 w-3.5"  />}
+            {isFullscreen ? (
+              <span className="text-xs font-mono select-none">❐</span>
+            ) : (
+              <span className="text-xs font-mono select-none">□</span>
+            )}
           </Button>
+          {onClose && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="h-full w-10 rounded-none text-white/70 hover:bg-[#e81123] hover:text-white transition-colors"
+              onClick={onClose}
+              title="Close"
+              aria-label="Close"
+            >
+              <span className="text-xs font-mono select-none">✕</span>
+            </Button>
+          )}
         </div>
       </div>
       <div
         ref={containerRef}
-        className="ssh-terminal-surface min-h-0 flex-1 overflow-hidden p-2 [&_.xterm-screen]:min-h-full [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
+        className="ssh-terminal-surface min-h-0 flex-1 overflow-hidden bg-[#0c0c0c] p-1.5 [&_.xterm-screen]:min-h-full [&_.xterm-viewport]:!overflow-y-auto [&_.xterm]:h-full"
       />
     </div>
   );

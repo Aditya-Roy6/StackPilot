@@ -4,3 +4,4 @@ httpx==0.28.1
 pydantic==2.10.4
 langgraph==0.2.60
 typing-extensions==4.12.2
+psycopg2-binary>=2.9.9

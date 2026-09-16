@@ -11,9 +11,12 @@
 #include "../utils/TokenCrypto.h"
 #include "ApplicationCatalog.h"
 #include "BuildService.h"
+#include "AiServiceClient.h"
+#include "AiStreamProxy.h"
 #include "DeploymentCleanupService.h"
 #include "KubernetesService.h"
 #include "SshService.h"
+#include <thread>
 
 #include <algorithm>
 #include <chrono>
@@ -657,17 +660,20 @@ void JobQueueService::stop() {
 
 Json::Value JobQueueService::enqueueDeploymentBuild(const std::string& deploymentId,
                                                     const std::string& userId,
-                                                    const std::string& queuedLog) {
+                                                    const std::string& queuedLog,
+                                                    const std::string& metadataJson) {
     auto conn = Database::getInstance().getConnection();
     pqxx::work txn(*conn);
 
+    std::string safeMeta = metadataJson.empty() ? "{}" : metadataJson;
     auto jobRows = txn.exec_params(
-        "INSERT INTO deployment_jobs (deployment_id, user_id, type, status, max_attempts) "
-        "VALUES ($1, $2, 'deployment_build', 'queued', $3) "
+        "INSERT INTO deployment_jobs (deployment_id, user_id, type, status, max_attempts, metadata) "
+        "VALUES ($1, $2, 'deployment_build', 'queued', $3, $4::jsonb) "
         "RETURNING id, status, attempts, max_attempts, created_at",
         deploymentId,
         userId,
-        maxAttempts_
+        maxAttempts_,
+        safeMeta
     );
 
     const std::string jobId = jobRows[0]["id"].as<std::string>();
@@ -913,7 +919,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
         auto deploymentRows = txn.exec_params(
-            "SELECT d.id, d.version, d.status, d.environment_id, d.source_artifact_id, d.branch, d.commit_sha, "
+            "SELECT d.id, d.version, d.status, d.environment_id, d.source_artifact_id, d.branch, d.commit_sha, d.project_id, "
             "d.trigger_source, d.ci_required, d.ci_status, d.created_at AS deployment_created_at, "
             "EXTRACT(EPOCH FROM (NOW() - d.created_at))::int AS deployment_age_seconds, "
             "e.cleanup_previous_on_success, e.current_deployment_id AS previous_current_deployment_id, "
@@ -954,6 +960,7 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
         const bool ciRequired = row["ci_required"].is_null() ? false : row["ci_required"].as<bool>();
         const std::string ciStatus = row["ci_status"].is_null() ? "not_required" : row["ci_status"].as<std::string>();
         const std::string triggerSource = row["trigger_source"].is_null() ? "manual" : row["trigger_source"].as<std::string>();
+        const std::string projectId = row["project_id"].is_null() ? "" : row["project_id"].as<std::string>();
         const int deploymentAgeSeconds = row["deployment_age_seconds"].is_null() ? 0 : row["deployment_age_seconds"].as<int>();
         const bool cleanupPreviousOnSuccess =
             row["cleanup_previous_on_success"].is_null() ? false : row["cleanup_previous_on_success"].as<bool>();
@@ -1305,11 +1312,15 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
 
         // Check if this is an AI repair rebuild (skip re-clone, use modified source)
         bool isAiRepair = false;
+        std::string aiSessionId;
+        int aiRepairAttempt = 0;
         try {
             auto metaConn = Database::getInstance().getConnection();
             pqxx::work metaTxn(*metaConn);
             auto metaRows = metaTxn.exec_params(
                 "SELECT COALESCE(dj.metadata->>'ai_repair', 'false') AS ai_repair, "
+                "COALESCE(dj.metadata->>'ai_session_id', '') AS ai_session_id, "
+                "COALESCE(dj.metadata->>'ai_repair_attempt', '0') AS ai_repair_attempt, "
                 "COALESCE(d.trigger_source, '') AS trigger_source "
                 "FROM deployment_jobs dj "
                 "LEFT JOIN deployments d ON d.id = dj.deployment_id "
@@ -1319,6 +1330,8 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
             if (!metaRows.empty()) {
                 std::string flag = metaRows[0]["ai_repair"].as<std::string>();
                 std::string trig = metaRows[0]["trigger_source"].as<std::string>();
+                aiSessionId = metaRows[0]["ai_session_id"].as<std::string>();
+                try { aiRepairAttempt = std::stoi(metaRows[0]["ai_repair_attempt"].as<std::string>()); } catch (...) {}
                 if (flag == "true" || trig == "ai_repair") {
                     isAiRepair = true;
                 }
@@ -1896,8 +1909,343 @@ void JobQueueService::executeDeploymentBuildJob(const DeploymentJobRecord& job) 
                 }
             }
             completeJob(job);
+
+            // ── AI SRE: Mark healing session as healed on successful AI repair build ──
+            if (isAiRepair && !aiSessionId.empty()) {
+                try {
+                    auto healConn = Database::getInstance().getConnection();
+                    pqxx::work healTxn(*healConn);
+                    healTxn.exec_params(
+                        "UPDATE ai_sessions SET status = 'healed', updated_at = NOW() WHERE id = $1::uuid",
+                        aiSessionId
+                    );
+                    healTxn.exec_params(
+                        "INSERT INTO ai_messages (session_id, role, content, metadata) "
+                        "VALUES ($1::uuid, 'assistant', $2, '{}'::jsonb)",
+                        aiSessionId,
+                        "🎉 **Deployment Successful & Live!**\n\n"
+                        "The AI SRE self-healing engine has successfully diagnosed the build failure, "
+                        "applied the necessary patches, and rebuilt the deployment.\n\n"
+                        "**Deployment ID:** `" + job.deploymentId.substr(0, 8) + "...`\n"
+                        "**Status:** ✅ Running"
+                    );
+                    healTxn.commit();
+                    spdlog::info("AI SRE: Healing session {} marked as healed for deployment {}", aiSessionId, job.deploymentId);
+                } catch (const std::exception& healErr) {
+                    spdlog::warn("AI SRE: Failed to update healing session {}: {}", aiSessionId, healErr.what());
+                }
+            }
         } else {
             failJob(job, buildResult.error.empty() ? "Deployment build failed" : buildResult.error, false);
+
+            // ── AI SRE: Autonomous self-healing trigger on build failure ──
+            // Only trigger if: (1) not already an AI repair that's exhausted retries,
+            // (2) attempt count < 3, (3) AI is enabled for this user
+            if (!isAiRepair) {
+                try {
+                    // Check if AI is enabled for this user
+                    auto aiConn = Database::getInstance().getConnection();
+                    pqxx::work aiCheckTxn(*aiConn);
+                    auto aiPrefRows = aiCheckTxn.exec_params(
+                        "SELECT COALESCE(enabled, TRUE) AS enabled, "
+                        "COALESCE(provider, 'nvidia') AS provider, "
+                        "COALESCE(model, '') AS model "
+                        "FROM ai_preferences WHERE user_id = $1",
+                        job.userId);
+                    aiCheckTxn.commit();
+
+                    bool aiEnabled = true;
+                    std::string aiProvider = "nvidia";
+                    std::string aiModel = "";
+                    if (!aiPrefRows.empty()) {
+                        aiEnabled = aiPrefRows[0]["enabled"].as<bool>();
+                        aiProvider = aiPrefRows[0]["provider"].as<std::string>();
+                        aiModel = aiPrefRows[0]["model"].is_null() ? "" : aiPrefRows[0]["model"].as<std::string>();
+                    }
+
+                    if (aiEnabled && !projectId.empty()) {
+                        spdlog::info("AI SRE: Spawning autonomous background auto-healing thread for deployment {} (project {})",
+                                     job.deploymentId, projectName);
+
+                        std::thread([userId = job.userId,
+                                     deploymentId = job.deploymentId,
+                                     projectId,
+                                     projectName,
+                                     branch,
+                                     buildError = buildResult.error,
+                                     aiProvider,
+                                     aiModel]() {
+                            try {
+                                // 1. Create SRE incident session
+                                std::string sessionId;
+                                auto sessConn = Database::getInstance().getConnection();
+                                pqxx::work sessTxn(*sessConn);
+                                auto sessResult = sessTxn.exec_params(
+                                    "INSERT INTO ai_sessions (user_id, project_id, deployment_id, title, session_type, status) "
+                                    "VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'sre_incident', 'healing') RETURNING id",
+                                    userId,
+                                    projectId,
+                                    deploymentId,
+                                    "🤖 Auto-Healing: " + projectName + " (" + deploymentId.substr(0, std::min<size_t>(8, deploymentId.size())) + ")"
+                                );
+                                sessionId = sessResult[0][0].as<std::string>();
+
+                                // 2. Log initial user error message
+                                std::string logExcerpt = buildError;
+                                if (logExcerpt.size() > 2500) {
+                                    logExcerpt = "..." + logExcerpt.substr(logExcerpt.size() - 2500);
+                                }
+                                sessTxn.exec_params(
+                                    "INSERT INTO ai_messages (session_id, role, content, metadata) "
+                                    "VALUES ($1::uuid, 'user', $2, '{}'::jsonb)",
+                                    sessionId,
+                                    "**Build Failed**\n\n"
+                                    "**Project:** " + projectName + "\n"
+                                    "**Deployment:** `" + deploymentId.substr(0, std::min<size_t>(8, deploymentId.size())) + "...`\n\n"
+                                    "**Error:**\n```\n" + logExcerpt + "\n```\n\n"
+                                    "Please autonomously inspect the workspace files, fix the root cause with code and configuration edits, trigger rebuild with workspace_trigger_rebuild, and verify the deployment reaches running state."
+                                );
+
+                                // 3. Insert initial assistant message
+                                auto asstResult = sessTxn.exec_params(
+                                    "INSERT INTO ai_messages (session_id, role, content, metadata) "
+                                    "VALUES ($1::uuid, 'assistant', '🔍 Initializing Autonomous SRE Auto-Healing Engine...', "
+                                    "'{\"reasoning\": \"• 🤖 [AI SRE Engine] Initiating autonomous auto-healing loop...\\n\", \"tool_calls\": []}'::jsonb) "
+                                    "RETURNING id",
+                                    sessionId
+                                );
+                                std::string assistantMsgId = asstResult[0][0].as<std::string>();
+                                sessTxn.commit();
+
+                                // 4. Build streaming payload for agentic loop
+                                Json::Value payload(Json::objectValue);
+                                payload["provider"] = aiProvider;
+                                if (!aiModel.empty()) payload["model"] = aiModel;
+                                payload["model_mode"] = "thinking";
+                                payload["workflow_type"] = "sre_incident";
+                                payload["command"] = "/repair";
+                                payload["deployment_id"] = deploymentId;
+                                payload["project_id"] = projectId;
+                                payload["session_id"] = sessionId;
+                                payload["user_id"] = userId;
+
+                                Json::Value deploymentCtx(Json::objectValue);
+                                deploymentCtx["id"] = deploymentId;
+                                deploymentCtx["status"] = "failed";
+                                deploymentCtx["logs"] = buildError;
+                                deploymentCtx["branch"] = branch;
+                                payload["deployment"] = deploymentCtx;
+
+                                Json::Value projectCtx(Json::objectValue);
+                                projectCtx["id"] = projectId;
+                                projectCtx["name"] = projectName;
+                                payload["project"] = projectCtx;
+
+                                payload["message"] = "/repair The build for deployment " + deploymentId + " in project " + projectName + " failed with error:\n```\n" + logExcerpt + "\n```\nPlease autonomously inspect the workspace, apply surgical fixes using workspace tools, trigger rebuild, and verify until the service is live.";
+
+                                // 5. Stream from ai-service and record thoughts & tools
+                                std::string assembledReasoning = "• 🤖 [AI SRE Engine] Initiating autonomous auto-healing loop...\n";
+                                std::string assembledContent;
+                                Json::Value toolCalls(Json::arrayValue);
+                                auto lastDbUpdate = std::chrono::steady_clock::now();
+
+                                auto flushDb = [&](bool force) {
+                                    auto now = std::chrono::steady_clock::now();
+                                    if (!force && std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDbUpdate).count() < 1500) {
+                                        return;
+                                    }
+                                    try {
+                                        auto dbConn = Database::getInstance().getConnection();
+                                        pqxx::work dbTxn(*dbConn);
+
+                                        Json::Value meta(Json::objectValue);
+                                        meta["reasoning"] = assembledReasoning;
+                                        meta["tool_calls"] = toolCalls;
+                                        meta["model"] = aiModel;
+                                        meta["provider"] = aiProvider;
+                                        Json::StreamWriterBuilder writer;
+                                        writer["indentation"] = "";
+                                        std::string metaStr = Json::writeString(writer, meta);
+
+                                        std::string displayContent = assembledContent.empty()
+                                            ? "🛠️ Auto-healing in progress..."
+                                            : assembledContent;
+
+                                        dbTxn.exec_params(
+                                            "UPDATE ai_messages SET content = $2, metadata = $3::jsonb WHERE id = $1::uuid",
+                                            assistantMsgId,
+                                            displayContent,
+                                            metaStr
+                                        );
+                                        dbTxn.commit();
+                                        lastDbUpdate = std::chrono::steady_clock::now();
+                                    } catch (const std::exception& dbEx) {
+                                        spdlog::warn("AI SRE: Failed to flush message to db: {}", dbEx.what());
+                                    }
+                                };
+
+                                auto onChunk = [&](const std::string& sseFrame) {
+                                    std::istringstream stream(sseFrame);
+                                    std::string line;
+                                    bool hasImportantEvent = false;
+                                    while (std::getline(stream, line)) {
+                                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                                        if (line.rfind("data:", 0) == 0) {
+                                            std::string dataStr = line.substr(5);
+                                            size_t firstNonSpace = dataStr.find_first_not_of(" \t");
+                                            if (firstNonSpace != std::string::npos) {
+                                                dataStr = dataStr.substr(firstNonSpace);
+                                            } else {
+                                                dataStr.clear();
+                                            }
+                                            if (dataStr.empty() || dataStr == "[DONE]") continue;
+
+                                            Json::CharReaderBuilder reader;
+                                            Json::Value ev;
+                                            std::string parseErrs;
+                                            std::istringstream jsonStream(dataStr);
+                                            if (Json::parseFromStream(reader, jsonStream, &ev, &parseErrs) && ev.isObject()) {
+                                                std::string evType = ev.get("type", "").asString();
+                                                if (evType == "reasoning") {
+                                                    assembledReasoning += ev.get("delta", "").asString();
+                                                } else if (evType == "content") {
+                                                    assembledContent += ev.get("delta", "").asString();
+                                                } else if (evType == "tool_call") {
+                                                    Json::Value tc(Json::objectValue);
+                                                    tc["id"] = ev.get("id", "").asString();
+                                                    tc["name"] = ev.get("name", "").asString();
+                                                    tc["arguments"] = ev["arguments"];
+                                                    toolCalls.append(tc);
+                                                    hasImportantEvent = true;
+                                                } else if (evType == "tool_result") {
+                                                    std::string tcId = ev.get("id", "").asString();
+                                                    std::string tcName = ev.get("name", "").asString();
+                                                    for (Json::ArrayIndex i = 0; i < toolCalls.size(); ++i) {
+                                                        if ((!tcId.empty() && toolCalls[i].get("id", "").asString() == tcId) ||
+                                                            (toolCalls[i].get("name", "").asString() == tcName && !toolCalls[i].isMember("result"))) {
+                                                            toolCalls[i]["result"] = ev["result"];
+                                                            break;
+                                                        }
+                                                    }
+                                                    hasImportantEvent = true;
+                                                } else if (evType == "done") {
+                                                    if (ev.isMember("content") && !ev["content"].asString().empty()) {
+                                                        assembledContent = ev["content"].asString();
+                                                    }
+                                                    if (ev.isMember("reasoning") && !ev["reasoning"].asString().empty()) {
+                                                        assembledReasoning = ev["reasoning"].asString();
+                                                    }
+                                                    hasImportantEvent = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    flushDb(hasImportantEvent);
+                                };
+
+                                auto onFinish = [&](bool ok, const std::string& err) {
+                                    if (!ok && !err.empty()) {
+                                        assembledReasoning += "\n• Stream notice: " + err + "\n";
+                                    }
+                                    flushDb(true);
+
+                                    // Verify final status
+                                    bool isHealed = false;
+                                    std::string finalStatus = "failed";
+                                    try {
+                                        auto checkConn = Database::getInstance().getConnection();
+                                        pqxx::work checkTxn(*checkConn);
+                                        auto statusRows = checkTxn.exec_params(
+                                            "SELECT status FROM deployments "
+                                            "WHERE (id = $1::uuid OR project_id = $2::uuid) "
+                                            "ORDER BY created_at DESC LIMIT 1",
+                                            deploymentId, projectId
+                                        );
+                                        if (!statusRows.empty()) {
+                                            finalStatus = statusRows[0]["status"].as<std::string>();
+                                            if (finalStatus == "running" || finalStatus == "ready") {
+                                                isHealed = true;
+                                            }
+                                        }
+                                        checkTxn.commit();
+                                    } catch (const std::exception& stErr) {
+                                        spdlog::warn("AI SRE: Failed to query deployment status: {}", stErr.what());
+                                    }
+
+                                    if (isHealed) {
+                                        try {
+                                            auto healConn = Database::getInstance().getConnection();
+                                            pqxx::work healTxn(*healConn);
+                                            healTxn.exec_params(
+                                                "UPDATE ai_sessions SET status = 'healed', updated_at = NOW() WHERE id = $1::uuid",
+                                                sessionId
+                                            );
+                                            healTxn.commit();
+                                            spdlog::info("AI SRE: Auto-healing successfully healed deployment for project {}", projectName);
+                                        } catch (...) {}
+                                    } else {
+                                        // Intelligent fallback: If AI didn't execute tools/patches and error was missing Dockerfile / Archetype Pre-flight
+                                        bool fallbackApplied = false;
+                                        if (toolCalls.empty()) {
+                                            std::filesystem::path sourceDir = std::filesystem::path("uploads/builds") / deploymentId / "source";
+                                            if (!std::filesystem::exists(sourceDir)) {
+                                                sourceDir = std::filesystem::path("uploads/builds") / deploymentId;
+                                            }
+                                            bool isArchetypeOrDockerIssue = (buildError.find("Archetype Pre-Flight Check") != std::string::npos ||
+                                                                             buildError.find("embedded HTTP server") != std::string::npos ||
+                                                                             buildError.find("No Dockerfile found") != std::string::npos ||
+                                                                             buildError.find("Java Library") != std::string::npos ||
+                                                                             buildError.find("pure library") != std::string::npos);
+                                            if (isArchetypeOrDockerIssue && !std::filesystem::exists(sourceDir / "Dockerfile")) {
+                                                std::filesystem::path deploymentDir = std::filesystem::path("uploads/builds") / deploymentId;
+                                                BuildService fallbackBs;
+                                                std::string genReason;
+                                                if (fallbackBs.ensureDockerfile(sourceDir, deploymentDir / "build.log", genReason, nullptr)) {
+                                                    fallbackApplied = true;
+                                                    Json::Value meta(Json::objectValue);
+                                                    meta["ai_repair"] = true;
+                                                    meta["ai_session_id"] = sessionId;
+                                                    meta["ai_repair_attempt"] = 1;
+                                                    Json::StreamWriterBuilder writer;
+                                                    writer["indentation"] = "";
+                                                    JobQueueService::getInstance().enqueueDeploymentBuild(
+                                                        deploymentId, userId,
+                                                        "AI SRE fallback: Generated root Dockerfile and queued rebuild.",
+                                                        Json::writeString(writer, meta)
+                                                    );
+                                                }
+                                            }
+                                        }
+
+                                        if (!fallbackApplied) {
+                                            try {
+                                                auto failConn = Database::getInstance().getConnection();
+                                                pqxx::work failTxn(*failConn);
+                                                failTxn.exec_params(
+                                                    "UPDATE ai_sessions SET status = 'failed', updated_at = NOW() WHERE id = $1::uuid",
+                                                    sessionId
+                                                );
+                                                failTxn.commit();
+                                                spdlog::info("AI SRE: Auto-healing failed for deployment {} — session {}",
+                                                             deploymentId, sessionId);
+                                            } catch (...) {}
+                                        }
+                                    }
+                                };
+
+                                spdlog::info("AI SRE: Starting streaming auto-repair session {} for deployment {}",
+                                             sessionId, deploymentId);
+                                AiStreamProxy::stream("/chat/agent/stream", payload, onChunk, onFinish);
+
+                            } catch (const std::exception& threadErr) {
+                                spdlog::error("AI SRE: Background auto-healing thread exception: {}", threadErr.what());
+                            }
+                        }).detach();
+                    }
+                } catch (const std::exception& aiHealErr) {
+                    spdlog::warn("AI SRE: Auto-healing trigger failed for deployment {}: {}", job.deploymentId, aiHealErr.what());
+                }
+            }
         }
     } catch (const std::exception& e) {
         spdlog::error("Deployment job {} failed for {}: {}", job.id, job.deploymentId, e.what());

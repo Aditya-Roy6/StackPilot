@@ -28,6 +28,8 @@ public:
     ADD_METHOD_TO(DeploymentController::resumeRuntime, "/api/v1/deployments/{deployment_id}/runtime/resume", drogon::Post);
     ADD_METHOD_TO(DeploymentController::rollbackKubernetesDeployment, "/api/v1/deployments/{deployment_id}/kubernetes/rollback", drogon::Post);
     ADD_METHOD_TO(DeploymentController::getKubernetesEvents, "/api/v1/deployments/{deployment_id}/kubernetes/events", drogon::Get);
+    ADD_METHOD_TO(DeploymentController::getKubernetesStatus, "/api/v1/deployments/{deployment_id}/kubernetes/status", drogon::Get);
+    ADD_METHOD_TO(DeploymentController::getKubernetesStatus, "/api/v1/deployments/{deployment_id}/kubernetes-status", drogon::Get);
     ADD_METHOD_TO(DeploymentController::removeKubernetesDeployment, "/api/v1/deployments/{deployment_id}/kubernetes", drogon::Delete);
     ADD_METHOD_TO(DeploymentController::checkDrift, "/api/v1/deployments/{deployment_id}/drift", drogon::Get);
     ADD_METHOD_TO(DeploymentController::getRootCauseAnalysis, "/api/v1/deployments/{deployment_id}/rca", drogon::Get);

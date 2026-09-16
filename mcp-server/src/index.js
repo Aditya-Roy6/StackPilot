@@ -9,6 +9,18 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+process.on("uncaughtException", (err) => {
+  console.error("MCP Uncaught Exception:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("MCP Unhandled Rejection:", reason);
+});
+if (process.stdout) {
+  process.stdout.on("error", (err) => {
+    if (err.code === "EPIPE") process.exit(0);
+  });
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -234,9 +246,13 @@ function safeName(value, fallback = "local-project") {
     .trim()
     .replace(/\.[^.]+$/, "")
     .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^\.+|\.+$/g, "")
     .replace(/^-+|-+$/g, "")
     .slice(0, 64);
-  return cleaned || fallback;
+  if (!cleaned || cleaned === "." || cleaned === ".." || cleaned.includes("..")) {
+    return fallback;
+  }
+  return cleaned;
 }
 
 function projectNameFromPath(projectPath) {
@@ -386,6 +402,7 @@ async function copyFileChecked(source, destination, stats, options) {
 
 async function copyDirectory(sourceRoot, destinationRoot, stats, options, relative = "") {
   const entries = await fs.readdir(path.join(sourceRoot, relative), { withFileTypes: true });
+  const baseDestination = path.resolve(destinationRoot);
   for (const entry of entries) {
     const rel = path.join(relative, entry.name);
     if (shouldIgnore(rel, entry.name)) {
@@ -394,7 +411,10 @@ async function copyDirectory(sourceRoot, destinationRoot, stats, options, relati
     }
 
     const src = path.join(sourceRoot, rel);
-    const dst = path.join(destinationRoot, rel);
+    const dst = path.resolve(destinationRoot, rel);
+    if (!dst.startsWith(baseDestination)) {
+      throw new Error(`Path traversal detected during staging: ${rel}`);
+    }
     if (entry.isSymbolicLink()) {
       stats.skipped.push({ path: src, reason: "symbolic links are skipped by default" });
       continue;
@@ -417,7 +437,13 @@ async function stageLocalProject(projectPath, options = {}) {
   const sourceLabel = isSingleFile ? path.basename(resolvedProjectPath) : "";
   const nameBase = options.projectName || projectNameFromPath(resolvedProjectPath);
   const stageName = `${safeName(nameBase)}`;
-  const stageRoot = path.join(HOST_LOCAL_ROOT, stageName);
+  const baseDir = path.resolve(HOST_LOCAL_ROOT);
+  const stageRoot = path.resolve(baseDir, stageName);
+  const relativeFromBase = path.relative(baseDir, stageRoot);
+
+  if (!path.resolve(baseDir, stageName).startsWith(baseDir) || stageRoot === baseDir || relativeFromBase.startsWith("..") || path.isAbsolute(relativeFromBase)) {
+    throw new Error(`Invalid staging path traversal detected: ${stageRoot}`);
+  }
   const containerPath = `${CONTAINER_LOCAL_ROOT}/${stageName}`;
 
   const stageRelativeToSource = path.relative(path.resolve(sourceRoot), path.resolve(stageRoot));
@@ -444,11 +470,18 @@ async function stageLocalProject(projectPath, options = {}) {
   };
 
   if (!options.dryRun) {
+    if (!path.resolve(baseDir, stageName).startsWith(baseDir) || stageRoot === baseDir || relativeFromBase.startsWith("..") || path.isAbsolute(relativeFromBase)) {
+      throw new Error(`Directory cleanup rejected: path traversal detected outside staging area: ${stageRoot}`);
+    }
     await fs.rm(stageRoot, { recursive: true, force: true }).catch(() => {});
     await fs.mkdir(stageRoot, { recursive: true });
   }
   if (isSingleFile) {
-    await copyFileChecked(resolvedProjectPath, path.join(stageRoot, sourceLabel), stats, limits);
+    const targetFile = path.resolve(stageRoot, sourceLabel);
+    if (!path.resolve(stageRoot, sourceLabel).startsWith(stageRoot)) {
+      throw new Error(`Invalid file staging destination: ${targetFile}`);
+    }
+    await copyFileChecked(resolvedProjectPath, targetFile, stats, limits);
   } else {
     await copyDirectory(sourceRoot, stageRoot, stats, limits);
   }

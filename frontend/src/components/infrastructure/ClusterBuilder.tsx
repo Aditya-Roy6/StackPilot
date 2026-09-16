@@ -405,7 +405,7 @@ export function ClusterBuilder() {
             Bootstrap a control plane from a saved server, join worker servers, and verify the cluster without leaving StackPilot.
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-nowrap items-center gap-2 shrink-0">
           <Button
             variant="outline"
             onClick={() => {
@@ -427,7 +427,7 @@ export function ClusterBuilder() {
           </Link>
           <Button
             variant="outline"
-            className="border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive"
+            className="border-destructive/30 text-destructive hover:bg-destructive/10 hover:text-destructive whitespace-nowrap"
             onClick={() => {
               setServerToWipe(connections[0] || null);
               setShowWipeServerDialog(true);

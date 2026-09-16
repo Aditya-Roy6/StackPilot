@@ -10,10 +10,10 @@ import { Button } from "@/components/ui/button";
 // Without this, a render-time throw takes out the whole route with no diagnostics.
 export default function DashboardError({
   error,
-  unstable_retry,
+  reset,
 }: {
   error: Error & { digest?: string };
-  unstable_retry: () => void;
+  reset: () => void;
 }) {
   const [copied, setCopied] = useState(false);
 
@@ -45,7 +45,7 @@ export default function DashboardError({
             </pre>
 
             <div className="mt-4 flex flex-wrap gap-2">
-              <Button type="button" onClick={() => unstable_retry()}>
+              <Button type="button" onClick={() => reset()}>
                 <AppIcon name="rotate-ccw" fallback={RotateCcw} className="h-4 w-4"  />
                 Try again
               </Button>

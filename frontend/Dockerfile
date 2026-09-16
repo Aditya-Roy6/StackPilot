@@ -4,7 +4,7 @@ WORKDIR /app
 
 ENV NEXT_TELEMETRY_DISABLED=1
 
-COPY package*.json ./
+COPY package*.json .npmrc* ./
 RUN npm ci --no-audit --no-fund
 
 # ─── Development Target (Live Hot-Reloading) ───────────────
@@ -20,7 +20,7 @@ ENV NODE_ENV=development \
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=5 \
-    CMD wget -qO- http://127.0.0.1:3000 >/dev/null || exit 1
+    CMD wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1
 
 CMD ["npm", "run", "dev"]
 
@@ -61,6 +61,6 @@ USER nextjs
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
-    CMD wget -qO- http://127.0.0.1:3000 >/dev/null || exit 1
+    CMD wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1
 
 CMD ["node", "server.js"]

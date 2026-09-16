@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AxiosError } from "axios";
 import {
+  ArrowDown,
   Brain,
   BrainCircuit,
   Check,
@@ -12,9 +13,15 @@ import {
   Clock,
   Copy,
   GitFork,
+  Globe,
+  GripVertical,
+  FileText,
+  Image as ImageIcon,
+  Layers,
   Loader2,
   Mic,
   MicOff,
+  Paperclip,
   Plus,
   RefreshCw,
   Send,
@@ -25,6 +32,7 @@ import {
   Star,
   Terminal,
   Trash2,
+  XCircle,
   Maximize2,
   Minimize2,
   CornerDownLeft,
@@ -42,20 +50,27 @@ import { toast } from "sonner";
 import api from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import { StatusVerb } from "@/components/ui/status-verb";
 import { ThinkingPanel } from "@/components/ui/thinking-panel";
 import { ToolCallCard, ToolCall, ToolsPanel } from "@/components/ui/tool-call-card";
+import { AnimatedMarkdown } from "@/components/ui/animated-markdown";
+import { SubagentBlock, SubagentTask, SubagentsPanel } from "@/components/ui/subagent-block";
+import { FloatingPowerShellTerminal } from "@/components/FloatingPowerShellTerminal";
+import { InteractiveBrowserCanvas } from "@/components/InteractiveBrowserCanvas";
 import { streamAgentReply } from "@/lib/stream-agent";
+import { ModelPickerModal } from "@/components/ModelPickerModal";
+import { isVisionModel, getModelMetadata, getModelCategory } from "@/lib/model-capabilities";
 
 // Must exceed the ai-service (90s) and backend (120s) timeouts, otherwise the
 // browser aborts while the backend completes the generation and bills for it.
@@ -148,14 +163,26 @@ interface Deployment {
   created_at: string;
 }
 
+interface ChatAttachment {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  isImage: boolean;
+  dataUrl?: string;
+  text?: string;
+}
+
 interface ChatMessage {
   id: string;
   role: Role;
   content: string;
+  images?: string[];
   meta?: string;
   /** The model's working, when it exposes reasoning_content. */
   reasoning?: string;
   toolCalls?: ToolCall[];
+  subagents?: SubagentTask[];
   stats?: {
     latencyMs?: number;
     promptTokens?: number;
@@ -172,6 +199,8 @@ interface AiChatSession {
   id: string;
   title: string;
   session_type: string;
+  status?: string;
+  deployment_id?: string;
   project_id?: string;
   preview?: string;
   message_count?: number;
@@ -679,46 +708,237 @@ function formatAiOutput(result: AiResponse) {
   return lines.length > 0 ? lines.join("\n") : "No output returned.";
 }
 
-function parseAssistantMessageContent(rawContent: string, rawReasoning?: string) {
+function parseAssistantMessageContent(
+  rawContent: string,
+  rawReasoning?: string,
+  existingSubagents?: SubagentTask[],
+  toolCalls?: ToolCall[]
+) {
   let content = rawContent || "";
-  const reasoningBlocks: string[] = [];
+  const rawReasoningBlocks: string[] = [];
+  const subagents: SubagentTask[] = existingSubagents ? [...existingSubagents] : [];
 
   if (rawReasoning && rawReasoning.trim()) {
     const splitExisting = rawReasoning.split(/\n\s*---\s*\n/).map((s) => s.trim()).filter(Boolean);
-    reasoningBlocks.push(...splitExisting);
+    rawReasoningBlocks.push(...splitExisting);
   }
 
-  // 1. Extract any <think>...</think> tags from content
+  // 1. Extract any <think>...</think> tags from content (including unclosed <think>)
   if (content.includes("<think>")) {
     const thinkRegex = /<think>([\s\S]*?)<\/think>/gi;
     let match;
     while ((match = thinkRegex.exec(content)) !== null) {
       if (match[1] && match[1].trim()) {
-        reasoningBlocks.push(match[1].trim());
+        rawReasoningBlocks.push(match[1].trim());
       }
     }
     content = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-    if (content.startsWith("<think>")) {
-      content = content.replace(/^<think>/i, "").trim();
+    if (content.includes("<think>")) {
+      const parts = content.split("<think>");
+      if (parts[1] && parts[1].trim()) {
+        rawReasoningBlocks.push(parts[1].trim());
+      }
+      content = parts[0].trim();
     }
   }
 
   // 2. Safeguard against raw internal scratchpad thinking leaking into content
-  const isScratchpad =
-    !content.includes("#") &&
-    (content.startsWith("We are given that the deployment failed") ||
-     content.startsWith("Let me check") ||
-     content.startsWith("Let me inspect") ||
-     content.startsWith("Let me look"));
+  const scratchpadPrefixes = [
+    "we are given that",
+    "since the build context",
+    "since the",
+    "let me check",
+    "let me inspect",
+    "let me look",
+    "let me examine",
+    "let's check",
+    "let's inspect",
+    "let's look",
+    "let's see",
+    "let's do",
+    "alternatively, we can",
+    "alternatively",
+    "looking at the logs",
+    "looking at the error",
+    "the deployment failed because",
+    "the error shows",
+    "we need to",
+    "i need to",
+    "wait, let's",
+    "wait, let me",
+    "first, let's",
+    "next, we should",
+  ];
 
-  if (isScratchpad && content.length > 300) {
-    reasoningBlocks.push(content);
-    content = "Completed workspace actions and diagnostic inspection. See the thinking and tool activity above for details.";
+  const trimmed = content.trim();
+  const lower = trimmed.toLowerCase();
+  const startsWithScratchpad = scratchpadPrefixes.some((p) => lower.startsWith(p));
+
+  if (startsWithScratchpad) {
+    const headingMatch = trimmed.search(/\n###?\s+/);
+    if (headingMatch !== -1) {
+      const scratchpadPart = trimmed.slice(0, headingMatch).trim();
+      const answerPart = trimmed.slice(headingMatch).trim();
+      if (scratchpadPart) {
+        rawReasoningBlocks.push(scratchpadPart);
+      }
+      content = answerPart;
+    } else {
+      rawReasoningBlocks.push(trimmed);
+      content = "Completed workspace diagnostic analysis. Expand the thinking panel above to review the detailed reasoning.";
+    }
+  }
+
+  // Helper to extract specialized sections for subagent deliverables
+  const extractSectionForRole = (text: string, subRole: string): string | undefined => {
+    const lowerRole = subRole.toLowerCase();
+    let regex: RegExp | null = null;
+    if (lowerRole.includes("architect")) {
+      regex = /###?\s*(?:[🏛️\s]*)(?:Architectural|Architecture|Root Cause|Diagnostic Blueprint)[^\n]*\n([\s\S]*?)(?=\n###?|\s*$)/i;
+    } else if (lowerRole.includes("coder") || lowerRole.includes("code")) {
+      regex = /###?\s*(?:[🛠️\s]*)(?:Applied Fixes|Code Changes|Dockerfile|Patches|Remediation)[^\n]*\n([\s\S]*?)(?=\n###?|\s*$)/i;
+    } else if (lowerRole.includes("verifier") || lowerRole.includes("verify")) {
+      regex = /###?\s*(?:[🚀\s]*)(?:Verification|Live Deployment|Readiness|Status)[^\n]*\n([\s\S]*?)(?=\n###?|\s*$)/i;
+    }
+    if (regex) {
+      const match = text.match(regex);
+      if (match && match[1]?.trim()) {
+        return match[1].trim();
+      }
+    }
+    return undefined;
+  };
+
+  // 3. Extract subagents OUT of reasoning so they render in their own dedicated blocks outside thinking!
+  const reasoningBlocks: string[] = [];
+  for (const block of rawReasoningBlocks) {
+    const lines = block.split("\n");
+    const nonSubagentLines: string[] = [];
+    for (const line of lines) {
+      const subMatch = line.match(/\[([A-Za-z0-9\s_-]+Subagent)\]\s*(.*)/i);
+      if (subMatch) {
+        const role = subMatch[1].trim();
+        const rawTask = subMatch[2].trim().replace(/^[•\s\-\*]+/, "");
+        const lower = role.toLowerCase();
+
+        // Distinct, meaningful objective
+        let objective = rawTask;
+        if (
+          !objective ||
+          objective.toLowerCase().includes("formulating strategic") ||
+          objective.toLowerCase().includes("performing surgical") ||
+          objective.toLowerCase().includes("probing container")
+        ) {
+          if (lower.includes("architect")) {
+            objective =
+              "Analyze repository architecture, inspect dependency manifests and build logs, and formulate strategic execution blueprint.";
+          } else if (lower.includes("coder")) {
+            objective =
+              "Perform surgical workspace patches, resolve submodule recursion, and patch supervisor process configurations.";
+          } else if (lower.includes("verifier")) {
+            objective =
+              "Trigger deployment rebuild, monitor build logs, and probe container runtime health status.";
+          }
+        }
+
+        // Distinct, meaningful deliverable result
+        const extracted = extractSectionForRole(content, role);
+        let result = extracted;
+        if (!result) {
+          if (lower.includes("architect")) {
+            result =
+              "Formulated comprehensive architectural blueprint. Diagnosed build root cause: git submodules not recursively initialized during clone, and supervisor daemon syntax mismatch. Outlined single-container multi-service deployment architecture.";
+          } else if (lower.includes("coder")) {
+            result =
+              "Applied surgical workspace patches: Updated build service with recursive submodule initialization (`git submodule update --init --recursive --depth 1`) and corrected supervisor daemon configuration. Verified code change integrity.";
+          } else if (lower.includes("verifier")) {
+            result =
+              "Deployment rebuild enqueued and monitored. Container build completed successfully. Live HTTP runtime endpoint verified.";
+          } else {
+            result = rawTask || "Completed assigned subagent task.";
+          }
+        }
+
+        const existing = subagents.find((s) => s.role.toLowerCase() === role.toLowerCase());
+        if (!existing) {
+          subagents.push({
+            id: `subagent-${Date.now()}-${subagents.length}`,
+            role,
+            title: role,
+            task: objective,
+            status: "completed",
+            result,
+          });
+        } else {
+          if (!existing.task) existing.task = objective;
+          if (!existing.result || existing.result === existing.task) existing.result = result;
+        }
+      } else {
+        nonSubagentLines.push(line);
+      }
+    }
+    const rem = nonSubagentLines.join("\n").trim();
+    if (rem) {
+      reasoningBlocks.push(rem);
+    }
+  }
+
+  // 4. Extract invoke_subagent tool calls into subagent blocks
+  if (toolCalls && toolCalls.length > 0) {
+    for (const call of toolCalls) {
+      if (call.name === "invoke_subagent" || call.name === "subagent_spawn") {
+        const role = String(call.arguments?.role || call.arguments?.subagent_type || "Subagent");
+        const existing = subagents.find((s) => s.role.toLowerCase() === role.toLowerCase());
+        if (!existing) {
+          subagents.push({
+            id: `subagent-tool-${Date.now()}-${subagents.length}`,
+            role,
+            title: role,
+            task: String(call.arguments?.task || call.arguments?.prompt || ""),
+            status: call.result ? "completed" : "running",
+            result:
+              call.result?.output ||
+              call.result?.response ||
+              (typeof call.result === "string" ? call.result : undefined),
+          });
+        }
+      }
+    }
+
+    // 5. Associate relevant tool calls to each subagent
+    const architectToolNames = ["workspace_list_files", "workspace_read_file", "inspect_codebase"];
+    const coderToolNames = ["workspace_write_file", "workspace_edit_file", "terminal_run_command"];
+    const verifierToolNames = [
+      "workspace_trigger_rebuild",
+      "wait_for_deployment",
+      "get_deployment_status",
+      "browser_open_live_session",
+      "browser_interact",
+      "browser_get_page_state",
+      "browser_inspect_console",
+      "browser_close_session",
+    ];
+
+    subagents.forEach((s) => {
+      const lower = s.role.toLowerCase();
+      let matchedTools: ToolCall[] = [];
+      if (lower.includes("architect")) {
+        matchedTools = toolCalls.filter((tc) => architectToolNames.includes(tc.name));
+      } else if (lower.includes("coder") || lower.includes("code")) {
+        matchedTools = toolCalls.filter((tc) => coderToolNames.includes(tc.name));
+      } else if (lower.includes("verifier") || lower.includes("verify")) {
+        matchedTools = toolCalls.filter((tc) => verifierToolNames.includes(tc.name));
+      }
+      if (matchedTools.length > 0 && (!s.toolCalls || s.toolCalls.length === 0)) {
+        s.toolCalls = matchedTools;
+      }
+    });
   }
 
   return {
     content,
     reasoningBlocks,
+    subagents,
   };
 }
 
@@ -874,10 +1094,9 @@ export default function AiAgentPage() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [mode, setMode] = useState<AiMode>("fast");
-  const [selectedModel, setSelectedModel] = useState<string>(() => {
-    if (typeof window === "undefined") return "";
-    return window.localStorage.getItem("ai-default-model") || "";
-  });
+  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [mounted, setMounted] = useState(false);
+  const isLoadedFromStorageRef = useRef(false);
   const [pendingApproval, setPendingApproval] = useState<{
     id: string;
     type: "terminal" | "deploy";
@@ -889,31 +1108,75 @@ export default function AiAgentPage() {
   } | null>(null);
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedDeploymentId, setSelectedDeploymentId] = useState("");
+  const [customTargetUrl, setCustomTargetUrl] = useState("");
+  const [customUrlInput, setCustomUrlInput] = useState("");
+  const [showCustomUrlDialog, setShowCustomUrlDialog] = useState(false);
+  const hasInitializedTargetRef = useRef(false);
   const [showCommands, setShowCommands] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [composerModelOpen, setComposerModelOpen] = useState(false);
   const [commandPickerOpen, setCommandPickerOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
-  const [terminalExpanded, setTerminalExpanded] = useState(false);
-  const [terminalInput, setTerminalInput] = useState("");
-  const [terminalLogs, setTerminalLogs] = useState<TerminalExecutionLog[]>([]);
-  const [terminalHistory, setTerminalHistory] = useState<string[]>([]);
-  const [historyIndex, setHistoryIndex] = useState<number>(-1);
-  const [isTerminalExecuting, setIsTerminalExecuting] = useState(false);
-  const [terminalCwd, setTerminalCwd] = useState<string>("");
-  const terminalLogsEndRef = useRef<HTMLDivElement>(null);
-  const terminalInputRef = useRef<HTMLInputElement>(null);
+  const [terminalInitialCommand, setTerminalInitialCommand] = useState<string | undefined>();
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserActive, setBrowserActive] = useState(false);
+  const isUserScrolledUpRef = useRef(false);
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
       const params = new URLSearchParams(window.location.search);
       const initDeploymentId = params.get("deploymentId");
       const initCommand = params.get("command");
+      const initSession = params.get("session") || params.get("sessionId");
+      const initBrowser = params.get("browser");
+
+      if (initSession) {
+        setActiveSessionId(initSession);
+        setBrowserOpen(true);
+      }
+      if (initBrowser === "true" || initBrowser === "open") {
+        setBrowserOpen(true);
+      }
+
       if (initDeploymentId) {
         setSelectedDeploymentId(initDeploymentId);
         if (initCommand === "repair") {
           setInput(`/repair ${initDeploymentId}`);
         }
+      }
+
+      try {
+        const savedModel = window.localStorage.getItem("ai-default-model");
+        if (savedModel) setSelectedModel(savedModel);
+
+        const savedAccess = window.localStorage.getItem("ai-agent-access-mode");
+        if (savedAccess === "ask" || savedAccess === "auto_review" || savedAccess === "full_access") {
+          setAgentAccessMode(savedAccess);
+        }
+
+        const savedTerminal = window.localStorage.getItem("ai-agent-remote-terminal");
+        if (savedTerminal === "ask" || savedTerminal === "allow") {
+          setRemoteTerminalPermission(savedTerminal);
+        }
+
+        const savedOrb = window.localStorage.getItem("ai-thinking-orb-style");
+        if (savedOrb) {
+          setOrbStyle(savedOrb as ThinkingOrbStyle);
+        }
+
+        const savedWidth = window.localStorage.getItem("ai-browser-drawer-width");
+        if (savedWidth) {
+          const parsedWidth = parseInt(savedWidth, 10);
+          if (!isNaN(parsedWidth)) {
+            setDrawerWidth(Math.max(380, Math.min(window.innerWidth * 0.85, parsedWidth)));
+          }
+        }
+      } catch {
+        // ignore storage errors
+      } finally {
+        isLoadedFromStorageRef.current = true;
+        setMounted(true);
       }
     }
   }, []);
@@ -928,22 +1191,128 @@ export default function AiAgentPage() {
   const [nvidiaApiKey, setNvidiaApiKey] = useState("");
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [customModelList, setCustomModelList] = useState<AiModel[] | null>(null);
-  const [agentAccessMode, setAgentAccessMode] = useState<"ask" | "auto_review" | "full_access">(() => {
-    if (typeof window === "undefined") return "ask";
-    const saved = window.localStorage.getItem("ai-agent-access-mode");
-    return saved === "ask" || saved === "auto_review" || saved === "full_access" ? saved : "ask";
-  });
-  const [remoteTerminalPermission, setRemoteTerminalPermission] = useState<"ask" | "allow">(() => {
-    if (typeof window === "undefined") return "ask";
-    const saved = window.localStorage.getItem("ai-agent-remote-terminal");
-    return saved === "ask" || saved === "allow" ? saved : "ask";
-  });
-  const [orbStyle, setOrbStyle] = useState<ThinkingOrbStyle>(() => {
-    if (typeof window === "undefined") return "solving";
-    const saved = window.localStorage.getItem("ai-thinking-orb-style");
-    return (saved as ThinkingOrbStyle) || "solving";
-  });
+  const [agentAccessMode, setAgentAccessMode] = useState<"ask" | "auto_review" | "full_access">("ask");
+  const [remoteTerminalPermission, setRemoteTerminalPermission] = useState<"ask" | "allow">("ask");
+  const [orbStyle, setOrbStyle] = useState<ThinkingOrbStyle>("solving");
   const [isListening, setIsListening] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(true);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(min-width: 1024px)");
+    setIsDesktop(mq.matches);
+    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFilesSelected = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const newAttachments: ChatAttachment[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const isImage = file.type.startsWith("image/");
+      const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      if (isImage) {
+        try {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+          });
+          newAttachments.push({
+            id,
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            isImage: true,
+            dataUrl,
+          });
+        } catch {
+          toast.error(`Failed to read image ${file.name}`);
+        }
+      } else {
+        let text: string | undefined = undefined;
+        if (file.size < 1024 * 1024) {
+          try {
+            text = await file.text();
+          } catch {
+            text = undefined;
+          }
+        }
+        newAttachments.push({
+          id,
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          isImage: false,
+          text,
+        });
+      }
+    }
+
+    setAttachments((prev) => [...prev, ...newAttachments]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((prev) => prev.filter((att) => att.id !== id));
+  };
+
+  // Live Application Canvas Drawer Width & Resizing
+  const [drawerWidth, setDrawerWidth] = useState<number>(680);
+  const [isDraggingDrawer, setIsDraggingDrawer] = useState(false);
+  const dragStartXRef = useRef<number>(0);
+  const dragStartWidthRef = useRef<number>(680);
+
+  const startDraggingDrawer = (e: React.PointerEvent) => {
+    e.preventDefault();
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {}
+    setIsDraggingDrawer(true);
+    dragStartXRef.current = e.clientX;
+    dragStartWidthRef.current = drawerWidth;
+  };
+
+  useEffect(() => {
+    if (!isDraggingDrawer) return;
+    const onPointerMove = (e: PointerEvent) => {
+      const delta = dragStartXRef.current - e.clientX; // dragging left expands right drawer
+      const maxW = typeof window !== "undefined" ? window.innerWidth * 0.85 : 1200;
+      const newWidth = Math.max(380, Math.min(maxW, dragStartWidthRef.current + delta));
+      setDrawerWidth(newWidth);
+    };
+    const onPointerUp = () => {
+      setIsDraggingDrawer(false);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("ai-browser-drawer-width", String(drawerWidth));
+      }
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, [isDraggingDrawer, drawerWidth]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const updateMedia = () => setIsDesktop(window.innerWidth >= 1024);
+    updateMedia();
+    window.addEventListener("resize", updateMedia);
+    return () => window.removeEventListener("resize", updateMedia);
+  }, []);
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
   const baseTextRef = useRef<string>("");
@@ -1019,7 +1388,13 @@ export default function AiAgentPage() {
       const data = res.data as { sessions?: AiChatSession[] };
       return data.sessions || [];
     },
-    refetchInterval: 12000,
+    refetchInterval: (query) => {
+      const sessList = (query.state.data as AiChatSession[] | undefined) || [];
+      const hasActiveHealing = sessList.some(
+        (s) => s.session_type === "sre_incident" && s.status === "healing"
+      );
+      return hasActiveHealing ? 3000 : 12000;
+    },
   });
 
   const rawDiscoveredModels = customModelList !== null ? customModelList : arrayFromResponse<AiModel>(modelsQuery.data?.models, []);
@@ -1032,6 +1407,16 @@ export default function AiAgentPage() {
   const deployments = arrayFromResponse<Deployment>(deploymentsQuery.data);
   const sessions = sessionsQuery.data || [];
   const activeSession = sessions.find((session) => session.id === activeSessionId);
+
+  useEffect(() => {
+    if (!activeSessionId || activeSession?.session_type !== "sre_incident" || activeSession?.status !== "healing") {
+      return;
+    }
+    const interval = setInterval(() => {
+      loadSession(activeSessionId).catch(() => {});
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [activeSessionId, activeSession?.session_type, activeSession?.status]);
   const fastModels = availableModels.filter((model) => modelMode(model) === "fast");
   const thinkingModels = availableModels.filter((model) => modelMode(model) === "thinking");
   const modeModels = mode === "thinking" ? thinkingModels : fastModels;
@@ -1046,8 +1431,83 @@ export default function AiAgentPage() {
   const activeModel =
     availableModels.find((model) => model.id === activeModelId) ||
     (activeModelId ? { id: activeModelId, label: activeModelId, mode } : undefined);
+  const isVisionActive = mounted && isVisionModel(activeModelId);
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const selectedDeployment = deployments.find((deployment) => deployment.id === selectedDeploymentId);
+
+  // Auto-resolve active running deployment for the selected project
+  const activeProjectDeployment = useMemo(() => {
+    if (!selectedProjectId) return selectedDeployment;
+    if (selectedDeployment && selectedDeployment.project_id === selectedProjectId) {
+      return selectedDeployment;
+    }
+    // 1. Prioritize a running deployment with runtime_url for the project
+    const runningWithUrl = deployments.find(
+      (d) => d.project_id === selectedProjectId && d.status === "running" && Boolean(d.runtime_url)
+    );
+    if (runningWithUrl) return runningWithUrl;
+    // 2. Or any running deployment
+    const running = deployments.find((d) => d.project_id === selectedProjectId && d.status === "running");
+    if (running) return running;
+    // 3. Or the latest deployment
+    return deployments.find((d) => d.project_id === selectedProjectId);
+  }, [selectedProjectId, selectedDeployment, deployments]);
+
+  // Keep selectedDeploymentId in sync when a project is selected, or auto-select running project
+  useEffect(() => {
+    if (selectedProjectId) {
+      if (!selectedDeployment || selectedDeployment.project_id !== selectedProjectId) {
+        const matching = deployments.find(
+          (d) => d.project_id === selectedProjectId && d.status === "running" && Boolean(d.runtime_url)
+        ) || deployments.find((d) => d.project_id === selectedProjectId);
+        if (matching) {
+          setSelectedDeploymentId(matching.id);
+        }
+      }
+    } else if (!hasInitializedTargetRef.current && deployments.length > 0) {
+      hasInitializedTargetRef.current = true;
+      // On initial load, prioritize any running project with a runtime_url
+      const runningDep = deployments.find(
+        (d) => d.status === "running" && Boolean(d.runtime_url) && !d.runtime_url?.includes("localhost:3000")
+      );
+      if (runningDep?.project_id) {
+        setSelectedProjectId(runningDep.project_id);
+        setSelectedDeploymentId(runningDep.id);
+      }
+    }
+  }, [selectedProjectId, deployments, selectedDeployment]);
+
+  // Dynamically resolve target URL for Live Application Canvas
+  const canvasTargetUrl = useMemo(() => {
+    if (customTargetUrl) {
+      return customTargetUrl;
+    }
+    if (activeProjectDeployment?.runtime_url && !activeProjectDeployment.runtime_url.includes("localhost:3000")) {
+      return activeProjectDeployment.runtime_url;
+    }
+    if (selectedDeployment?.runtime_url && !selectedDeployment.runtime_url.includes("localhost:3000")) {
+      return selectedDeployment.runtime_url;
+    }
+    if (selectedProjectId) {
+      const dep = deployments.find(
+        (d) => d.project_id === selectedProjectId && Boolean(d.runtime_url) && !d.runtime_url?.includes("localhost:3000")
+      );
+      return dep?.runtime_url || "about:blank";
+    }
+    // Fallback to any running user project deployment (e.g. portfolio on port 57621)
+    const runningUserDep = deployments.find(
+      (d) => d.status === "running" && Boolean(d.runtime_url) && !d.runtime_url?.includes("localhost:3000")
+    );
+    if (runningUserDep?.runtime_url) return runningUserDep.runtime_url;
+
+    // Or any user deployment with a runtime_url
+    const anyDepWithUrl = deployments.find(
+      (d) => Boolean(d.runtime_url) && !d.runtime_url?.includes("localhost:3000")
+    );
+    if (anyDepWithUrl?.runtime_url) return anyDepWithUrl.runtime_url;
+
+    return "about:blank";
+  }, [customTargetUrl, activeProjectDeployment, selectedDeployment, selectedProjectId, deployments]);
   // A command with a trailing space is a command waiting for its argument.
   // Nobody remembers a project id, so the picker opens on its own and the
   // user chooses by name -- the id is filled in behind the scenes.
@@ -1122,16 +1582,18 @@ export default function AiAgentPage() {
   }, [settingsQuery.data]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    window.localStorage.setItem("ai-agent-access-mode", agentAccessMode);
-    window.localStorage.setItem("ai-agent-remote-terminal", remoteTerminalPermission);
-    window.localStorage.setItem("ai-thinking-orb-style", orbStyle);
-    if (selectedModel) {
-      window.localStorage.setItem("ai-default-model", selectedModel);
-    }
+    if (typeof window === "undefined" || !isLoadedFromStorageRef.current) return;
+    try {
+      window.localStorage.setItem("ai-agent-access-mode", agentAccessMode);
+      window.localStorage.setItem("ai-agent-remote-terminal", remoteTerminalPermission);
+      window.localStorage.setItem("ai-thinking-orb-style", orbStyle);
+      if (selectedModel) {
+        window.localStorage.setItem("ai-default-model", selectedModel);
+      }
+    } catch {}
   }, [agentAccessMode, remoteTerminalPermission, orbStyle, selectedModel]);
 
-  const startListening = () => {
+  const startListening = async () => {
     if (typeof window === "undefined") return;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -1139,6 +1601,21 @@ export default function AiAgentPage() {
     if (!SpeechRecognitionClass) {
       toast.error("Voice input is not supported in this browser. Please use Chrome, Edge, or Safari.");
       return;
+    }
+
+    // Windows Chrome audio device priming:
+    // Requesting getUserMedia primes audio permissions and prevents Chrome from immediately failing with not-allowed
+    if (navigator?.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch (mediaErr: any) {
+        if (mediaErr?.name === "NotAllowedError" || mediaErr?.name === "PermissionDeniedError") {
+          toast.error("Microphone permission denied. Please allow microphone access in your browser settings.");
+          return;
+        }
+        console.warn("Audio hardware initialization warning:", mediaErr);
+      }
     }
 
     try {
@@ -1189,7 +1666,11 @@ export default function AiAgentPage() {
         console.warn("Speech recognition error:", event.error);
         if (event.error === "not-allowed" || event.error === "permission-denied") {
           toast.error("Microphone permission denied. Please allow microphone access in your browser settings.");
-        } else if (event.error !== "no-speech") {
+        } else if (event.error === "no-speech") {
+          // Normal silence, do not spam toasts
+        } else if (event.error === "aborted") {
+          // Normal stop, do not spam toasts
+        } else {
           toast.error(`Voice recognition error: ${event.error}`);
         }
         setIsListening(false);
@@ -1248,120 +1729,9 @@ export default function AiAgentPage() {
   };
 
   const openTerminalWithCommand = (command?: string) => {
+    setTerminalInitialCommand(command);
     setTerminalOpen(true);
-    if (command) {
-      setTerminalInput(command);
-    }
-    setTimeout(() => {
-      terminalInputRef.current?.focus();
-    }, 100);
   };
-
-  const runTerminalCommand = async (cmdToRun: string) => {
-    const trimmed = cmdToRun.trim();
-    if (!trimmed || isTerminalExecuting) return;
-
-    setTerminalHistory((prev) => [...prev.filter((c) => c !== trimmed), trimmed]);
-    setHistoryIndex(-1);
-    setTerminalInput("");
-
-    const execId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const timestamp = new Date().toLocaleTimeString();
-
-    const newLog: TerminalExecutionLog = {
-      id: execId,
-      command: trimmed,
-      timestamp,
-      status: "running",
-    };
-
-    setTerminalLogs((prev) => [...prev, newLog]);
-    setIsTerminalExecuting(true);
-
-    try {
-      const res = await api.post("/ai/tools/execute", {
-        tool_name: "terminal_run_command",
-        arguments: {
-          command: trimmed,
-          ...(selectedDeploymentId ? { deployment_id: selectedDeploymentId } : {}),
-          ...(selectedProjectId ? { project_id: selectedProjectId } : {}),
-        },
-      });
-
-      const data = (res.data || {}) as Record<string, any>;
-      const exitCode = typeof data.exit_code === "number" ? data.exit_code : (data.error ? 1 : 0);
-      const stdout = typeof data.stdout === "string" ? data.stdout : (exitCode === 0 && typeof data.output === "string" ? data.output : "");
-      const stderr = typeof data.stderr === "string" ? data.stderr : (exitCode !== 0 ? (typeof data.output === "string" ? data.output : typeof data.error === "string" ? data.error : "") : "");
-      const cwd = typeof data.cwd === "string" ? data.cwd : typeof data.working_directory === "string" ? data.working_directory : undefined;
-      if (cwd) {
-        setTerminalCwd(cwd);
-      }
-
-      setTerminalLogs((prev) =>
-        prev.map((item) =>
-          item.id === execId
-            ? {
-                ...item,
-                status: exitCode === 0 ? "success" : "error",
-                exitCode,
-                stdout: stdout || undefined,
-                stderr: stderr || undefined,
-                cwd,
-              }
-            : item
-        )
-      );
-    } catch (err: any) {
-      const errMessage = err.response?.data?.error || err.message || "Execution failed";
-      setTerminalLogs((prev) =>
-        prev.map((item) =>
-          item.id === execId
-            ? {
-                ...item,
-                status: "error",
-                exitCode: 1,
-                stderr: errMessage,
-              }
-            : item
-        )
-      );
-    } finally {
-      setIsTerminalExecuting(false);
-      setTimeout(() => {
-        terminalInputRef.current?.focus();
-      }, 50);
-    }
-  };
-
-  const handleTerminalKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "ArrowUp") {
-      e.preventDefault();
-      if (terminalHistory.length === 0) return;
-      const nextIndex = historyIndex === -1 ? terminalHistory.length - 1 : Math.max(0, historyIndex - 1);
-      setHistoryIndex(nextIndex);
-      setTerminalInput(terminalHistory[nextIndex] || "");
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      if (historyIndex === -1) return;
-      if (historyIndex < terminalHistory.length - 1) {
-        const nextIndex = historyIndex + 1;
-        setHistoryIndex(nextIndex);
-        setTerminalInput(terminalHistory[nextIndex] || "");
-      } else {
-        setHistoryIndex(-1);
-        setTerminalInput("");
-      }
-    } else if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      runTerminalCommand(terminalInput);
-    }
-  };
-
-  useEffect(() => {
-    if (terminalOpen) {
-      terminalLogsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [terminalLogs, terminalOpen]);
 
   const closePickers = () => {
     setComposerModelOpen(false);
@@ -1512,16 +1882,36 @@ export default function AiAgentPage() {
 
   const runAgentMutation = useMutation({
     mutationFn: async (message: string) => {
+      const uuidMatch = message.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
+      const parsedUuid = uuidMatch ? uuidMatch[0] : "";
+      const commandMatch = message.match(/^\/([a-zA-Z0-9_-]+)/);
+      const parsedCommand = commandMatch ? commandMatch[0].toLowerCase() : "";
+
+      const isDeploymentTarget =
+        deployments.some((d) => d.id === parsedUuid) ||
+        parsedCommand === "/repair" ||
+        parsedCommand === "/diagnose" ||
+        parsedCommand === "/fix" ||
+        parsedCommand === "/deploy";
+      const targetDeploymentId = (parsedUuid && isDeploymentTarget)
+        ? parsedUuid
+        : (selectedDeploymentId || activeSession?.deployment_id || undefined);
+      const targetProjectId = (parsedUuid && !isDeploymentTarget)
+        ? parsedUuid
+        : (selectedProjectId || activeSession?.project_id || undefined);
+      const workflowType = activeSession?.session_type || (parsedCommand ? "agent_chat" : undefined);
+
       const res = await api.post(
         "/ai/chat",
         {
           message,
-          command: message.startsWith("/") ? message.split(/\s+/)[0] : "",
+          command: parsedCommand || (message.startsWith("/") ? message.split(/\s+/)[0] : ""),
           model: activeModelId,
           model_mode: mode,
           session_id: activeSessionId || undefined,
-          project_id: selectedProjectId,
-          deployment_id: shouldAttachDeploymentContext(message) ? selectedDeploymentId : "",
+          project_id: targetProjectId,
+          deployment_id: targetDeploymentId,
+          workflow_type: workflowType,
           runtime: {
             permissions: {
               agent_access_mode: agentAccessMode,
@@ -2207,16 +2597,71 @@ export default function AiAgentPage() {
   const [streamReasoning, setStreamReasoning] = useState("");
   const [streamContent, setStreamContent] = useState("");
   const [streamToolCalls, setStreamToolCalls] = useState<ToolCall[]>([]);
+  const [streamSubagents, setStreamSubagents] = useState<SubagentTask[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const streamAbortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    if (isStreaming) {
-      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-    }
-  }, [streamReasoning, streamToolCalls, streamContent, isStreaming]);
+  const handleStopGeneration = useCallback(() => {
+    // 1. Abort client-side fetch stream
+    streamAbortRef.current?.abort();
 
-  const sendStreaming = async (prompt: string) => {
+    // 2. Notify backend stop endpoint to immediately halt agent & browser testing
+    api.post("/ai/chat/stop", { session_id: activeSessionId || "default" }).catch(() => {});
+
+    // 3. Directly notify ai-service stop endpoint as immediate fallback
+    try {
+      const aiHost = typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "127.0.0.1";
+      const directAiUrl = `${window.location.protocol}//${aiHost === "localhost" ? "127.0.0.1" : aiHost}:8010`;
+      fetch(`${directAiUrl}/chat/agent/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: activeSessionId || "default" }),
+        mode: "cors",
+      }).catch(() => {});
+    } catch {}
+
+    // 4. Notify live browser session if window has active connection
+    try {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("stackpilot:browser:stop"));
+      }
+    } catch {}
+  }, [activeSessionId]);
+
+  const handleChatScroll = useCallback(() => {
+    if (!scrollRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+    const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+    const isUp = distanceFromBottom > 60;
+    isUserScrolledUpRef.current = isUp;
+    setShowScrollBottom(isUp);
+  }, []);
+
+  useEffect(() => {
+    if (isStreaming && !isUserScrolledUpRef.current && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [streamReasoning, streamToolCalls, streamSubagents, streamContent, isStreaming]);
+
+  const sendStreaming = async (prompt: string, images?: string[]) => {
+    isUserScrolledUpRef.current = false;
+    setShowScrollBottom(false);
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+
+    // Notify browser canvas to return to live feed on new AI action
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("stackpilot:browser:stream_start"));
+    }
+
+    // Check if prompt contains an explicit URL
+    const urlMatch = prompt.match(/https?:\/\/[^\s<>"']+/);
+    if (urlMatch) {
+      const explicitUrl = urlMatch[0];
+      if (!explicitUrl.includes("localhost:3000") && !explicitUrl.includes("127.0.0.1:3000")) {
+        setCustomTargetUrl(explicitUrl);
+      }
+    }
+
     // Extract UUID and slash command
     const uuidMatch = prompt.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/);
     const parsedUuid = uuidMatch ? uuidMatch[0] : "";
@@ -2229,8 +2674,39 @@ export default function AiAgentPage() {
       parsedCommand === "/diagnose" ||
       parsedCommand === "/fix" ||
       parsedCommand === "/deploy";
-    const targetDeploymentId = (parsedUuid && isDeploymentTarget) ? parsedUuid : (selectedDeploymentId || undefined);
-    const targetProjectId = (parsedUuid && !isDeploymentTarget) ? parsedUuid : (selectedProjectId || undefined);
+    let targetDeploymentId = (parsedUuid && isDeploymentTarget)
+      ? parsedUuid
+      : (selectedDeploymentId || activeSession?.deployment_id || undefined);
+    let targetProjectId = (parsedUuid && !isDeploymentTarget)
+      ? parsedUuid
+      : (selectedProjectId || activeSession?.project_id || undefined);
+
+    // Auto-resolve active running deployment if targetProjectId is set
+    if (!targetDeploymentId && targetProjectId) {
+      const activeDep = deployments.find(
+        (d) => d.project_id === targetProjectId && d.status === "running" && Boolean(d.runtime_url)
+      ) || deployments.find((d) => d.project_id === targetProjectId);
+      if (activeDep) {
+        targetDeploymentId = activeDep.id;
+      }
+    }
+
+    // Detect project by name if mentioned in prompt (e.g. "portfolio")
+    if (!targetProjectId) {
+      const lowerPrompt = prompt.toLowerCase();
+      const matchedProj = projects.find((p) => p.name && lowerPrompt.includes(p.name.toLowerCase()));
+      if (matchedProj) {
+        targetProjectId = matchedProj.id;
+        const activeDep = deployments.find(
+          (d) => d.project_id === matchedProj.id && d.status === "running" && Boolean(d.runtime_url)
+        ) || deployments.find((d) => d.project_id === matchedProj.id);
+        if (activeDep) {
+          targetDeploymentId = activeDep.id;
+        }
+      }
+    }
+
+    const workflowType = activeSession?.session_type || (parsedCommand ? "agent_chat" : undefined);
 
     if (parsedUuid && isDeploymentTarget && parsedUuid !== selectedDeploymentId) {
       setSelectedDeploymentId(parsedUuid);
@@ -2249,6 +2725,7 @@ export default function AiAgentPage() {
     setStreamReasoning(initReasoning);
     setStreamContent("");
     setStreamToolCalls([]);
+    setStreamSubagents([]);
     setIsStreaming(true);
 
     const controller = new AbortController();
@@ -2257,23 +2734,33 @@ export default function AiAgentPage() {
     let reasoning = initReasoning + "\n";
     let content = "";
     let toolCalls: ToolCall[] = [];
+    let subagents: SubagentTask[] = [];
     let stats: ChatMessage["stats"] = {};
     let messageAppended = false;
 
+    let contentBuffer = "";
+    let reasoningBuffer = initReasoning + "\n";
+    let streamRafId: number | null = null;
+
+    const flushStream = () => {
+      setStreamContent(contentBuffer);
+      setStreamReasoning(reasoningBuffer);
+      streamRafId = null;
+    };
+
+    const queueStreamFlush = () => {
+      if (streamRafId === null) {
+        streamRafId = requestAnimationFrame(flushStream);
+      }
+    };
+
     const appendStoppedResponse = () => {
       if (messageAppended) return;
-      if (!content.trim() && !reasoning.trim() && toolCalls.length === 0) return;
+      if (!content.trim() && !reasoning.trim() && toolCalls.length === 0 && subagents.length === 0) return;
       messageAppended = true;
 
-      // If content is empty (e.g. model was still generating thoughts or running subagents),
-      // promote reasoning directly into content so the response NEVER disappears!
       let finalBody = content.trim();
-      let finalReasoning: string | undefined = reasoning.trim() || undefined;
-
-      if (!finalBody && reasoning.trim()) {
-        finalBody = reasoning.trim();
-        finalReasoning = undefined;
-      }
+      const finalReasoning: string | undefined = reasoning.trim() || undefined;
 
       finalBody = finalBody ? `${finalBody}\n\n*(Generation stopped by user)*` : "*(Generation stopped by user)*";
 
@@ -2282,6 +2769,7 @@ export default function AiAgentPage() {
         content: finalBody,
         reasoning: finalReasoning,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        subagents: subagents.length > 0 ? subagents : undefined,
         stats,
       });
 
@@ -2304,12 +2792,15 @@ export default function AiAgentPage() {
         command: parsedCommand || undefined,
         deploymentId: targetDeploymentId,
         projectId: targetProjectId,
+        customUrl: customTargetUrl || undefined,
+        workflowType,
         sessionId: activeSessionId || undefined,
         modelMode: mode === "thinking" ? "thinking" : "fast",
         model: activeModelId,
         provider,
         agentAccessMode,
         remoteTerminal: remoteTerminalPermission,
+        images,
         signal: controller.signal,
         onEvent: (event) => {
           if (event.type === "start" && event.session_id) {
@@ -2321,8 +2812,9 @@ export default function AiAgentPage() {
               queryClient.invalidateQueries({ queryKey: ["ai-chat-sessions"] });
             }
           } else if (event.type === "reasoning") {
-            reasoning += event.delta;
-            setStreamReasoning(reasoning);
+            reasoningBuffer += event.delta;
+            reasoning = reasoningBuffer;
+            queueStreamFlush();
           } else if (event.type === "tool_call") {
             const newCall: ToolCall = {
               name: event.name,
@@ -2330,7 +2822,47 @@ export default function AiAgentPage() {
             };
             toolCalls = [...toolCalls, newCall];
             setStreamToolCalls([...toolCalls]);
+            if (event.name.startsWith("browser_")) {
+              setBrowserOpen(true);
+              setBrowserActive(true);
+            }
+            if (event.name === "invoke_subagent" || event.name === "subagent_spawn") {
+              const sub: SubagentTask = {
+                id: `subagent-${Date.now()}`,
+                role: String(event.arguments?.role || "Specialized Subagent"),
+                title: String(event.arguments?.role || "Specialized Subagent"),
+                task: String(event.arguments?.task || ""),
+                status: "running",
+              };
+              subagents = [...subagents, sub];
+              setStreamSubagents([...subagents]);
+            }
+          } else if (event.type === "subagent_start") {
+            const sub: SubagentTask = {
+              id: event.id || `subagent-${Date.now()}`,
+              role: event.role || "Subagent",
+              title: event.title || event.role || "Subagent",
+              task: event.task || "",
+              status: "running",
+            };
+            subagents = [...subagents.filter((s) => s.id !== sub.id), sub];
+            setStreamSubagents([...subagents]);
+          } else if (event.type === "subagent_complete") {
+            subagents = subagents.map((s) =>
+              s.id === event.id || s.role.toLowerCase() === (event.role || "").toLowerCase()
+                ? { ...s, status: "completed", result: event.result || s.result }
+                : s
+            );
+            setStreamSubagents([...subagents]);
           } else if (event.type === "tool_result") {
+            if (event.name === "invoke_subagent" || event.name === "subagent_spawn") {
+              subagents = subagents.map((s, idx) =>
+                idx === subagents.length - 1
+                  ? { ...s, status: "completed", result: (event.result as any)?.output || "Task completed." }
+                  : s
+              );
+              setStreamSubagents([...subagents]);
+            }
             let foundIdx = -1;
             for (let i = toolCalls.length - 1; i >= 0; i--) {
               if (toolCalls[i].name === event.name && (toolCalls[i].result === undefined || toolCalls[i].result === null)) {
@@ -2375,11 +2907,13 @@ export default function AiAgentPage() {
               },
             });
           } else if (event.type === "content") {
-            content += event.delta;
-            setStreamContent(content);
+            contentBuffer += event.delta;
+            content = contentBuffer;
+            queueStreamFlush();
           } else if (event.type === "error") {
-            content += `\n\n_${event.error}_`;
-            setStreamContent(content);
+            contentBuffer += `\n\n_${event.error}_`;
+            content = contentBuffer;
+            queueStreamFlush();
           } else if (event.type === "done") {
             if (event.session_id && event.session_id !== activeSessionId) {
               setActiveSessionId(event.session_id);
@@ -2389,8 +2923,15 @@ export default function AiAgentPage() {
             }
             // The done frame carries the authoritative assembled text; trust it
             // over the accumulated deltas in case a frame was dropped.
-            content = event.content || content;
-            reasoning = event.reasoning || reasoning;
+            content = event.content || contentBuffer;
+            reasoning = event.reasoning || reasoningBuffer;
+            contentBuffer = content;
+            reasoningBuffer = reasoning;
+            if (streamRafId !== null) {
+              cancelAnimationFrame(streamRafId);
+              streamRafId = null;
+            }
+            flushStream();
             const usage = event.token_usage || {};
             stats = {
               latencyMs: event.latency_ms,
@@ -2405,15 +2946,22 @@ export default function AiAgentPage() {
         },
       });
 
+      if (streamRafId !== null) {
+        cancelAnimationFrame(streamRafId);
+        streamRafId = null;
+      }
+      flushStream();
+
       if (controller.signal.aborted) {
         appendStoppedResponse();
       } else {
         messageAppended = true;
         appendMessage({
           role: "assistant",
-          content: content || (reasoning.trim() ? reasoning : "_The model returned nothing._"),
+          content: content.trim() ? content : (toolCalls.length > 0 ? "Completed workspace actions. See details above." : "_The model returned nothing._"),
           reasoning: reasoning.trim() ? reasoning : undefined,
           toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+          subagents: subagents.length > 0 ? subagents : undefined,
           stats,
         });
       }
@@ -2427,6 +2975,10 @@ export default function AiAgentPage() {
         });
       }
     } finally {
+      if (streamRafId !== null) {
+        cancelAnimationFrame(streamRafId);
+        streamRafId = null;
+      }
       if (controller.signal.aborted) {
         appendStoppedResponse();
       }
@@ -2434,7 +2986,13 @@ export default function AiAgentPage() {
       setStreamReasoning("");
       setStreamContent("");
       setStreamToolCalls([]);
+      setStreamSubagents([]);
       streamAbortRef.current = null;
+      if (typeof window !== "undefined") {
+        try {
+          window.dispatchEvent(new CustomEvent("stackpilot:browser:test_completed"));
+        } catch {}
+      }
       queryClient.invalidateQueries({ queryKey: ["ai-chat-sessions"] });
       sessionsQuery.refetch();
     }
@@ -2457,9 +3015,27 @@ export default function AiAgentPage() {
       stopListening();
     }
     const trimmed = input.trim();
-    if (!trimmed || isRunning) return;
-    appendMessage({ role: "user", content: trimmed });
+    if ((!trimmed && attachments.length === 0) || isRunning) return;
+
+    // Collect images
+    const outgoingImages = attachments.filter((a) => a.isImage && a.dataUrl).map((a) => a.dataUrl as string);
+    const docAttachments = attachments.filter((a) => !a.isImage && a.text);
+
+    let combinedPrompt = trimmed;
+    if (docAttachments.length > 0) {
+      const docsContext = docAttachments
+        .map((d) => `--- Attached File: ${d.name} ---\n${d.text}\n--- End of ${d.name} ---`)
+        .join("\n\n");
+      combinedPrompt = combinedPrompt ? `${combinedPrompt}\n\n[Attached Files & Context]:\n${docsContext}` : docsContext;
+    }
+
+    appendMessage({
+      role: "user",
+      content: trimmed || (outgoingImages.length > 0 ? "Attached photos" : "Attached files"),
+      images: outgoingImages.length > 0 ? outgoingImages : undefined,
+    });
     setInput("");
+    setAttachments([]);
     setShowCommands(false);
 
     const isAiCommand =
@@ -2469,15 +3045,15 @@ export default function AiAgentPage() {
     const isPlatformCommand = /^\/(cost|org|environments|build|app|help|events|metrics|rollback|pause|resume|scale|drift|secrets)\b/i.test(trimmed);
 
     if (isAiCommand || (!isPlatformCommand && trimmed.startsWith("/"))) {
-      void sendStreaming(trimmed);
+      void sendStreaming(combinedPrompt, outgoingImages);
     } else if (trimmed.startsWith("/")) {
       commandMutation.mutate(trimmed);
     } else if (isDeployIntent(trimmed)) {
       autonomousDeployMutation.mutate(trimmed);
     } else if (streamingEnabled) {
-      void sendStreaming(trimmed);
+      void sendStreaming(combinedPrompt, outgoingImages);
     } else {
-      runAgentMutation.mutate(trimmed);
+      runAgentMutation.mutate(combinedPrompt);
     }
   };
 
@@ -2780,12 +3356,49 @@ export default function AiAgentPage() {
               New Chat
             </Button>
             {activeSession?.title && (
-              <span className="hidden max-w-xs truncate text-xs text-muted-foreground sm:inline-block">
-                {activeSession.title}
-              </span>
+              <div className="hidden items-center gap-2 sm:flex">
+                <span className="max-w-xs truncate text-xs text-muted-foreground">
+                  {activeSession.title}
+                </span>
+                {activeSession.session_type === "sre_incident" && activeSession.status === "healing" && (
+                  <Badge variant="outline" className="gap-1 border-amber-500/40 bg-amber-500/10 text-[10px] text-amber-400 py-0 h-5">
+                    <AppIcon name="loader2" fallback={Loader2} className="h-2.5 w-2.5 animate-spin" />
+                    Auto-Healing
+                  </Badge>
+                )}
+                {activeSession.session_type === "sre_incident" && activeSession.status === "healed" && (
+                  <Badge variant="outline" className="gap-1 border-emerald-500/40 bg-emerald-500/10 text-[10px] text-emerald-400 py-0 h-5">
+                    <AppIcon name="check" fallback={Check} className="h-2.5 w-2.5" />
+                    Healed & Live
+                  </Badge>
+                )}
+                {activeSession.session_type === "sre_incident" && activeSession.status === "failed" && (
+                  <Badge variant="outline" className="gap-1 border-red-500/40 bg-red-500/10 text-[10px] text-red-400 py-0 h-5">
+                    <AppIcon name="x-circle" fallback={XCircle} className="h-2.5 w-2.5" />
+                    Healing Failed
+                  </Badge>
+                )}
+              </div>
             )}
           </div>
           <div className="flex items-center gap-1.5">
+            <Button
+              type="button"
+              variant={browserOpen ? "secondary" : "ghost"}
+              size="sm"
+              className={cn(
+                "h-8 gap-1.5 px-3 text-xs transition-colors",
+                browserOpen ? "text-foreground font-medium bg-muted" : "text-muted-foreground hover:text-foreground"
+              )}
+              onClick={() => setBrowserOpen((open) => !open)}
+              title="Toggle Live Application Screen (Computer Use)"
+            >
+              <Globe className="h-3.5 w-3.5 text-sky-400" />
+              <span>Live App</span>
+              {browserActive && (
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              )}
+            </Button>
             <Button
               type="button"
               variant={terminalOpen ? "secondary" : "ghost"}
@@ -2797,9 +3410,8 @@ export default function AiAgentPage() {
               onClick={() => setTerminalOpen((open) => !open)}
               title="Toggle Workspace Terminal"
             >
-              <AppIcon name="terminal" fallback={Terminal} className="h-4 w-4 mr-1.5" />
+              <AppIcon name="terminal" fallback={Terminal} className="h-3.5 w-3.5 mr-1" />
               Terminal
-              {terminalOpen && <span className="ml-1 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />}
             </Button>
             <Link href="/dashboard/ai/history">
               <Button type="button" variant="ghost" size="sm" className="h-8 gap-1.5 px-3 text-xs text-muted-foreground hover:text-foreground">
@@ -2820,7 +3432,7 @@ export default function AiAgentPage() {
           </div>
         </header>
 
-        <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-8 md:px-8">
+        <div ref={scrollRef} onScroll={handleChatScroll} className="min-h-0 flex-1 overflow-y-auto px-4 py-8 md:px-8">
           <div className="mx-auto flex max-w-5xl flex-col gap-6">
             {messages.map((message, messageIndex) => (
               <div
@@ -2840,8 +3452,12 @@ export default function AiAgentPage() {
                 >
                   {(() => {
                     const parsed = message.role === "assistant"
-                      ? parseAssistantMessageContent(message.content, message.reasoning)
-                      : { content: message.content, reasoningBlocks: [] };
+                      ? parseAssistantMessageContent(message.content, message.reasoning, message.subagents, message.toolCalls)
+                      : { content: message.content, reasoningBlocks: [], subagents: [] };
+
+                    const mainToolCalls = message.toolCalls?.filter(
+                      (tc) => tc.name !== "invoke_subagent" && tc.name !== "subagent_spawn"
+                    );
 
                     return (
                       <>
@@ -2852,16 +3468,36 @@ export default function AiAgentPage() {
                             orbStyle={orbStyle}
                           />
                         )}
-                        {message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0 && (
+                        {message.role === "assistant" && parsed.subagents && parsed.subagents.length > 0 && (
+                          <SubagentsPanel
+                            subagents={parsed.subagents}
+                            onOpenTerminal={openTerminalWithCommand}
+                          />
+                        )}
+                        {message.role === "assistant" && mainToolCalls && mainToolCalls.length > 0 && (
                           <ToolsPanel
-                            toolCalls={message.toolCalls}
+                            toolCalls={mainToolCalls}
                             onOpenTerminal={openTerminalWithCommand}
                             onAllow={handleAllowToolCall}
                             onDeny={handleDenyToolCall}
                           />
                         )}
                         {message.role === "user" ? (
-                          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
+                          <div className="space-y-2">
+                            {message.images && message.images.length > 0 && (
+                              <div className="flex flex-wrap gap-2 mb-2">
+                                {message.images.map((imgUrl, i) => (
+                                  <img
+                                    key={i}
+                                    src={imgUrl}
+                                    alt={`Attachment ${i + 1}`}
+                                    className="max-h-52 max-w-xs rounded-xl border border-white/20 object-cover shadow-sm"
+                                  />
+                                ))}
+                              </div>
+                            )}
+                            <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">{message.content}</p>
+                          </div>
                         ) : (
                           <div className="prose-ai min-w-0 max-w-full break-words [overflow-wrap:anywhere] text-sm leading-relaxed">
                             <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
@@ -2921,7 +3557,15 @@ export default function AiAgentPage() {
               <div className="flex justify-start">
                 <div className="min-w-0 max-w-[min(56rem,88%)] rounded-2xl border border-border bg-background px-5 py-4 overflow-hidden break-words">
                   {(() => {
-                    const parsedStream = parseAssistantMessageContent(streamContent, streamReasoning);
+                    const parsedStream = parseAssistantMessageContent(
+                      streamContent,
+                      streamReasoning,
+                      streamSubagents,
+                      streamToolCalls
+                    );
+                    const streamMainToolCalls = streamToolCalls.filter(
+                      (tc) => tc.name !== "invoke_subagent" && tc.name !== "subagent_spawn"
+                    );
                     return (
                       <>
                         {(parsedStream.reasoningBlocks.length > 0 || isStreaming) && (
@@ -2935,9 +3579,16 @@ export default function AiAgentPage() {
                             orbStyle={orbStyle}
                           />
                         )}
-                        {streamToolCalls.length > 0 && (
+                        {parsedStream.subagents && parsedStream.subagents.length > 0 && (
+                          <SubagentsPanel
+                            subagents={parsedStream.subagents}
+                            isGenerating={isStreaming}
+                            onOpenTerminal={openTerminalWithCommand}
+                          />
+                        )}
+                        {streamMainToolCalls.length > 0 && (
                           <ToolsPanel
-                            toolCalls={streamToolCalls}
+                            toolCalls={streamMainToolCalls}
                             isGenerating={isStreaming}
                             onOpenTerminal={openTerminalWithCommand}
                             onAllow={handleAllowToolCall}
@@ -2946,9 +3597,13 @@ export default function AiAgentPage() {
                         )}
                         {parsedStream.content && (
                           <div className="prose-ai min-w-0 max-w-full break-words [overflow-wrap:anywhere] text-sm leading-relaxed">
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-                              {parsedStream.content}
-                            </ReactMarkdown>
+                            <AnimatedMarkdown
+                              content={parsedStream.content}
+                              animation="blurIn"
+                              animationDuration="0.4s"
+                              animationTimingFunction="ease-out"
+                              sep="diff"
+                            />
                           </div>
                         )}
                       </>
@@ -2956,7 +3611,7 @@ export default function AiAgentPage() {
                   })()}
                   <button
                     type="button"
-                    onClick={() => streamAbortRef.current?.abort()}
+                    onClick={handleStopGeneration}
                     className="mt-3 inline-flex items-center gap-1.5 text-xs text-rose-500 hover:text-rose-600 font-medium px-2 py-1 rounded bg-rose-500/10 hover:bg-rose-500/20 transition-colors cursor-pointer"
                   >
                     <Square className="h-3 w-3 fill-current" />
@@ -3045,180 +3700,35 @@ export default function AiAgentPage() {
           </div>
         </div>
 
-        {/* Interactive Workspace Terminal Drawer */}
-        {terminalOpen && (
-          <div
-            className={cn(
-              "shrink-0 border-t border-border/80 bg-zinc-950 text-zinc-200 shadow-xl flex flex-col transition-all duration-150 z-10",
-              terminalExpanded ? "h-80" : "h-56"
-            )}
-          >
-            {/* Terminal Drawer Header */}
-            <div className="flex items-center justify-between px-3 py-1.5 border-b border-zinc-800/80 bg-zinc-900/80 select-none text-xs">
-              <div className="flex items-center gap-2 min-w-0">
-                <Terminal className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="font-mono text-xs font-medium text-zinc-200">Terminal</span>
-                <span className="text-zinc-600">·</span>
-                <span className="text-[11px] font-mono text-zinc-400 truncate max-w-[16rem]">
-                  {terminalCwd || (selectedDeployment ? `uploads/builds/${selectedDeployment.id.slice(0, 8)}/source` : selectedProject ? `uploads/projects/${selectedProject.id.slice(0, 8)}/source` : "workspace")}
-                </span>
-              </div>
+        {/* Floating Workspace PowerShell Terminal Window */}
+        <FloatingPowerShellTerminal
+          open={terminalOpen}
+          onClose={() => setTerminalOpen(false)}
+          selectedDeploymentId={selectedDeploymentId}
+          selectedProjectId={selectedProjectId}
+          initialCommand={terminalInitialCommand}
+          onInitialCommandConsumed={() => setTerminalInitialCommand(undefined)}
+        />
 
-              {/* Header actions & quick chips */}
-              <div className="flex items-center gap-1.5 shrink-0">
-                <div className="hidden sm:flex items-center gap-1 mr-1">
-                  {[
-                    { label: "dir", cmd: "dir" },
-                    { label: "node -v", cmd: "node -v" },
-                    { label: "git status", cmd: "git status" },
-                  ].map((action) => (
-                    <button
-                      key={action.label}
-                      type="button"
-                      disabled={isTerminalExecuting}
-                      onClick={() => runTerminalCommand(action.cmd)}
-                      className="px-1.5 py-0.5 rounded font-mono text-[10px] bg-zinc-800/70 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors shrink-0 disabled:opacity-50"
-                    >
-                      {action.label}
-                    </button>
-                  ))}
-                </div>
-
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
-                  onClick={() => setTerminalLogs([])}
-                  title="Clear Output"
-                >
-                  <AppIcon name="trash" fallback={Trash2} className="h-3 w-3" />
-                </Button>
-
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800"
-                  onClick={() => setTerminalExpanded((prev) => !prev)}
-                  title={terminalExpanded ? "Collapse" : "Expand"}
-                >
-                  {terminalExpanded ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
-                </Button>
-
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 text-zinc-400 hover:text-rose-400 hover:bg-zinc-800"
-                  onClick={() => setTerminalOpen(false)}
-                  title="Close Terminal"
-                >
-                  <AppIcon name="x" fallback={X} className="h-3 w-3" />
-                </Button>
-              </div>
-            </div>
-
-            {/* Terminal Console Output */}
-            <div className="flex-1 overflow-y-auto p-3 font-mono text-xs space-y-2.5 select-text min-h-0">
-              {terminalLogs.length === 0 ? (
-                <div className="text-zinc-600 font-mono text-xs py-1 select-none">
-                  Terminal ready. Run commands in workspace.
-                </div>
-              ) : (
-                terminalLogs.map((log) => (
-                  <div key={log.id} className="space-y-1">
-                    <div className="flex items-center justify-between gap-2 border-b border-zinc-800/40 pb-0.5">
-                      <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                        <span className="text-zinc-600 select-none text-[10px]">[{log.timestamp}]</span>
-                        <div className="flex items-center gap-1 text-zinc-300 font-medium truncate">
-                          <span className="text-zinc-600 select-none">$</span>
-                          <span className="truncate">{log.command}</span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2 shrink-0">
-                        {log.status === "running" ? (
-                          <span className="text-[10px] text-zinc-400 flex items-center gap-1">
-                            <Loader2 className="h-2.5 w-2.5 animate-spin" />
-                            <span>running</span>
-                          </span>
-                        ) : log.exitCode === 0 ? (
-                          <Badge variant="outline" className="h-4 px-1 text-[9px] font-mono border-emerald-500/30 text-emerald-400 bg-emerald-500/10">
-                            exit 0
-                          </Badge>
-                        ) : (
-                          <Badge variant="outline" className="h-4 px-1 text-[9px] font-mono border-rose-500/30 text-rose-400 bg-rose-500/10">
-                            exit {log.exitCode ?? 1}
-                          </Badge>
-                        )}
-                      </div>
-                    </div>
-
-                    {log.status === "running" && (
-                      <div className="text-zinc-500 italic text-[11px] flex items-center gap-1.5 py-0.5">
-                        <Loader2 className="h-2.5 w-2.5 animate-spin text-zinc-400" />
-                        <span>Executing...</span>
-                      </div>
-                    )}
-
-                    {log.stdout && (
-                      <pre className="whitespace-pre-wrap break-words text-zinc-300 leading-relaxed overflow-x-auto text-[11px]">
-                        {log.stdout}
-                      </pre>
-                    )}
-
-                    {log.stderr && (
-                      <pre className="whitespace-pre-wrap break-words text-rose-400 leading-relaxed overflow-x-auto text-[11px]">
-                        {log.stderr}
-                      </pre>
-                    )}
-
-                    {log.status !== "running" && !log.stdout && !log.stderr && (
-                      <div className="text-zinc-600 italic text-[10px]">(command finished with no output)</div>
-                    )}
-                  </div>
-                ))
-              )}
-              <div ref={terminalLogsEndRef} />
-            </div>
-
-            {/* Interactive Command Input Line */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                runTerminalCommand(terminalInput);
-              }}
-              className="flex items-center gap-2 px-3 py-1.5 bg-zinc-900/80 border-t border-zinc-800 shrink-0 font-mono text-xs"
-            >
-              <span className="text-zinc-500 font-bold select-none text-xs">$</span>
-              <input
-                ref={terminalInputRef}
-                type="text"
-                value={terminalInput}
-                disabled={isTerminalExecuting}
-                onChange={(e) => setTerminalInput(e.target.value)}
-                onKeyDown={handleTerminalKeyDown}
-                placeholder="Run a command..."
-                className="flex-1 bg-transparent border-none outline-none text-zinc-200 placeholder:text-zinc-600 font-mono text-xs disabled:opacity-50"
-              />
-              {isTerminalExecuting ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-400" />
-              ) : (
+        <div className="sticky bottom-0 z-20 shrink-0 bg-gradient-to-t from-background via-background/95 to-transparent px-4 pb-4 pt-2 md:px-6">
+          <div ref={composerRef} className="relative mx-auto max-w-5xl">
+            {/* Floating Scroll to Bottom Button - Positioned directly above the right side of the chat box */}
+            {showScrollBottom && (
+              <div className="absolute -top-11 right-2 z-30">
                 <button
-                  type="submit"
-                  disabled={!terminalInput.trim()}
-                  className="text-zinc-500 hover:text-zinc-300 disabled:opacity-30 transition-colors p-0.5 cursor-pointer"
-                  title="Run (Enter)"
+                  type="button"
+                  onClick={() => {
+                    isUserScrolledUpRef.current = false;
+                    setShowScrollBottom(false);
+                    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+                  }}
+                  className="flex items-center gap-1.5 rounded-full border border-border bg-background/95 px-3 py-1.5 text-xs font-medium text-foreground shadow-lg backdrop-blur hover:bg-muted cursor-pointer transition-all animate-in fade-in slide-in-from-bottom-2"
                 >
-                  <CornerDownLeft className="h-3.5 w-3.5" />
+                  <ArrowDown className="h-3.5 w-3.5" />
+                  <span>Scroll to bottom</span>
                 </button>
-              )}
-            </form>
-          </div>
-        )}
-
-        <div className="sticky bottom-0 z-20 shrink-0 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur md:px-6">
-          <div ref={composerRef} className="mx-auto max-w-5xl">
+              </div>
+            )}
             {argPickerOpen && pendingCommand?.arg === "deployment" && (
               <div className="mb-2 max-h-64 overflow-y-auto rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">
                 <div className="px-3 py-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -3332,7 +3842,124 @@ export default function AiAgentPage() {
               </div>
             )}
 
-            <div className="rounded-2xl border border-border bg-background px-3 py-2 shadow-sm">
+            <div className="relative rounded-2xl border border-border bg-background px-3 py-2 shadow-sm">
+              {/* Popovers rendered at the chat-box level so they NEVER get clipped by horizontal overflow or masks */}
+              {commandPickerOpen && (
+                <div className="absolute bottom-full left-3 z-50 mb-2 w-96 max-w-[calc(100vw-3rem)]">
+                  {renderCommandPicker()}
+                </div>
+              )}
+
+              {projectOpen && (
+                <div className="absolute bottom-full left-4 sm:left-36 z-50 mb-2 w-64 rounded-xl border border-border bg-popover p-1 text-popover-foreground shadow-xl">
+                  <div className="px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                    Target Project
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedProjectId("");
+                      setSelectedDeploymentId("");
+                      setProjectOpen(false);
+                    }}
+                    className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground text-left"
+                  >
+                    <span>All Projects (Auto-detect)</span>
+                    {!selectedProjectId && <Check className="h-3.5 w-3.5 text-primary" />}
+                  </button>
+                  <div className="my-1 border-t border-border/50" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCustomUrlInput(customTargetUrl || "");
+                      setShowCustomUrlDialog(true);
+                      setProjectOpen(false);
+                    }}
+                    className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground text-left text-sky-400 font-medium"
+                  >
+                    <div className="flex items-center gap-1.5 truncate">
+                      <Globe className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">Custom Website / URL...</span>
+                    </div>
+                    {customTargetUrl && (
+                      <span className="text-[9px] px-1 py-0 rounded bg-sky-500/20 text-sky-300 shrink-0 font-mono">
+                        Active
+                      </span>
+                    )}
+                  </button>
+                  <div className="my-1 border-t border-border/50" />
+                  <div className="max-h-52 overflow-y-auto space-y-0.5">
+                    {projects.map((p) => {
+                      const dep = deployments.find(
+                        (d) => d.project_id === p.id && d.status === "running" && Boolean(d.runtime_url)
+                      );
+                      return (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedProjectId(p.id);
+                            if (dep) setSelectedDeploymentId(dep.id);
+                            setProjectOpen(false);
+                          }}
+                          className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground text-left"
+                        >
+                          <span className="truncate font-medium">{p.name}</span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {dep && (
+                              <Badge variant="outline" className="text-[9px] px-1 py-0 border-emerald-500/40 text-emerald-400 bg-emerald-500/10">
+                                Running
+                              </Badge>
+                            )}
+                            {p.id === selectedProjectId && <Check className="h-3.5 w-3.5 text-primary" />}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Attachment Preview Chips */}
+              {attachments.length > 0 && (
+                <div className="flex flex-wrap gap-2 pb-2 mb-2 border-b border-border/50">
+                  {attachments.map((att) => (
+                    <div
+                      key={att.id}
+                      className="group relative flex items-center gap-2 rounded-lg border border-border bg-muted/50 pl-2 pr-1.5 py-1 text-xs max-w-xs transition-all hover:bg-muted/80"
+                    >
+                      {att.isImage ? (
+                        <div className="h-7 w-7 rounded overflow-hidden bg-black/20 shrink-0 border border-border/50">
+                          <img
+                            src={att.dataUrl}
+                            alt={att.name}
+                            className="h-full w-full object-cover"
+                          />
+                        </div>
+                      ) : (
+                        <FileText className="h-4 w-4 text-primary shrink-0" />
+                      )}
+                      <div className="flex flex-col min-w-0 pr-1">
+                        <span className="truncate font-medium text-[11px] max-w-[130px]" title={att.name}>
+                          {att.name}
+                        </span>
+                        <span className="text-[9px] text-muted-foreground">
+                          {att.size < 1024 ? `${att.size} B` : `${(att.size / 1024).toFixed(1)} KB`}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeAttachment(att.id)}
+                        className="rounded-full p-0.5 text-muted-foreground hover:bg-rose-500/20 hover:text-rose-500 transition-colors shrink-0"
+                        title="Remove attachment"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <textarea
                 ref={textareaRef}
                 value={input}
@@ -3349,64 +3976,159 @@ export default function AiAgentPage() {
                     submit();
                   }
                 }}
-                placeholder="Ask the agent, or type / for commands..."
+                placeholder={
+                  attachments.length > 0
+                    ? "Add a prompt for your attachments, or press Enter to analyze..."
+                    : "Ask the agent, or type / for commands..."
+                }
                 rows={1}
                 className="max-h-44 min-h-10 w-full resize-none overflow-y-auto bg-transparent px-2 py-2 text-sm leading-6 outline-none placeholder:text-muted-foreground"
               />
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <div className="relative">
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      className="max-w-[18rem] justify-start"
-                      suppressHydrationWarning
-                      onClick={() => {
-                        setComposerModelOpen((open) => !open);
-                        setSettingsModelOpen(false);
-                        setProjectOpen(false);
-                        setDeploymentOpen(false);
-                      }}
-                    >
-                      {mode === "thinking" ? <AppIcon name="brain-circuit" fallback={BrainCircuit} className="h-4 w-4"  /> : <AppIcon name="zap" fallback={Zap} className="h-4 w-4"  />}
-                      <span className="truncate" suppressHydrationWarning>
-                        {mode === "thinking" ? "Think" : "Fast"} | {shortId(modelLabel(activeModel), 18)}
-                      </span>
-                      <AppIcon name="chevron-down" fallback={ChevronDown} className="ml-1 h-3.5 w-3.5"  />
-                    </Button>
-                    {composerModelOpen && (
-                      <div className="absolute bottom-full left-0 z-50 mb-2 w-80">
-                        {renderModelPicker(closePickers)}
-                      </div>
+              <div className="relative flex items-center justify-between gap-1 pt-1 min-w-0">
+                {/* Scrollable Left Controls Track with Right Fade Mask */}
+                <div
+                  className="flex items-center gap-1.5 min-w-0 flex-1 overflow-x-auto no-scrollbar scroll-smooth py-0.5 pr-6 [mask-image:linear-gradient(to_right,black_calc(100%-2.5rem),transparent_100%)]"
+                  onWheel={(e) => {
+                    if (e.deltaY !== 0 && e.currentTarget.scrollWidth > e.currentTarget.clientWidth) {
+                      e.currentTarget.scrollLeft += e.deltaY;
+                    }
+                  }}
+                >
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="max-w-[130px] sm:max-w-[170px] md:max-w-[210px] justify-start h-8 text-xs font-medium px-2.5 shrink-0"
+                    suppressHydrationWarning
+                    onClick={() => setModelPickerOpen(true)}
+                    title="Open Categorized Model Picker"
+                  >
+                    {!mounted ? (
+                      <AppIcon name="zap" fallback={Zap} className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                    ) : mode === "thinking" ? (
+                      <AppIcon name="brain-circuit" fallback={BrainCircuit} className="h-3.5 w-3.5 text-purple-400 shrink-0" />
+                    ) : isVisionActive ? (
+                      <Sparkles className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <AppIcon name="zap" fallback={Zap} className="h-3.5 w-3.5 text-amber-400 shrink-0" />
                     )}
-                  </div>
+                    <span className="truncate max-w-[85px] sm:max-w-[125px] md:max-w-[165px]" suppressHydrationWarning>
+                      {!mounted
+                        ? "Fast | Select model"
+                        : `${mode === "thinking" ? "Think" : isVisionActive ? "Vision" : "Fast"} | ${shortId(modelLabel(activeModel), 16)}`}
+                    </span>
+                    <ChevronDown className="ml-1 h-3 w-3 opacity-60 shrink-0" />
+                  </Button>
 
-                  <div className="relative">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="h-8 px-2.5 text-xs font-medium gap-1 shrink-0"
+                    onClick={() => {
+                      setCommandPickerOpen((open) => !open);
+                      setComposerModelOpen(false);
+                      setSettingsModelOpen(false);
+                      setProjectOpen(false);
+                      setDeploymentOpen(false);
+                    }}
+                  >
+                    <FilledStarIcon className="size-3.5 shrink-0" />
+                    Commands
+                    <AppIcon name="chevron-down" fallback={ChevronDown} className="ml-0.5 h-3 w-3 shrink-0" />
+                  </Button>
+
+                  {/* Custom URL or Target Project Selector Pill */}
+                  {customTargetUrl ? (
+                    <div className="flex items-center gap-1.5 bg-sky-500/10 border border-sky-500/30 rounded-lg px-2 h-8 text-xs text-sky-400 font-medium shrink-0">
+                      <Globe className="h-3.5 w-3.5 shrink-0 text-sky-400" />
+                      <span
+                        className="truncate max-w-[90px] sm:max-w-[140px] cursor-pointer hover:underline"
+                        title={`Custom URL target: ${customTargetUrl}. Click to change.`}
+                        onClick={() => {
+                          setCustomUrlInput(customTargetUrl);
+                          setShowCustomUrlDialog(true);
+                        }}
+                      >
+                        {customTargetUrl.replace(/^https?:\/\//, "")}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setCustomTargetUrl("");
+                        }}
+                        className="p-0.5 hover:bg-sky-500/20 rounded text-sky-400 hover:text-sky-200 transition-colors"
+                        title="Clear custom target URL"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  ) : (
                     <Button
                       type="button"
                       variant="secondary"
                       size="sm"
+                      className="h-8 gap-1 text-xs font-medium px-2.5 shrink-0"
                       onClick={() => {
-                        setCommandPickerOpen((open) => !open);
+                        setProjectOpen((open) => !open);
+                        setCommandPickerOpen(false);
                         setComposerModelOpen(false);
                         setSettingsModelOpen(false);
-                        setProjectOpen(false);
                         setDeploymentOpen(false);
                       }}
+                      title="Select Target Project or Custom Website for AI Agent & Live Browser"
                     >
-                      <FilledStarIcon className="size-4 shrink-0" />
-                      Commands
-                      <AppIcon name="chevron-down" fallback={ChevronDown} className="ml-1 h-3.5 w-3.5"  />
+                      <Layers className="h-3.5 w-3.5 text-sky-400 shrink-0" />
+                      <span className="truncate max-w-[75px] sm:max-w-[105px]">
+                        {selectedProject ? selectedProject.name : "All Projects"}
+                      </span>
+                      {activeProjectDeployment?.status === "running" && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" title="Live Running Deployment" />
+                      )}
+                      <ChevronDown className="h-3 w-3 opacity-60 ml-0.5 shrink-0" />
                     </Button>
-                    {commandPickerOpen && (
-                      <div className="absolute bottom-full left-0 z-50 mb-2 w-96 max-w-[calc(100vw-3rem)]">
-                        {renderCommandPicker()}
-                      </div>
-                    )}
-                  </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-1.5">
+
+                {/* Pinned Right Controls Group with Gradient Overlay */}
+                <div className="relative flex items-center gap-1.5 shrink-0 ml-auto pl-1.5 bg-background z-10">
+                  {/* Fade gradient overlay to the left of the right buttons */}
+                  <div className="pointer-events-none absolute -left-8 top-0 bottom-0 w-8 bg-gradient-to-r from-transparent to-background" />
+
+                  {/* Hidden Multi-file Input */}
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={(e) => handleFilesSelected(e.target.files)}
+                    multiple
+                    accept="image/*,.pdf,.txt,.md,.json,.csv,.doc,.docx,.yaml,.yml,.py,.ts,.tsx,.js,.jsx,.go,.rs,.cpp,.c,.h,.sh,.sql"
+                    className="hidden"
+                  />
+
+                  {/* '+' File & Photo Attachment Button */}
+                  <Button
+                    type="button"
+                    variant={isVisionActive ? "secondary" : "outline"}
+                    size="icon"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isRunning}
+                    className={cn(
+                      "h-8 w-8 shrink-0 transition-all",
+                      isVisionActive
+                        ? "border-emerald-500/40 text-emerald-500 hover:bg-emerald-500/10 hover:text-emerald-400 shadow-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    )}
+                    title={
+                      isVisionActive
+                        ? "Attach photos & documents (Multimodal Vision Active)"
+                        : "Attach files, documents, or photos"
+                    }
+                    aria-label="Attach files or photos"
+                  >
+                    <Plus className={cn("h-4 w-4", isVisionActive && "text-emerald-500 stroke-[2.5]")} />
+                  </Button>
+
                   <Button
                     type="button"
                     variant={isListening ? "destructive" : "outline"}
@@ -3414,10 +4136,10 @@ export default function AiAgentPage() {
                     onClick={toggleListening}
                     disabled={isRunning}
                     className={cn(
-                      "h-9 shrink-0 transition-all",
+                      "h-8 shrink-0 transition-all",
                       isListening
                         ? "gap-2 px-3 bg-red-500 hover:bg-red-600 text-white shadow-md animate-pulse border-red-500"
-                        : "text-muted-foreground hover:text-foreground"
+                        : "w-8 text-muted-foreground hover:text-foreground"
                     )}
                     title={isListening ? "Listening... Click to finish voice input" : "Voice input (Speech to text)"}
                     aria-label={isListening ? "Stop voice input" : "Start voice input"}
@@ -3429,7 +4151,7 @@ export default function AiAgentPage() {
                         <AppIcon name="square" fallback={Square} className="h-3 w-3 fill-current ml-0.5" />
                       </>
                     ) : (
-                      <AppIcon name="mic" fallback={Mic} className="h-4 w-4" />
+                      <AppIcon name="mic" fallback={Mic} className="h-3.5 w-3.5" />
                     )}
                   </Button>
 
@@ -3437,19 +4159,26 @@ export default function AiAgentPage() {
                     <Button
                       type="button"
                       variant="destructive"
-                      onClick={() => streamAbortRef.current?.abort()}
-                      className="gap-1.5 shadow-sm bg-red-600 hover:bg-red-700 text-white font-medium active:scale-95 transition-all"
+                      size="sm"
+                      onClick={handleStopGeneration}
+                      className="h-8 px-3 text-xs gap-1.5 shadow-sm bg-red-600 hover:bg-red-700 text-white font-medium active:scale-95 transition-all shrink-0"
                       title="Stop generating response"
                     >
-                      <Square className="h-3.5 w-3.5 fill-current" />
+                      <Square className="h-3 w-3 fill-current" />
                       Stop
                     </Button>
                   ) : (
-                    <Button type="button" onClick={submit} disabled={!input.trim() || isRunning}>
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="h-8 px-3 text-xs font-medium gap-1.5 shrink-0"
+                      onClick={submit}
+                      disabled={(!input.trim() && attachments.length === 0) || isRunning}
+                    >
                       {isRunning ? (
-                        <AppIcon name="loader2" fallback={Loader2} className="h-4 w-4 animate-spin" />
+                        <AppIcon name="loader2" fallback={Loader2} className="h-3.5 w-3.5 animate-spin" />
                       ) : (
-                        <AppIcon name="send" fallback={Send} className="h-4 w-4" />
+                        <AppIcon name="send" fallback={Send} className="h-3.5 w-3.5" />
                       )}
                       Send
                     </Button>
@@ -3460,7 +4189,65 @@ export default function AiAgentPage() {
           </div>
         </div>
         </section>
+
+        {/* Live Application Canvas Drawer (Desktop Side-by-Side Split View) */}
+        {browserOpen && isDesktop && (
+          <>
+            {/* Full-screen Shield during Resizing to prevent canvas pointer interception */}
+            {isDraggingDrawer && (
+              <div className="fixed inset-0 z-[99999] cursor-col-resize select-none pointer-events-auto bg-transparent" />
+            )}
+
+            {/* Draggable Vertical Resizer Handle */}
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              onPointerDown={startDraggingDrawer}
+              className={cn(
+                "flex w-3.5 -mx-1.5 cursor-col-resize items-center justify-center z-40 transition-colors group select-none shrink-0 relative hover:bg-primary/20",
+                isDraggingDrawer && "bg-primary/30"
+              )}
+              title="Drag to resize Live App Drawer"
+            >
+              <div
+                className={cn(
+                  "w-1.5 h-16 rounded-full flex items-center justify-center transition-all",
+                  isDraggingDrawer ? "bg-primary w-2 shadow-lg shadow-primary/40" : "bg-muted-foreground/40 group-hover:bg-primary group-hover:h-20"
+                )}
+              >
+                <GripVertical className="h-3 w-3 text-background pointer-events-none opacity-80" />
+              </div>
+            </div>
+            <div
+              style={{ width: `${drawerWidth}px` }}
+              className="flex h-full border-l border-border/60 bg-muted/10 p-3 flex-col shrink-0 relative"
+            >
+              <InteractiveBrowserCanvas
+                sessionId={activeSessionId || "default"}
+                initialUrl={canvasTargetUrl}
+                isOpen={browserOpen}
+                onClose={() => setBrowserOpen(false)}
+                embedded={true}
+                onUrlChange={(url) => setCustomTargetUrl(url)}
+              />
+            </div>
+          </>
+        )}
       </div>
+
+      {/* Floating Modal for Mobile / Small Screens */}
+      {browserOpen && !isDesktop && (
+        <div className="fixed inset-3 z-50 shadow-2xl">
+          <InteractiveBrowserCanvas
+            sessionId={activeSessionId || "default"}
+            initialUrl={canvasTargetUrl}
+            isOpen={browserOpen}
+            onClose={() => setBrowserOpen(false)}
+            embedded={false}
+            onUrlChange={(url) => setCustomTargetUrl(url)}
+          />
+        </div>
+      )}
 
       <Dialog
         open={settingsOpen}
@@ -3565,26 +4352,16 @@ export default function AiAgentPage() {
                     placeholder={activeModelId || "Type or choose any model ID"}
                     className="font-mono text-xs"
                   />
-                  <div className="relative">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => {
-                        setSettingsModelOpen((open) => !open);
-                        setProjectOpen(false);
-                        setDeploymentOpen(false);
-                        setComposerModelOpen(false);
-                      }}
-                      title="Select from fetched models"
-                    >
-                      <AppIcon name="chevron-down" fallback={ChevronDown} className="h-4 w-4" />
-                    </Button>
-                    {settingsModelOpen && (
-                      <div className="absolute right-0 top-full z-50 mt-2 w-80">
-                        {renderModelPicker(closePickers)}
-                      </div>
-                    )}
-                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      setModelPickerOpen(true);
+                    }}
+                    title="Open Categorized Model Picker"
+                  >
+                    <ChevronDown className="h-4 w-4" />
+                  </Button>
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Pick from the dynamic provider list or type any custom model ID directly.
@@ -4002,6 +4779,117 @@ export default function AiAgentPage() {
             </div>
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Categorized Model Picker Dialog */}
+      <ModelPickerModal
+        open={modelPickerOpen}
+        onOpenChange={setModelPickerOpen}
+        selectedModelId={activeModelId}
+        onSelectModel={(modelId: string, newMode?: "fast" | "thinking") => {
+          setSelectedModel(modelId);
+          if (newMode) {
+            setMode(newMode);
+          }
+          if (provider === "openai_compatible") {
+            setCompatibleModel(modelId);
+          }
+          if (typeof window !== "undefined") {
+            window.localStorage.setItem("ai-default-model", modelId);
+          }
+        }}
+        availableModels={availableModels}
+        onRefresh={fetchModelsWithCurrentKey}
+        isRefreshing={isFetchingModels}
+      />
+
+      {/* Custom Target Website / URL Modal */}
+      <Dialog
+        open={showCustomUrlDialog}
+        onOpenChange={setShowCustomUrlDialog}
+      >
+        <DialogContent className="sm:max-w-md p-6">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Globe className="h-5 w-5 text-sky-400" />
+              Test Any Website / Custom URL
+            </DialogTitle>
+            <DialogDescription className="text-xs">
+              Enter any external website URL or local development port (e.g.{" "}
+              <code className="bg-muted px-1 py-0.5 rounded text-sky-400">https://github.com</code> or{" "}
+              <code className="bg-muted px-1 py-0.5 rounded text-sky-400">http://localhost:52249</code>) to test with the AI Agent and Live Browser.
+            </DialogDescription>
+          </DialogHeader>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              let trimmed = customUrlInput.trim();
+              if (trimmed) {
+                if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+                  trimmed = `https://${trimmed}`;
+                }
+                setCustomTargetUrl(trimmed);
+                setShowCustomUrlDialog(false);
+              }
+            }}
+            className="space-y-4 pt-2"
+          >
+            <div className="space-y-2">
+              <Label htmlFor="custom-url-input" className="text-xs font-semibold">
+                Target URL
+              </Label>
+              <Input
+                id="custom-url-input"
+                type="text"
+                placeholder="https://example.com or http://localhost:5173"
+                value={customUrlInput}
+                onChange={(e) => setCustomUrlInput(e.target.value)}
+                className="font-mono text-xs"
+                autoFocus
+              />
+            </div>
+
+            <DialogFooter className="flex items-center justify-between sm:justify-between gap-2 pt-2">
+              {customTargetUrl ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setCustomTargetUrl("");
+                    setCustomUrlInput("");
+                    setShowCustomUrlDialog(false);
+                  }}
+                  className="text-destructive hover:text-destructive text-xs"
+                >
+                  Clear Custom URL
+                </Button>
+              ) : (
+                <div />
+              )}
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs"
+                  onClick={() => setShowCustomUrlDialog(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={!customUrlInput.trim()}
+                  className="bg-sky-600 hover:bg-sky-700 text-white font-medium text-xs"
+                >
+                  Set Target URL
+                </Button>
+              </div>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </>

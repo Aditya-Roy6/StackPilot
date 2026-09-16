@@ -119,17 +119,25 @@ bool shouldSkipContextPath(const std::filesystem::path& path) {
 }
 
 bool shouldIncludeExcerpt(const std::filesystem::path& relativePath) {
-    const std::string name = relativePath.filename().string();
-    const std::string ext = relativePath.extension().string();
+    const std::string name = toLower(relativePath.filename().string());
+    const std::string ext = toLower(relativePath.extension().string());
     static const std::unordered_set<std::string> manifestNames = {
-        "package.json", "requirements.txt", "pyproject.toml", "Pipfile", "poetry.lock",
-        "uv.lock", "environment.yml", "go.mod", "Cargo.toml", "pom.xml",
-        "build.gradle", "build.gradle.kts", "README.md"
+        "package.json", "requirements.txt", "pyproject.toml", "pipfile", "poetry.lock",
+        "uv.lock", "environment.yml", "go.mod", "cargo.toml", "pom.xml",
+        "build.gradle", "build.gradle.kts", "readme.md", "index.html", "index.htm",
+        "vite.config.js", "vite.config.ts", "next.config.js", "next.config.mjs",
+        "angular.json", "app.json", "appsettings.json", "program.cs", "startup.cs",
+        "cmakelists.txt", "makefile", "gemfile", "composer.json"
     };
     if (manifestNames.find(name) != manifestNames.end()) {
         return true;
     }
-    return ext == ".py" || ext == ".js" || ext == ".ts" || ext == ".tsx";
+    static const std::unordered_set<std::string> codeExtensions = {
+        ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".htm", ".css",
+        ".cs", ".csproj", ".sln", ".java", ".kt", ".kts", ".go", ".rs",
+        ".php", ".rb", ".c", ".cpp", ".h", ".hpp", ".sh"
+    };
+    return codeExtensions.find(ext) != codeExtensions.end();
 }
 
 bool hasCommonCodeExtension(const std::filesystem::path& path) {
@@ -173,8 +181,126 @@ bool isSafeTarEntryName(const std::string& rawName) {
 bool isValidDockerfileText(const std::string& dockerfile) {
     const std::string lowered = toLower(dockerfile);
     return lowered.find("from ") != std::string::npos &&
-           lowered.find("copy ") != std::string::npos &&
+           (lowered.find("copy ") != std::string::npos || lowered.find("add ") != std::string::npos || lowered.find("run ") != std::string::npos) &&
            (lowered.find("cmd ") != std::string::npos || lowered.find("entrypoint ") != std::string::npos);
+}
+
+std::string extractDockerfileFromText(const std::string& text) {
+    if (text.empty()) return "";
+    std::regex fenceRegex(R"(```(?:dockerfile|docker)?\s*\n(FROM\s+[\s\S]+?)\n```)", std::regex::icase);
+    std::smatch m;
+    if (std::regex_search(text, m, fenceRegex) && m.size() > 1) {
+        return trim(m[1].str());
+    }
+    std::regex rawRegex(R"((FROM\s+[^\n]+[\s\S]+?(?:CMD|ENTRYPOINT)\s+[^\n]+))", std::regex::icase);
+    if (std::regex_search(text, m, rawRegex) && m.size() > 1) {
+        return trim(m[1].str());
+    }
+    return "";
+}
+
+bool isDockerInstruction(const std::string& line) {
+    std::string trimmed = strings::trim(line);
+    if (trimmed.empty() || trimmed[0] == '#') return true;
+    size_t spacePos = trimmed.find_first_of(" \t");
+    std::string firstWord = toLower(spacePos == std::string::npos ? trimmed : trimmed.substr(0, spacePos));
+    static const std::unordered_set<std::string> instructions = {
+        "from", "run", "cmd", "label", "expose", "env", "add", "copy",
+        "entrypoint", "volume", "user", "workdir", "arg", "onbuild",
+        "stopsignal", "healthcheck", "shell", "maintainer"
+    };
+    return instructions.find(firstWord) != instructions.end();
+}
+
+std::string sanitizeDockerfile(const std::string& raw) {
+    std::string content = raw;
+    std::regex nginxPrintfRegex(R"(RUN\s+printf\s+["']server\s*\{[\s\S]+?\}\s*["']\s*>\s*/etc/nginx/conf\.d/default\.conf)", std::regex::icase);
+    content = std::regex_replace(content, nginxPrintfRegex,
+        "RUN printf 'server {\\n    listen 3000;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html index.htm;\\n    location / {\\n        try_files $uri $uri/ /index.html;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf");
+
+    std::istringstream stream(content);
+    std::string line;
+    std::vector<std::string> lines;
+    while (std::getline(stream, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+
+    for (int i = static_cast<int>(lines.size()) - 1; i >= 0; --i) {
+        std::string trimmed = strings::trim(lines[i]);
+        if (!trimmed.empty()) {
+            while (!lines[i].empty() && (lines[i].back() == '\\' || lines[i].back() == ' ' || lines[i].back() == '\t')) {
+                if (lines[i].back() == '\\') {
+                    lines[i].pop_back();
+                    break;
+                }
+                lines[i].pop_back();
+            }
+            break;
+        }
+    }
+
+    std::vector<std::string> fixedLines;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        std::string current = lines[i];
+        std::string curTrimmed = strings::trim(current);
+        size_t spacePos = curTrimmed.find_first_of(" \t");
+        std::string firstWord = toLower(spacePos == std::string::npos ? curTrimmed : curTrimmed.substr(0, spacePos));
+
+        if (firstWord == "cmd" || firstWord == "entrypoint") {
+            while (!current.empty() && (current.back() == '\\' || current.back() == ' ' || current.back() == '\t')) {
+                if (current.back() == '\\') {
+                    current.pop_back();
+                    break;
+                }
+                current.pop_back();
+            }
+            fixedLines.push_back(current);
+            continue;
+        }
+
+        if (i + 1 < lines.size()) {
+            size_t nextIdx = i + 1;
+            while (nextIdx < lines.size() && strings::trim(lines[nextIdx]).empty()) {
+                ++nextIdx;
+            }
+            if (nextIdx < lines.size()) {
+                const std::string nextTrimmed = strings::trim(lines[nextIdx]);
+                if (!isDockerInstruction(nextTrimmed) && nextTrimmed[0] != '#') {
+                    if (!curTrimmed.empty() && curTrimmed.back() != '\\') {
+                        current += " \\";
+                    }
+                }
+            }
+        }
+
+        fixedLines.push_back(current);
+    }
+
+    std::ostringstream out;
+    for (const auto& l : fixedLines) {
+        out << l << "\n";
+    }
+    return out.str();
+}
+
+bool hasFileWithExtension(const std::filesystem::path& dir, const std::string& ext, int maxDepth = 3) {
+    std::error_code ec;
+    for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
+         it != std::filesystem::recursive_directory_iterator();
+         it.increment(ec)) {
+        if (ec) break;
+        if (it.depth() > maxDepth) {
+            it.pop();
+            continue;
+        }
+        if (it->is_regular_file(ec) && toLower(it->path().extension().string()) == toLower(ext)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string markerValue(const std::string& output, const std::string& marker) {
@@ -908,6 +1034,28 @@ BuildResult BuildService::buildFromRepository(const std::string& deploymentId,
             return result;
         }
     }
+    if (isBuildCanceled(deploymentId)) {
+        if (!askPassPath.empty()) {
+            std::error_code cleanupEc;
+            std::filesystem::remove(askPassPath, cleanupEc);
+            std::filesystem::remove(tokenPath, cleanupEc);
+        }
+        result.error = "Deployment was canceled by user";
+        appendLogLine(logFile, result.error, onLogLine);
+        result.logs = readFileBounded(logFile);
+        return result;
+    }
+
+    if (std::filesystem::exists(sourceDir / ".gitmodules")) {
+        appendLogLine(logFile, "Initializing and updating git submodules...", onLogLine);
+        const std::string submoduleCmd =
+            credentialPrefix + "GIT_TERMINAL_PROMPT=0 git -C " + shellQuote(sourceDir.string()) + " submodule update --init --recursive --depth 1";
+        int subExit = runCommandCapture(submoduleCmd, logFile, true, cloneTimeoutSeconds_, onLogLine, deploymentId);
+        if (subExit != 0 && !isBuildCanceled(deploymentId)) {
+            appendLogLine(logFile, "Warning: Failed to update some git submodules (exit code " + std::to_string(subExit) + "). Proceeding with build...", onLogLine);
+        }
+    }
+
     if (!askPassPath.empty()) {
         std::error_code cleanupEc;
         std::filesystem::remove(askPassPath, cleanupEc);
@@ -2107,10 +2255,25 @@ Json::Value BuildService::collectSourceContext(const std::filesystem::path& sour
     Json::Value context(Json::objectValue);
     Json::Value files(Json::arrayValue);
     Json::Value excerpts(Json::objectValue);
+    Json::Value topLevelDirs(Json::arrayValue);
+
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (entry.is_directory(ec)) {
+            const std::string name = entry.path().filename().string();
+            if (name != ".git" && name != "node_modules" && name != ".next" &&
+                name != "dist" && name != "build" && name != "bin" && name != "obj") {
+                topLevelDirs.append(name);
+            }
+        }
+    }
+    context["top_level_directories"] = topLevelDirs;
 
     int fileCount = 0;
     int excerptCount = 0;
-    std::error_code ec;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(sourceDir, ec)) {
         if (ec) {
             break;
@@ -2124,13 +2287,13 @@ Json::Value BuildService::collectSourceContext(const std::filesystem::path& sour
         }
 
         const std::string rel = relative.generic_string();
-        if (fileCount < 220) {
+        if (fileCount < 500) {
             files.append(rel);
         }
         ++fileCount;
 
-        if (excerptCount < 36 && shouldIncludeExcerpt(relative)) {
-            excerpts[rel] = readFileBounded(entry.path(), 6000);
+        if (excerptCount < 60 && shouldIncludeExcerpt(relative)) {
+            excerpts[rel] = readFileBounded(entry.path(), 8000);
             ++excerptCount;
         }
     }
@@ -2147,7 +2310,7 @@ bool BuildService::tryGenerateDockerfileWithAi(const std::filesystem::path& sour
                                                std::string& reason,
                                                LogCallback onLogLine) const {
     if (!envFlag("STACKPILOT_AI_DOCKERFILE_ENABLED", true)) {
-        reason = "AI Dockerfile generation is disabled";
+        reason = "AI Dockerfile generation is disabled via STACKPILOT_AI_DOCKERFILE_ENABLED";
         return false;
     }
 
@@ -2158,19 +2321,15 @@ bool BuildService::tryGenerateDockerfileWithAi(const std::filesystem::path& sour
     payload["project"]["name"] = sourceDir.filename().string();
     payload["source"] = collectSourceContext(sourceDir);
     payload["message"] =
-        "Read the actual project file tree and excerpts, choose the correct entrypoint, and generate a Dockerfile. "
-        "If there are multiple Python files, infer the most likely runnable entrypoint from names, imports, and README/package context. "
-        "Prefer a deterministic Dockerfile that runs the app or script without requiring manual edits. "
-        "IMPORTANT: The platform will route traffic to port 3000. Your Dockerfile MUST EXPOSE port 3000 and ensure the app listens on port 3000. "
-        "If using nginx, you MUST include a RUN command to change the default port, e.g., RUN sed -i 's/80/3000/g' /etc/nginx/conf.d/default.conf "
-        "CRITICAL ARCHITECTURE RULE: NEVER copy files individually using multiple COPY commands (e.g., do not write 'COPY index.html ...'). "
-        "You MUST copy the entire directory at once using 'COPY . /usr/share/nginx/html/' (for nginx) or 'COPY . /app/' (for Python/Node). "
-        "This is strictly required to prevent Docker build crashes caused by spaces in individual filenames. "
-        "CRITICAL SECURITY RULE: The platform runs all containers as a non-root user (UID 10001). "
-        "If using nginx, you MUST grant non-root permissions by adding this exact command: "
-        "RUN mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp /var/cache/nginx/scgi_temp && chmod -R 777 /var/cache/nginx /var/run /var/log/nginx /etc/nginx";
+        "Inspect the provided project file tree, directory structure, and file excerpts to generate an optimal, production-ready Dockerfile. "
+        "CRITICAL REQUIREMENTS: "
+        "1. Traffic routes to port 3000. Your Dockerfile MUST expose port 3000 and ensure the service listens on port 3000. "
+        "2. For static HTML/CSS/JS sites, use nginx:alpine, configure nginx to listen on port 3000, copy the files to /usr/share/nginx/html, and chmod permissions so non-root user can run. "
+        "3. For monorepos containing both frontend and backend (e.g. .NET backend + React frontend), prioritize building and running the primary runnable backend service or build both stages into one container. "
+        "4. DO NOT use heredocs ('cat << EOF'). Use standard POSIX commands. "
+        "5. Output the complete buildable Dockerfile text.";
 
-    appendLogLine(logFile, "AI Dockerfile generation: scanning source tree and asking AI for a Dockerfile plan...", onLogLine);
+    appendLogLine(logFile, "AI Dockerfile generation: analyzing repository files with AI agent...", onLogLine);
     const auto aiResult = AiServiceClient::instance().postWorkflow("/generate/dockerfile", payload);
     if (!aiResult.ok) {
         reason = aiResult.error.empty() ? "AI Dockerfile generation failed" : aiResult.error;
@@ -2178,12 +2337,31 @@ bool BuildService::tryGenerateDockerfileWithAi(const std::filesystem::path& sour
         return false;
     }
 
+    std::string dockerfile;
     const Json::Value structured = aiResult.body.isMember("structured_output")
         ? aiResult.body["structured_output"]
         : Json::Value(Json::objectValue);
-    const std::string dockerfile = structured.isMember("dockerfile") && structured["dockerfile"].isString()
-        ? structured["dockerfile"].asString()
-        : "";
+    if (structured.isMember("dockerfile") && structured["dockerfile"].isString()) {
+        dockerfile = structured["dockerfile"].asString();
+    }
+    if (!isValidDockerfileText(dockerfile)) {
+        if (aiResult.body.isMember("summary") && aiResult.body["summary"].isString()) {
+            dockerfile = extractDockerfileFromText(aiResult.body["summary"].asString());
+        }
+    }
+    if (!isValidDockerfileText(dockerfile)) {
+        if (aiResult.body.isMember("content") && aiResult.body["content"].isString()) {
+            dockerfile = extractDockerfileFromText(aiResult.body["content"].asString());
+        }
+    }
+    if (!isValidDockerfileText(dockerfile)) {
+        if (aiResult.body.isMember("raw") && aiResult.body["raw"].isString()) {
+            dockerfile = extractDockerfileFromText(aiResult.body["raw"].asString());
+        }
+    }
+
+    dockerfile = sanitizeDockerfile(dockerfile);
+
     if (!isValidDockerfileText(dockerfile)) {
         reason = "AI did not return a valid Dockerfile";
         appendLogLine(logFile, reason + "; falling back to deterministic generator.", onLogLine);
@@ -2246,25 +2424,35 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         }
     }
 
-    // 2. Check for Windows Desktop Executables (.exe / .msi / .sln / .vcxproj / .csproj)
+    // 2. Check for Windows Desktop Executables (.exe / .msi)
     bool hasWinExe = false;
-    bool hasWinSln = false;
     for (const auto& entry : std::filesystem::directory_iterator(sourceDir, ec)) {
         if (ec) break;
         const std::string ext = entry.path().extension().string();
         if (ext == ".exe" || ext == ".msi") {
             hasWinExe = true;
-        } else if (ext == ".sln" || ext == ".vcxproj" || ext == ".csproj") {
-            hasWinSln = true;
+            break;
         }
     }
-    if ((hasWinExe || hasWinSln) && !hasFile(sourceDir, "Dockerfile") && !hasFile(sourceDir, "package.json")) {
+    if (hasWinExe && !hasFile(sourceDir, "Dockerfile") && !hasFile(sourceDir, "package.json")) {
         arch.type = "windows_desktop_exe";
-        arch.displayName = "Windows Desktop Executable (.exe / .NET / Win32)";
+        arch.displayName = "Windows Desktop Executable (.exe / Win32)";
         arch.isDeployable = true;
         arch.requiresDiversion = true;
         arch.suggestedStrategy = "wine_novnc_web_stream";
         arch.details = "Detected a Windows executable or desktop application. StackPilot generates a containerized Wine virtual desktop with an interactive HTML5 web stream on port 3000.";
+        return arch;
+    }
+
+    // 2.5 Check for .NET / C# Web Application (.sln / .csproj)
+    bool hasDotNet = hasFileWithExtension(sourceDir, ".sln") || hasFileWithExtension(sourceDir, ".csproj") ||
+                     hasFile(sourceDir, "Backend_MVC_DotNet8");
+    if (hasDotNet && !hasFile(sourceDir, "Dockerfile")) {
+        arch.type = "dotnet_web";
+        arch.displayName = ".NET 8 / ASP.NET Web Application";
+        arch.isDeployable = true;
+        arch.suggestedStrategy = "dotnet_sdk_aspnet_container";
+        arch.details = "Detected a .NET 8 / C# application. StackPilot packages the service using Microsoft .NET 8 SDK and ASP.NET Core runtime on port 3000.";
         return arch;
     }
 
@@ -2295,7 +2483,11 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
     // 4. Check for Native Android Application (Gradle / Manifest)
     bool isAndroidApp = hasFile(sourceDir, "AndroidManifest.xml") ||
                         hasFile(sourceDir / "app" / "src" / "main", "AndroidManifest.xml") ||
-                        hasFile(sourceDir / "src" / "main", "AndroidManifest.xml");
+                        hasFile(sourceDir / "src" / "main", "AndroidManifest.xml") ||
+                        hasFile(sourceDir / "androidApp" / "src" / "main", "AndroidManifest.xml") ||
+                        hasFile(sourceDir / "androidApp", "build.gradle.kts") ||
+                        hasFile(sourceDir / "androidApp", "build.gradle") ||
+                        hasFile(sourceDir, "build_and_sign_apk.sh");
     std::string androidBundleId;
     std::string androidSdkVersion;
 
@@ -2310,12 +2502,20 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
         } else if (hasFile(sourceDir / "app", "build.gradle")) {
             std::ifstream in(sourceDir / "app" / "build.gradle");
             bgContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir / "androidApp", "build.gradle.kts")) {
+            std::ifstream in(sourceDir / "androidApp" / "build.gradle.kts");
+            bgContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir / "androidApp", "build.gradle")) {
+            std::ifstream in(sourceDir / "androidApp" / "build.gradle");
+            bgContent.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         }
 
         if (bgContent.find("com.android.application") != std::string::npos ||
             bgContent.find("com.android.library") != std::string::npos ||
             bgContent.find("apply plugin: 'android'") != std::string::npos ||
             bgContent.find("apply plugin: \"android\"") != std::string::npos ||
+            bgContent.find("plugins.android") != std::string::npos ||
+            bgContent.find("libs.plugins.android") != std::string::npos ||
             bgContent.find("android {") != std::string::npos) {
             isAndroidApp = true;
         }
@@ -2334,6 +2534,40 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
                 androidSdkVersion = "API " + m[1].str();
             }
         }
+    }
+
+    // 4.5 Check for Compose Multiplatform / Desktop Application (JVM / Compose Desktop)
+    bool isComposeDesktop = hasFile(sourceDir, "desktopApp") ||
+                            hasFile(sourceDir / "desktopApp", "build.gradle.kts") ||
+                            hasFile(sourceDir / "desktopApp", "build.gradle") ||
+                            hasFile(sourceDir, "conveyor.conf");
+    if (!isComposeDesktop && (hasFile(sourceDir, "build.gradle.kts") || hasFile(sourceDir, "build.gradle"))) {
+        std::string bgKts;
+        if (hasFile(sourceDir, "build.gradle.kts")) {
+            std::ifstream in(sourceDir / "build.gradle.kts");
+            bgKts.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        } else if (hasFile(sourceDir, "build.gradle")) {
+            std::ifstream in(sourceDir / "build.gradle");
+            bgKts.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        }
+        if (bgKts.find("compose.multiplatform") != std::string::npos ||
+            bgKts.find("compose.desktop") != std::string::npos ||
+            bgKts.find("org.jetbrains.compose") != std::string::npos ||
+            bgKts.find("desktopApp") != std::string::npos ||
+            bgKts.find("javafx") != std::string::npos ||
+            bgKts.find("openjfx") != std::string::npos) {
+            isComposeDesktop = true;
+        }
+    }
+
+    if (isComposeDesktop && !hasFile(sourceDir, "Dockerfile")) {
+        arch.type = "desktop_compose_gui";
+        arch.displayName = "Compose Multiplatform / Desktop Application";
+        arch.isDeployable = true;
+        arch.requiresDiversion = true;
+        arch.suggestedStrategy = "desktop_novnc_web_stream";
+        arch.details = "Detected a Compose Multiplatform / Desktop application. StackPilot compiles the desktop target and streams the UI over an interactive HTML5 virtual desktop on port 3000.";
+        return arch;
     }
 
     if (isAndroidApp && !hasFile(sourceDir, "package.json") && !hasFile(sourceDir, "requirements.txt") && !hasFile(sourceDir, "Dockerfile")) {
@@ -2378,18 +2612,25 @@ RepositoryArchetype BuildService::classifyRepositoryArchetype(const std::filesys
             isJavaWeb = true;
         }
 
-        if (isJavaWeb) {
+        bool hasApplicationEntry = (buildContent.find("mainClass") != std::string::npos ||
+                                    buildContent.find("application") != std::string::npos ||
+                                    buildContent.find("fun main") != std::string::npos ||
+                                    buildContent.find("public static void main") != std::string::npos ||
+                                    hasFile(sourceDir, "gradlew") ||
+                                    hasFile(sourceDir, "mvnw"));
+
+        if (isJavaWeb || hasApplicationEntry) {
             arch.type = "java_web";
-            arch.displayName = "Java Web Application (Spring Boot / Maven / Gradle)";
+            arch.displayName = isJavaWeb ? "Java Web Application (Spring Boot / Maven / Gradle)" : "Java / Kotlin Application (Gradle / Maven)";
             arch.isDeployable = true;
             arch.suggestedStrategy = "java_temurin_container";
-            arch.details = "Detected a Java web application (Spring Boot / Maven / Gradle). StackPilot packages the service using Eclipse Temurin Java 21 LTS runtime with port 3000.";
+            arch.details = "Detected a Java/Kotlin application (Spring Boot / Maven / Gradle). StackPilot packages the service using Eclipse Temurin Java 21 LTS runtime on port 3000.";
             return arch;
         } else if (!hasFile(sourceDir, "Dockerfile")) {
             arch.type = "library";
             arch.displayName = "Java Library / SDK";
             arch.isDeployable = false;
-            arch.details = "Detected a Java library or package without an embedded HTTP server (e.g. Spring Boot Web, Quarkus, Micronaut). Pure libraries cannot be run as long-running web services.";
+            arch.details = "Detected a Java library or package without a runnable entrypoint. Pure libraries cannot be run as long-running web services. Add a Dockerfile or runnable entrypoint to deploy.";
             return arch;
         }
     }
@@ -2540,7 +2781,17 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
         return true;
     }
 
-    // Run Archetype Pre-Flight Classification
+    // 1. Pass the whole project to the AI Agent FIRST to develop the Dockerfile
+    appendLogLine(logFile, "🤖 [AI Agent Auto-Detect] No Dockerfile found in repository. Passing project tree to AI agent...", onLogLine);
+    std::string aiReason;
+    if (tryGenerateDockerfileWithAi(sourceDir, logFile, aiReason, onLogLine)) {
+        appendLogLine(logFile, "✅ [AI Agent Auto-Detect] Dockerfile developed and verified. Continuing deployment build...", onLogLine);
+        return true;
+    }
+
+    appendLogLine(logFile, "⚠️ AI Dockerfile generation could not complete (" + aiReason + "). Falling back to deterministic archetype engine...", onLogLine);
+
+    // 2. Run Archetype Pre-Flight Classification
     const RepositoryArchetype archetype = classifyRepositoryArchetype(sourceDir);
     if (!archetype.isDeployable) {
         appendLogLine(logFile, "============================================================", onLogLine);
@@ -2587,6 +2838,25 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
             "RUN printf 'import http.server, socketserver, os, glob\\nPORT = 3000\\nclass H(http.server.SimpleHTTPRequestHandler):\\n    def do_GET(self):\\n        apks = glob.glob(\"/app/**/*.apk\", recursive=True)\\n        apk = apks[0] if apks else \"\"\\n        apk_name = os.path.basename(apk) if apk else \"app-debug.apk\"\\n        if self.path == \"/\" or self.path == \"/index.html\":\\n            self.send_response(200)\\n            self.send_header(\"Content-type\", \"text/html; charset=utf-8\")\\n            self.end_headers()\\n            host = self.headers.get(\"Host\", f\"localhost:{PORT}\")\\n            dl_url = f\"http://{host}/{apk_name}\"\\n            qr_api = f\"https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={dl_url}&bgcolor=18181b&color=38bdf8&margin=1\"\\n            html = f\"\"\"<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Android APK Install</title><style>body{{font-family:system-ui,sans-serif;background:#09090b;color:#f4f4f5;text-align:center;padding:40px 16px;margin:0;}} .card{{background:#18181b;max-width:440px;margin:0 auto;padding:32px;border-radius:20px;border:1px solid #27272a;box-shadow:0 20px 40px rgba(0,0,0,0.6);}} h1{{font-size:22px;margin:0 0 8px;}} p{{color:#a1a1aa;font-size:13px;line-height:1.5;}} .btn{{display:inline-block;background:#38bdf8;color:#09090b;padding:12px 28px;font-weight:700;border-radius:10px;text-decoration:none;margin-top:20px;transition:0.2s;}} .qr{{background:#18181b;padding:12px;border-radius:16px;display:inline-block;margin:16px 0;border:1px solid #38bdf840;}}</style></head><body><div class=\"card\"><h1>Android Application Ready</h1><p>Scan the QR code with your physical Android phone camera to download and install this application instantly over WiFi.</p><div class=\"qr\"><img src=\"{qr_api}\" width=\"220\" height=\"220\" alt=\"QR Code\" /></div><br><a href=\"/{apk_name}\" class=\"btn\" download>Download APK ({apk_name})</a></div></body></html>\"\"\"\\n            self.wfile.write(html.encode(\"utf-8\"))\\n        else:\\n            super().do_GET()\\nwith socketserver.TCPServer((\"\", PORT), H) as s:\\n    print(f\"Android Portal serving on {PORT}\")\\n    s.serve_forever()\\n' > /app/portal.py\n"
             "EXPOSE 3000\n"
             "CMD [\"python\", \"/app/portal.py\"]\n";
+    } else if (archetype.type == "desktop_compose_gui") {
+        appendLogLine(logFile, "🖥️ [Archetype Engine] " + archetype.displayName + " detected.", onLogLine);
+        appendLogLine(logFile, "⚡ [Desktop Stream] Auto-generating Eclipse Temurin 21 + Xvfb HTML5 web desktop on port 3000...", onLogLine);
+        generated =
+            "FROM eclipse-temurin:21-jdk AS builder\n"
+            "WORKDIR /app\n"
+            "COPY . .\n"
+            "RUN if [ -f gradlew ]; then chmod +x gradlew && (./gradlew desktopApp:jar || ./gradlew jar || ./gradlew build -x test || ./gradlew assemble || true); fi\n\n"
+            "FROM ubuntu:22.04\n"
+            "ENV DEBIAN_FRONTEND=noninteractive DISPLAY=:99\n"
+            "RUN apt-get update && apt-get install -y --no-install-recommends \\\n"
+            "    ca-certificates curl xvfb openbox x11vnc novnc websockify supervisor openjdk-21-jre fonts-dejavu-core net-tools \\\n"
+            "    && rm -rf /var/lib/apt/lists/*\n"
+            "WORKDIR /app\n"
+            "COPY --from=builder /app /app\n"
+            "RUN mkdir -p /etc/supervisor/conf.d\n"
+            "RUN printf '[supervisord]\\nnodaemon=true\\n\\n[program:xvfb]\\ncommand=Xvfb :99 -screen 0 1280x720x24 -ac +extension GLX +render -noreset\\npriority=100\\nautorestart=true\\n\\n[program:openbox]\\ncommand=openbox-session\\nenvironment=DISPLAY=\":99\"\\npriority=200\\nautorestart=true\\n\\n[program:x11vnc]\\ncommand=x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -listen 127.0.0.1\\npriority=300\\nautorestart=true\\n\\n[program:websockify]\\ncommand=websockify --web /usr/share/novnc 3000 localhost:5900\\npriority=400\\nautorestart=true\\n\\n[program:app]\\ncommand=/bin/bash -c \"sleep 3; jar=$(find /app -name \\'*.jar\\' | grep -v \\'plain\\' | head -n1); if [ -n \\\"$jar\\\" ]; then exec java -jar \\\"$jar\\\"; else exec sleep infinity; fi\"\\nenvironment=DISPLAY=\":99\"\\npriority=500\\nautorestart=false\\n' > /etc/supervisor/conf.d/supervisord.conf\n"
+            "EXPOSE 3000\n"
+            "CMD [\"/usr/bin/supervisord\", \"-c\", \"/etc/supervisor/conf.d/supervisord.conf\"]\n";
     } else if (archetype.type == "expo_react_native") {
         appendLogLine(logFile, "📱 [Archetype Pre-Flight Check] " + archetype.displayName + " detected.", onLogLine);
         appendLogLine(logFile, "⚡ [Smart Diversion] Auto-generating Expo Web PWA container preview on port 3000...", onLogLine);
@@ -2620,6 +2890,34 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
             "RUN mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp /var/cache/nginx/scgi_temp && chmod -R 777 /var/cache/nginx /var/run /var/log/nginx /etc/nginx\n"
             "EXPOSE 3000\n"
             "CMD [\"nginx\", \"-g\", \"daemon off;\"]\n";
+    } else if (hasFile(sourceDir, "index.html") || hasFileWithExtension(sourceDir, ".html")) {
+        appendLogLine(logFile, "🌐 [Archetype Engine] Static HTML/CSS/JS site detected. Generating Nginx container on port 3000...", onLogLine);
+        generated =
+            "FROM nginx:alpine\n"
+            "WORKDIR /usr/share/nginx/html\n"
+            "COPY . /usr/share/nginx/html/\n"
+            "RUN printf 'server {\\n    listen 3000;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html index.htm;\\n    location / {\\n        try_files $uri $uri/ /index.html =404;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf\n"
+            "RUN mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp /var/cache/nginx/scgi_temp && chmod -R 777 /var/cache/nginx /var/run /var/log/nginx /etc/nginx\n"
+            "EXPOSE 3000\n"
+            "CMD [\"nginx\", \"-g\", \"daemon off;\"]\n";
+    } else if (hasFileWithExtension(sourceDir, ".sln") || hasFileWithExtension(sourceDir, ".csproj") ||
+               hasFile(sourceDir, "Backend_MVC_DotNet8")) {
+        appendLogLine(logFile, "🔷 [Archetype Engine] .NET 8 / C# application detected. Generating multi-stage SDK & ASP.NET container on port 3000...", onLogLine);
+        generated =
+            "FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build\n"
+            "WORKDIR /src\n"
+            "COPY . .\n"
+            "RUN proj=$(find . -name '*.csproj' ! -iname '*test*' | head -n1); \\\n"
+            "    if [ -z \"$proj\" ]; then proj=$(find . -name '*.csproj' | head -n1); fi; \\\n"
+            "    if [ -z \"$proj\" ]; then echo \"No .csproj found\"; exit 1; fi; \\\n"
+            "    dotnet restore \"$proj\" && dotnet publish \"$proj\" -c Release -o /app/publish /p:UseAppHost=false\n\n"
+            "FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS final\n"
+            "WORKDIR /app\n"
+            "COPY --from=build /app/publish .\n"
+            "ENV ASPNETCORE_URLS=http://+:3000\n"
+            "ENV PORT=3000\n"
+            "EXPOSE 3000\n"
+            "CMD [\"sh\", \"-c\", \"cfg=$(find /app -maxdepth 1 -name '*.runtimeconfig.json' ! -iname '*test*' | head -n1); if test -n \\\"$cfg\\\"; then dll=\\\"\\${cfg%.runtimeconfig.json}.dll\\\"; else dll=$(find /app -maxdepth 1 -name '*.dll' ! -name 'Microsoft.*' ! -name 'System.*' ! -name 'Azure.*' ! -iname '*test*' | head -n1); fi; exec dotnet \\\"$dll\\\"\"]\n";
     } else if (hasFile(sourceDir, "package.json")) {
         const std::filesystem::path packageJsonPath = sourceDir / "package.json";
         Json::Value packageJson;
@@ -2681,8 +2979,9 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
                 "RUN if [ ! -d /usr/share/nginx/html ] || [ -z \"$(ls -A /usr/share/nginx/html 2>/dev/null)\" ]; then \\\n"
                 "      cp -r /app/build/* /usr/share/nginx/html/ 2>/dev/null || true; \\\n"
                 "    fi\n"
-                "RUN printf 'server {\\n    listen 80;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html;\\n    location / {\\n        try_files $uri $uri/ /index.html;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf\n"
-                "EXPOSE 80\n"
+                "RUN printf 'server {\\n    listen 3000;\\n    server_name localhost;\\n    root /usr/share/nginx/html;\\n    index index.html;\\n    location / {\\n        try_files $uri $uri/ /index.html;\\n    }\\n}\\n' > /etc/nginx/conf.d/default.conf\n"
+                "RUN mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp /var/cache/nginx/scgi_temp && chmod -R 777 /var/cache/nginx /var/run /var/log/nginx /etc/nginx\n"
+                "EXPOSE 3000\n"
                 "CMD [\"nginx\", \"-g\", \"daemon off;\"]\n";
         } else {
             generated =
@@ -2764,22 +3063,16 @@ bool BuildService::ensureDockerfile(const std::filesystem::path& sourceDir,
             "FROM eclipse-temurin:21-jdk AS build\n"
             "WORKDIR /src\n"
             "COPY . .\n"
-            "RUN if [ -f mvnw ]; then chmod +x mvnw && ./mvnw -DskipTests package; elif [ -f pom.xml ]; then apt-get update && apt-get install -y maven && mvn -DskipTests package; elif [ -f gradlew ]; then chmod +x gradlew && ./gradlew build -x test; else apt-get update && apt-get install -y gradle && gradle build -x test; fi\n"
+            "RUN if [ -f mvnw ]; then chmod +x mvnw && ./mvnw -DskipTests package; elif [ -f pom.xml ]; then apt-get update && apt-get install -y maven && mvn -DskipTests package; elif [ -f gradlew ]; then chmod +x gradlew && (./gradlew build -x test || ./gradlew desktopApp:jar || ./gradlew jar || ./gradlew assemble || true); else apt-get update && apt-get install -y gradle && gradle build -x test; fi\n"
             "FROM eclipse-temurin:21-jre\n"
             "WORKDIR /app\n"
             "COPY --from=build /src .\n"
             "ENV PORT=3000\n"
             "ENV SERVER_PORT=3000\n"
             "EXPOSE 3000\n"
-            "CMD [\"/bin/sh\", \"-c\", \"jar=$(find . -path '*/target/*.jar' -o -path '*/build/libs/*.jar' | grep -v plain | head -n1); [ -n \\\"$jar\\\" ] || { echo 'No runnable jar found'; exit 1; }; exec java -jar \\\"$jar\\\"\"]\n";
+            "CMD [\"/bin/sh\", \"-c\", \"jar=$(find . -path '*/target/*.jar' -o -path '*/build/libs/*.jar' -o -name '*.jar' | grep -v plain | head -n1); [ -n \\\"$jar\\\" ] || { echo 'No runnable jar found'; exit 1; }; exec java -jar \\\"$jar\\\"\"]\n";
     } else {
-        appendLogLine(logFile, "Deterministic generator could not classify this source tree. Trying AI Dockerfile fallback.", onLogLine);
-        if (tryGenerateDockerfileWithAi(sourceDir, logFile, reason, onLogLine)) {
-            return true;
-        }
-        reason = reason.empty()
-            ? "No Dockerfile found and project type could not be auto-detected"
-            : "No deterministic Dockerfile generator matched this project, and AI fallback failed: " + reason;
+        reason = "No Dockerfile found, AI generation failed (" + aiReason + "), and project type could not be auto-detected";
         return false;
     }
 

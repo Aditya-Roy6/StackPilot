@@ -10,7 +10,7 @@ import { AppIcon } from "@/lib/custom-icons";
 import { Button } from "@/components/ui/button";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { MobileSimulatorDialog } from "@/components/deployments/MobileSimulatorDialog";
-import { AiSreSelfHealingDialog } from "@/components/deployments/AiSreSelfHealingDialog";
+
 import {
   Area,
   AreaChart,
@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Tooltip as AppTooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { AnimatedStreamingText } from "@/components/ui/animated-streaming-text";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
@@ -569,7 +570,6 @@ export default function DeploymentsPage() {
   const [metricsDeployment, setMetricsDeployment] = useState<Deployment | null>(null);
   const [deleteDeployment, setDeleteDeployment] = useState<Deployment | null>(null);
   const [mobileSimulatorDeployment, setMobileSimulatorDeployment] = useState<Deployment | null>(null);
-  const [sreRepairDeployment, setSreRepairDeployment] = useState<Deployment | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isFilterDialogOpen, setIsFilterDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -577,6 +577,7 @@ export default function DeploymentsPage() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(5);
   const shownPortAdjustmentToasts = useRef<Set<string>>(new Set());
+  const shownHealedToasts = useRef<Set<string>>(new Set());
   const queryClient = useQueryClient();
 
   const { data, isLoading, refetch } = useQuery({
@@ -598,6 +599,22 @@ export default function DeploymentsPage() {
   });
 
   const deployments: Deployment[] = useMemo(() => data?.deployments || [], [data?.deployments]);
+
+  useEffect(() => {
+    if (deployments.length > 0) {
+      for (const dep of deployments) {
+        if (dep.trigger_source === "ai_repair" && dep.status === "running") {
+          const key = `${dep.id}:healed`;
+          if (!shownHealedToasts.current.has(key)) {
+            shownHealedToasts.current.add(key);
+            toast.success("Deployment successful and deployed", {
+              description: `${deploymentDisplayName(dep)} was automatically repaired and is now live!`,
+            });
+          }
+        }
+      }
+    }
+  }, [deployments]);
   const activeFilterCount = filters.statuses.length + filters.runtimes.length;
   const normalizedSearchQuery = searchQuery.trim().toLowerCase();
   const filteredDeployments = useMemo(() => {
@@ -732,6 +749,7 @@ export default function DeploymentsPage() {
           };
         }
       );
+      queryClient.invalidateQueries({ queryKey: ["deployments"] });
       queryClient.removeQueries({ queryKey: ["deployment-logs", deploymentId] });
       queryClient.removeQueries({ queryKey: ["kubernetes-status", deploymentId] });
       queryClient.removeQueries({ queryKey: ["deployment-metrics", deploymentId] });
@@ -777,6 +795,15 @@ export default function DeploymentsPage() {
 
           if (message.type === "deployment_update" && message.deployment) {
             const deployment = message.deployment as Deployment;
+            if (deployment.trigger_source === "ai_repair" && deployment.status === "running") {
+              const healedKey = `${deployment.id}:healed`;
+              if (!shownHealedToasts.current.has(healedKey)) {
+                shownHealedToasts.current.add(healedKey);
+                toast.success("Deployment successful and deployed", {
+                  description: "AI SRE auto-healing completed successfully",
+                });
+              }
+            }
             for (const adjustment of portAdjustmentMessages(deployment)) {
               const toastKey = `${deployment.id}:${adjustment.id}`;
               if (!shownPortAdjustmentToasts.current.has(toastKey)) {
@@ -886,7 +913,7 @@ export default function DeploymentsPage() {
             Complete history of your application builds and deployments.
           </p>
         </div>
-        <div className="flex flex-col items-stretch gap-2 sm:items-end">
+        <div className="flex flex-row items-center gap-2">
           <Button
             variant="outline"
             onClick={() => refetch()}
@@ -1094,17 +1121,11 @@ export default function DeploymentsPage() {
                     <TableCell className="px-6 py-4 whitespace-nowrap">
                       <div className="ml-auto w-max max-w-full overflow-x-auto">
                         <div className="flex w-max items-center justify-end gap-2 whitespace-nowrap pb-1">
-                        {dep.status === "failed" && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => setSreRepairDeployment(dep)}
-                            className="shrink-0 gap-1.5 border-primary/40 bg-primary/10 text-primary hover:bg-primary/20"
-                            title="Open AI SRE Root Cause Diagnosis & Self-Healing"
-                          >
-                            <AppIcon name="wand2" fallback={Wand2} className="h-4 w-4"  />
-                            AI SRE Heal
-                          </Button>
+                        {dep.trigger_source === "ai_repair" && (dep.status === "queued" || dep.status === "building") && (
+                          <span className="flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/5 px-2.5 py-1 text-xs font-medium text-primary">
+                            <AppIcon name="loader2" fallback={Loader2} className="h-3 w-3 animate-spin" />
+                            Auto-Healing
+                          </span>
                         )}
                         {isMobileDeployment(dep) && (
                           <Button
@@ -1309,12 +1330,6 @@ export default function DeploymentsPage() {
         runtimeUrl={mobileSimulatorDeployment ? deploymentRuntimeUrl(mobileSimulatorDeployment) : ""}
         archetype={mobileSimulatorDeployment?.runtime_snapshot?.archetype}
         deploymentId={mobileSimulatorDeployment?.id}
-      />
-
-      <AiSreSelfHealingDialog
-        open={!!sreRepairDeployment}
-        onClose={() => setSreRepairDeployment(null)}
-        deployment={sreRepairDeployment}
       />
     </div>
   );
@@ -1728,90 +1743,84 @@ function DeploymentLogsDialog({
   return (
     <Dialog open={!!deploymentId} onOpenChange={(open) => !open && onClose()}>
       <DialogContent 
+        showCloseButton={false}
         className={cn(
-          "flex flex-col p-0 overflow-hidden border-border bg-card shadow-2xl transition-all duration-500 ease-in-out",
+          "flex flex-col p-0 overflow-hidden border border-zinc-800 bg-[#0c0c0c] text-[#cccccc] shadow-2xl transition-all duration-300 ease-in-out rounded-md",
           isExpanded 
-            ? "!max-w-[98vw] sm:!max-w-[98vw] !w-[98vw] h-[95vh] rounded-xl" 
-            : "!max-w-[95vw] sm:!max-w-5xl !w-[95vw] sm:!w-auto h-[80vh] rounded-xl"
+            ? "!max-w-[96vw] sm:!max-w-[96vw] !w-[96vw] h-[92vh]" 
+            : "!max-w-[95vw] sm:!max-w-4xl !w-[95vw] sm:!w-auto max-h-[85vh] h-auto min-h-[260px]"
         )}
       >
-        <DialogHeader className="p-6 border-b border-border bg-card relative">
-          <div className="flex items-center justify-between">
-            <div className="space-y-1">
-              <DialogTitle className="text-xl font-bold text-foreground flex items-center gap-2">
-                <AppIcon name="terminal" fallback={Terminal} className="w-5 h-5 text-primary"  />
-                Build Logs
-              </DialogTitle>
-              <DialogDescription className="text-muted-foreground font-medium flex flex-wrap items-center gap-2">
-                Deployment ID: <span className="font-mono text-xs">{deploymentId}</span>
-                <span className="w-1 h-1 rounded-full bg-muted-foreground/40" />
-                Branch: <span className="font-mono text-xs">{initialDeployment?.branch || "-"}</span>
-                <span className="w-1 h-1 rounded-full bg-muted-foreground/40" />
-                Commit:{" "}
-                {logCommitUrl ? (
-                  <a
-                    href={logCommitUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 font-mono text-xs text-primary hover:underline"
-                    title={logCommitSha}
-                  >
-                    {shortCommit(logCommitSha)}
-                    <AppIcon name="external-link" fallback={ExternalLink} className="h-3 w-3"  />
-                  </a>
-                ) : (
-                  <span className="font-mono text-xs">{logCommitSha ? shortCommit(logCommitSha) : "-"}</span>
-                )}
-                <span className="w-1 h-1 rounded-full bg-muted-foreground/40" />
-                Status: 
-                <span className={cn(
-                  "capitalize px-2 py-0.5 rounded text-xs font-semibold",
-                  displayStatus === 'built' ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400" :
-                  displayStatus === 'failed' ? "bg-destructive/10 text-destructive" :
-                  "bg-primary/10 text-primary"
-                )}>
-                  {displayStatus}
-                </span>
-              </DialogDescription>
-            </div>
-            
-            <AppTooltip>
-              <TooltipTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => setIsExpanded(!isExpanded)}
-                    className="absolute top-4 right-12 z-50 h-8 w-8 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  >
-                    {isExpanded ? <AppIcon name="minimize2" fallback={Minimize2} className="w-4 h-4"  /> : <AppIcon name="maximize2" fallback={Maximize2} className="w-4 h-4"  />}
-                  </Button>
-                }
-              />
-              <TooltipContent side="top">{isExpanded ? "Shrink" : "Expand"}</TooltipContent>
-            </AppTooltip>
+        <div className="h-8 border-b border-zinc-800 bg-[#18181b] px-2 flex items-center justify-between select-none shrink-0">
+          <div className="flex min-w-0 items-center gap-2 text-xs text-white/90">
+            <svg className="h-3.5 w-3.5 shrink-0 text-sky-400" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M1.5 2A1.5 1.5 0 0 0 0 3.5v9A1.5 1.5 0 0 0 1.5 14h13a1.5 1.5 0 0 0 1.5-1.5v-9A1.5 1.5 0 0 0 14.5 2h-13zm0 1h13a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-13a.5.5 0 0 1-.5-.5v-9a.5.5 0 0 1 .5-.5z"/>
+              <path d="m3.854 5.146 2.5 2.5a.5.5 0 0 1 0 .708l-2.5 2.5a.5.5 0 0 1-.708-.708L5.293 8 3.146 5.854a.5.5 0 1 1 .708-.708zm3 5.5a.5.5 0 0 1 .5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5z"/>
+            </svg>
+            <span className="font-normal font-sans text-xs text-white/90 truncate">
+              Windows PowerShell - Deployments: {deploymentId.slice(0, 8)} ({displayStatus})
+            </span>
           </div>
-        </DialogHeader>
+
+          {/* Windows-style Header caption controls: Maximize and Close */}
+          <div className="flex shrink-0 items-center h-full">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="h-full w-10 rounded-none text-white/70 hover:bg-white/10 hover:text-white"
+              title={isExpanded ? "Restore" : "Maximize"}
+            >
+              {isExpanded ? (
+                <span className="text-xs font-mono select-none">❐</span>
+              ) : (
+                <span className="text-xs font-mono select-none">□</span>
+              )}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={onClose}
+              className="h-full w-10 rounded-none text-white/70 hover:bg-[#e81123] hover:text-white transition-colors"
+              title="Close"
+            >
+              <span className="text-xs font-mono select-none">✕</span>
+            </Button>
+          </div>
+        </div>
         
-        <div className="relative flex-1 min-h-0 flex flex-col">
+        <div className="relative flex-1 min-h-0 flex flex-col bg-[#0c0c0c]">
           <div 
             ref={scrollRef}
             onScroll={handleScroll}
-            className="flex-1 overflow-y-auto p-6 font-mono text-[13px] leading-relaxed bg-background text-foreground border-t border-border scrollbar-thin"
+            className={cn(
+              "overflow-y-auto px-4 py-2.5 font-mono text-[13px] font-normal leading-relaxed bg-[#0c0c0c] text-[#cccccc] scrollbar-thin select-text",
+              isExpanded ? "flex-1" : "max-h-[55vh] min-h-[140px]"
+            )}
           >
-            <pre className="whitespace-pre-wrap break-all">
-              {displayLogs || (
+            <div className="mb-2 text-[#cccccc] text-xs font-normal select-none leading-relaxed">
+              Windows PowerShell<br />
+              Copyright (C) Microsoft Corporation. All rights reserved.<br />
+              <br />
+              PS C:\stackpilot\deployments\{deploymentId.slice(0, 8)}&gt; (streaming build logs...)
+            </div>
+            <pre className="whitespace-pre-wrap break-all text-[#cccccc] font-mono font-normal m-0 p-0 leading-relaxed">
+              {displayLogs ? (
+                displayLogs
+              ) : (
                 displayStatus === "queued"
                   ? "Build is queued. A background worker will start it shortly."
                   : displayStatus === "pending"
-                  ? "Build has not started yet.\nClick Start build to clone the repository and build the Docker image."
+                  ? "Build has not started yet.\nClick 'Start build' to clone the repository and build the Docker image."
                   : "Initializing build engine...\nConnecting to logs stream..."
               )}
               {displayStatus === "failed" && displayLogs && !hasCapturedFailureReason
                 ? "\n\nThis failed build does not include a complete failure summary. Re-run it to capture the exact exit code or timeout reason."
                 : ""}
-              {(displayStatus === 'building' || displayStatus === 'queued') && (
-                <span className="inline-block w-2 h-4 ml-1 bg-primary animate-pulse align-middle" />
+              {(displayStatus === 'building' || displayStatus === 'queued' || displayStatus === 'running') && (
+                <span className="inline-block w-2 h-4 ml-1 bg-white animate-pulse align-middle" />
               )}
             </pre>
           </div>
@@ -1821,7 +1830,7 @@ function DeploymentLogsDialog({
               variant="secondary"
               size="sm"
               onClick={scrollToBottom}
-              className="absolute bottom-4 right-6 shadow-lg border border-border bg-background/95 hover:bg-muted text-xs gap-1.5 backdrop-blur-sm z-10 animate-in fade-in"
+              className="absolute bottom-3 right-5 shadow-lg border border-zinc-700 bg-zinc-900/90 hover:bg-zinc-800 text-zinc-100 text-xs gap-1.5 backdrop-blur-sm z-10 animate-in fade-in"
             >
               <AppIcon name="arrow-down" fallback={ArrowDown} className="h-3.5 w-3.5" />
               Scroll to bottom
@@ -1830,70 +1839,72 @@ function DeploymentLogsDialog({
         </div>
 
         {buildAnalysis && (
-          <div className="border-t border-border bg-card px-6 py-4">
-            <div className="rounded-xl border border-border bg-muted/30 p-4">
+          <div className="border-t border-zinc-800 bg-zinc-950/90 px-4 py-3">
+            <div className="rounded border border-zinc-800 bg-zinc-900/60 p-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <div className="flex items-center gap-2 font-semibold text-foreground">
-                    <AppIcon name="bot" fallback={Bot} className="h-4 w-4 text-primary"  />
+                  <div className="flex items-center gap-2 font-semibold text-zinc-100 text-xs">
+                    <AppIcon name="bot" fallback={Bot} className="h-4 w-4 text-sky-400"  />
                     AI build diagnosis
                   </div>
-                  <pre className="mt-1 whitespace-pre-wrap font-sans text-sm text-muted-foreground">
+                  <pre className="mt-1 whitespace-pre-wrap font-mono text-xs text-zinc-300">
                     {buildAnalysis.summary || buildAnalysis.error || "No summary returned."}
                   </pre>
                 </div>
-                <Badge variant={buildAnalysis.status === "error" ? "destructive" : "outline"}>
+                <Badge variant={buildAnalysis.status === "error" ? "destructive" : "outline"} className="border-zinc-700 text-zinc-200">
                   {Math.round((buildAnalysis.confidence || 0) * 100)}% confidence
                 </Badge>
               </div>
               {buildRootCause && (
-                <p className="mt-3 rounded-lg border border-border bg-background/70 px-3 py-2 text-sm">
-                  <span className="font-medium">Root cause: </span>
+                <p className="mt-2 rounded border border-zinc-700/60 bg-zinc-900/80 px-2.5 py-1.5 text-xs text-zinc-200">
+                  <span className="font-semibold text-sky-400">Root cause: </span>
                   {buildRootCause}
                 </p>
               )}
               {buildFixSteps.length > 0 && (
-                <div className="mt-3 space-y-2">
-                  <div className="text-xs font-semibold uppercase text-muted-foreground">Suggested fixes</div>
+                <div className="mt-2 space-y-1.5">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-sky-400">Suggested fixes</div>
                   {buildFixSteps.map((step, index) => (
-                    <div key={`${step}-${index}`} className="rounded-lg border border-border bg-background/70 px-3 py-2 text-sm">
+                    <div key={`${step}-${index}`} className="rounded border border-zinc-700/60 bg-zinc-900/80 px-2.5 py-1.5 text-xs text-zinc-200">
                       {step}
                     </div>
                   ))}
                 </div>
               )}
               {buildAnalysis.warnings && buildAnalysis.warnings.length > 0 && (
-                <p className="mt-3 text-xs text-amber-600 dark:text-amber-300">{buildAnalysis.warnings[0]}</p>
+                <p className="mt-2 text-xs text-amber-300">{buildAnalysis.warnings[0]}</p>
               )}
             </div>
           </div>
         )}
 
-        <div className="p-4 border-t border-border bg-muted/40 flex items-center justify-between">
-          <div className="flex items-center text-xs text-muted-foreground gap-2">
+        <div className="px-4 py-2 border-t border-sky-900/50 bg-[#0c1d3b] flex items-center justify-between text-xs text-sky-200/90 shrink-0">
+          <div className="flex items-center gap-2">
             <div
               className={cn(
                 "w-2 h-2 rounded-full",
                 displayStatus === "built" || displayStatus === "failed"
-                  ? "bg-muted-foreground/40"
+                  ? "bg-sky-400/40"
                   : isWsConnected
-                  ? "bg-emerald-500 animate-pulse"
+                  ? "bg-emerald-400 animate-pulse"
                   : isWsConnecting
-                  ? "bg-amber-500 animate-pulse"
-                  : "bg-muted-foreground/40"
+                  ? "bg-amber-400 animate-pulse"
+                  : "bg-sky-400/40"
               )}
             />
-            {displayStatus === "built" || displayStatus === "failed"
-              ? "Log history loaded from database"
-              : isWsConnected
-              ? "Receiving real-time updates via WebSocket"
-              : isWsConnecting
-              ? "Reconnecting to live stream..."
-              : displayStatus === "queued"
-              ? "Waiting for a background worker"
-              : displayStatus === "pending"
-              ? "Waiting for build trigger"
-              : "Log history loaded from database"}
+            <span>
+              {displayStatus === "built" || displayStatus === "failed"
+                ? "Log history loaded from database"
+                : isWsConnected
+                ? "Receiving real-time updates via WebSocket"
+                : isWsConnecting
+                ? "Reconnecting to live stream..."
+                : displayStatus === "queued"
+                ? "Waiting for a background worker"
+                : displayStatus === "pending"
+                ? "Waiting for build trigger"
+                : "Log history loaded from database"}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             {displayStatus === "failed" && (
@@ -1903,24 +1914,25 @@ function DeploymentLogsDialog({
                   variant="outline"
                   onClick={() => buildAnalysisMutation.mutate()}
                   disabled={buildAnalysisMutation.isPending}
+                  className="h-7 text-xs border-sky-700 bg-sky-950/60 text-sky-100 hover:bg-sky-800/60"
                 >
-                  {buildAnalysisMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="bot" fallback={Bot} className="mr-2 h-4 w-4"  />}
+                  {buildAnalysisMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-1.5 h-3.5 w-3.5 animate-spin"  /> : <AppIcon name="bot" fallback={Bot} className="mr-1.5 h-3.5 w-3.5"  />}
                   Diagnose
                 </Button>
                 <Button
                   size="sm"
-                  className="bg-primary hover:bg-primary/90 text-primary-foreground font-medium shadow-sm gap-1.5"
+                  className="h-7 text-xs bg-[#0078d4] hover:bg-[#106ebe] text-white font-medium shadow-sm gap-1.5"
                   onClick={() => buildRepairMutation.mutate()}
                   disabled={buildRepairMutation.isPending}
                 >
-                  {buildRepairMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="wand2" fallback={Wand2} className="mr-2 h-4 w-4"  />}
+                  {buildRepairMutation.isPending ? <AppIcon name="loader2" fallback={Loader2} className="mr-1.5 h-3.5 w-3.5 animate-spin"  /> : <AppIcon name="wand2" fallback={Wand2} className="mr-1.5 h-3.5 w-3.5"  />}
                   Auto-Fix & Deploy
                 </Button>
               </>
             )}
             {displayStatus === "pending" && (
-              <Button size="sm" onClick={onStartBuild} disabled={isStartingBuild}>
-                {isStartingBuild ? <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin"  /> : <AppIcon name="play" fallback={Play} className="mr-2 h-4 w-4 fill-current"  />}
+              <Button size="sm" onClick={onStartBuild} disabled={isStartingBuild} className="h-7 text-xs bg-[#0078d4] hover:bg-[#106ebe] text-white">
+                {isStartingBuild ? <AppIcon name="loader2" fallback={Loader2} className="mr-1.5 h-3.5 w-3.5 animate-spin"  /> : <AppIcon name="play" fallback={Play} className="mr-1.5 h-3.5 w-3.5 fill-current"  />}
                 Start build
               </Button>
             )}
@@ -1928,19 +1940,26 @@ function DeploymentLogsDialog({
               <Button
                 size="sm"
                 variant="outline"
-                className="border-destructive/40 text-destructive hover:bg-destructive/10 hover:border-destructive gap-1.5"
+                className="h-7 text-xs border-red-500/50 bg-red-950/50 text-red-300 hover:bg-red-900/60 gap-1.5"
                 onClick={onCancelBuild}
                 disabled={isCancellingBuild}
               >
                 {isCancellingBuild ? (
-                  <AppIcon name="loader2" fallback={Loader2} className="mr-2 h-4 w-4 animate-spin" />
+                  <AppIcon name="loader2" fallback={Loader2} className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <AppIcon name="x-circle" fallback={XCircle} className="mr-2 h-4 w-4" />
+                  <AppIcon name="x-circle" fallback={XCircle} className="mr-1.5 h-3.5 w-3.5" />
                 )}
                 Cancel build
               </Button>
             )}
-            <Button variant="ghost" size="sm" onClick={onClose}>Close</Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={onClose}
+              className="h-7 text-xs border-sky-700 bg-sky-950/60 text-sky-100 hover:bg-sky-800/60"
+            >
+              Close
+            </Button>
           </div>
         </div>
       </DialogContent>
@@ -3037,12 +3056,24 @@ function DeleteDeploymentDialog({
     : "Unchecked only removes the runtime resources and database record. Checked also removes the image from this host.";
   const expectedText = deployment.project_name;
   const displayName = deploymentDisplayName(deployment);
-  const canDelete = confirmation.trim() === expectedText && !isDeleting;
+  const canDelete =
+    (confirmation.trim() === expectedText ||
+      confirmation.trim().toLowerCase() === expectedText.trim().toLowerCase() ||
+      confirmation.trim().toLowerCase() === displayName.trim().toLowerCase()) &&
+    !isDeleting;
   const copyConfirmationText = async () => {
     try {
-      await navigator.clipboard.writeText(expectedText);
-      setConfirmation(expectedText);
-      toast.success("Confirmation text copied");
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(expectedText);
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = expectedText;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textArea);
+      }
+      toast.success("Confirmation text copied to clipboard");
     } catch {
       toast.error("Unable to copy confirmation text");
     }
@@ -3103,7 +3134,7 @@ function DeleteDeploymentDialog({
         )}
 
         <div className="space-y-2">
-          <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr),auto] sm:items-center">
+          <div className="flex items-center justify-between gap-3">
             <Label htmlFor="delete-deployment-confirm" className="min-w-0 text-sm leading-relaxed">
               Type <span className="break-words font-semibold text-foreground">{expectedText}</span> to confirm
             </Label>
@@ -3116,6 +3147,12 @@ function DeleteDeploymentDialog({
             id="delete-deployment-confirm"
             value={confirmation}
             onChange={(event) => setConfirmation(event.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && canDelete) {
+                e.preventDefault();
+                onConfirm(deleteImage === true);
+              }
+            }}
             placeholder={expectedText}
             autoComplete="off"
           />

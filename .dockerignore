@@ -1,12 +1,26 @@
-node_modules/
-.next/
+# Dependency and build caches
+**/node_modules/
+**/.next/
 build/
 build-mingw/
 .vscode/
+.git/
 .env*
 *.pem
-.git/
-frontend/node_modules/
-frontend/.next/
+
+# Separate services not needed for backend C++ compilation
+frontend/
+enterprise-frontend/
+ai-service/
+mcp-server/
+searxng/
+local-projects/
 uploads/
 logs/
+video/
+
+# Large binaries and media
+*.mp4
+*.bat
+*.md
+scratch*

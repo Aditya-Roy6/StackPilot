@@ -15,6 +15,15 @@ export const UI_THEMES = [
   "catppuccin",
   "dracula",
   "nord",
+  "antd",
+  "browser",
+  "minimal-flat",
+  "terminal-phosphor",
+  "high-contrast-dense",
+  "material-m3",
+  "aws-cloudscape",
+  "ibm-carbon",
+  "azure-fluent",
 ] as const;
 export type UiTheme = (typeof UI_THEMES)[number];
 
@@ -77,6 +86,60 @@ export const UI_THEME_META: UiThemeMeta[] = [
     name: "Nord",
     description: "Cool arctic palette with muted blues and soft contrast.",
     swatches: ["#eceff4", "#e5e9f0", "#5e81ac"],
+  },
+  {
+    id: "antd",
+    name: "Ant Design",
+    description: "Enterprise specification by Ant Group — Daybreak Blue, crisp borders, subtle shadows.",
+    swatches: ["#ffffff", "#fafafa", "#1677ff"],
+  },
+  {
+    id: "browser",
+    name: "Browser Native",
+    description: "Authentic HTML user-agent controls: 3D beveled buttons, inset fields, and zero radius.",
+    swatches: ["#ffffff", "#e9e9e9", "#0000ee"],
+  },
+  {
+    id: "minimal-flat",
+    name: "Minimal Flat",
+    description: "High-speed monochrome with zero shadows, zero transitions, and 1px crisp borders.",
+    swatches: ["#ffffff", "#fbfbfb", "#0a0a0a"],
+  },
+  {
+    id: "terminal-phosphor",
+    name: "Terminal CRT",
+    description: "Retro amber console aesthetic in pure JetBrains Mono with high-contrast text.",
+    swatches: ["#0a0800", "#141000", "#ffb000"],
+  },
+  {
+    id: "high-contrast-dense",
+    name: "SRE Dense",
+    description: "Pure black background, high-contrast borders, and compact high-density layout.",
+    swatches: ["#000000", "#111111", "#00ff66"],
+  },
+  {
+    id: "material-m3",
+    name: "Google Cloud M3",
+    description: "Google Cloud Console design: Roboto typography, pill badges, and layered tonal elevation.",
+    swatches: ["#ffffff", "#f8f9fa", "#1a73e8"],
+  },
+  {
+    id: "aws-cloudscape",
+    name: "AWS Cloudscape",
+    description: "AWS Management Console aesthetic: Deep navy chrome, squid ink blue, and orange accents.",
+    swatches: ["#f2f3f3", "#161f2e", "#ec7211"],
+  },
+  {
+    id: "ibm-carbon",
+    name: "IBM Carbon",
+    description: "IBM Carbon 11 Design System: Strict 0px radius, IBM Plex Sans, and industrial grid.",
+    swatches: ["#f4f4f4", "#ffffff", "#0f62fe"],
+  },
+  {
+    id: "azure-fluent",
+    name: "Azure Fluent",
+    description: "Microsoft Azure & Fluent 2 design: Segoe UI, subtle acrylic surfaces, and Azure Blue.",
+    swatches: ["#ffffff", "#f3f2f1", "#0078d4"],
   },
 ];
 
@@ -167,12 +230,5 @@ export function useUiTheme(): [UiTheme, (theme: UiTheme) => void] {
   return [theme, setUiTheme];
 }
 
-/**
- * Runs before first paint (injected in <head>) so a non-default theme does not
- * flash the default palette on load.
- */
-export const UI_THEME_INIT_SCRIPT = `(function(){try{var t=localStorage.getItem(${JSON.stringify(
-  UI_THEME_STORAGE_KEY
-)});var allowed=${JSON.stringify(UI_THEMES)};document.documentElement.setAttribute('data-ui-theme',allowed.indexOf(t)>-1?t:${JSON.stringify(
-  DEFAULT_UI_THEME
-)});}catch(e){}})();`;
+export { UI_THEME_INIT_SCRIPT } from "./theme-init";
+

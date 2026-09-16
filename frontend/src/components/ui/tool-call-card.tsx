@@ -451,9 +451,12 @@ export function ToolCallCard({
   );
 }
 
+import { LiveToolChips } from "@/components/ui/beautiful-tool-chips";
+
 /**
  * Collapsible accordion for grouping multiple tool execution cards.
- * Matches the style and behavior of the ThinkingPanel component.
+ * Renders modern Beautiful UI compact tool chips with interactive row expansion,
+ * diff previews, and permission gating cards.
  */
 export function ToolsPanel({
   toolCalls,
@@ -470,103 +473,17 @@ export function ToolsPanel({
   onAllow?: (call: ToolCall) => void;
   onDeny?: (call: ToolCall) => void;
 }) {
-  const hasPermissions = toolCalls.some(
-    (c) =>
-      c.result?.status === "permission_required" ||
-      c.result?.status === "requires_approval" ||
-      c.result?.action_required === "permission"
-  );
-  const [open, setOpen] = useState(isGenerating || hasPermissions);
-
   if (!toolCalls || toolCalls.length === 0) return null;
 
-  const permissionCount = toolCalls.filter(
-    (c) =>
-      c.result?.status === "permission_required" ||
-      c.result?.status === "requires_approval" ||
-      c.result?.action_required === "permission"
-  ).length;
-
-  const pendingCount = toolCalls.filter(
-    (c) =>
-      (c.result === undefined || c.result === null) &&
-      c.result?.status !== "permission_required"
-  ).length;
-
-  const errorCount = toolCalls.filter(
-    (c) =>
-      c.result?.error ||
-      (typeof c.result?.exit_code === "number" && c.result.exit_code !== 0) ||
-      c.result?.status === "failed" ||
-      c.result?.status === "error"
-  ).length;
-
-  const isAllDone = pendingCount === 0 && permissionCount === 0;
-
   return (
-    <div className={cn("mb-2.5 space-y-1.5", className)}>
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
-        <button
-          type="button"
-          onClick={() => setOpen((value) => !value)}
-          className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 text-xs hover:bg-accent hover:text-accent-foreground transition-colors font-mono"
-          aria-expanded={open}
-        >
-          {open ? (
-            <ChevronDown className="h-3 w-3" />
-          ) : (
-            <ChevronRight className="h-3 w-3" />
-          )}
-
-          {isGenerating && pendingCount > 0 ? (
-            <Loader2 className="h-3 w-3 animate-spin text-zinc-400" />
-          ) : errorCount > 0 ? (
-            <AlertCircle className="h-3 w-3 text-rose-500" />
-          ) : (
-            <Wrench className="h-3 w-3 text-muted-foreground" />
-          )}
-
-          <span>
-            {open
-              ? `Hide tools (${toolCalls.length})`
-              : `Tools (${toolCalls.length})`}
-          </span>
-
-          {permissionCount > 0 && (
-            <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-500 border border-amber-500/30">
-              {permissionCount} awaiting action
-            </span>
-          )}
-
-          {isAllDone && errorCount === 0 && (
-            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-500/80 font-normal">
-              <CheckCircle2 className="h-3 w-3" />
-              <span>completed</span>
-            </span>
-          )}
-
-          {errorCount > 0 && (
-            <span className="rounded bg-rose-500/10 px-1.5 py-0.5 text-[10px] font-medium text-rose-500">
-              {errorCount} failed
-            </span>
-          )}
-        </button>
-      </div>
-
-      {open && (
-        <div className="space-y-2 pt-1 transition-all duration-200">
-          {toolCalls.map((tc, tcIdx) => (
-            <ToolCallCard
-              key={tcIdx}
-              call={tc}
-              isGenerating={isGenerating}
-              onOpenTerminal={onOpenTerminal}
-              onAllow={onAllow}
-              onDeny={onDeny}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+    <LiveToolChips
+      toolCalls={toolCalls}
+      isGenerating={isGenerating}
+      className={className}
+      onOpenTerminal={onOpenTerminal}
+      onAllow={onAllow}
+      onDeny={onDeny}
+    />
   );
 }
+

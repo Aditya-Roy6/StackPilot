@@ -49,15 +49,15 @@ std::string serviceUrl() {
 }
 
 long streamTimeoutSeconds() {
-    // Much longer than the blocking path's timeout. A thinking-mode reply can
-    // legitimately take minutes, and the whole point of streaming is that the
-    // user sees progress while it does.
-    const std::string raw = strings::getEnvOrDefault("STACKPILOT_AI_STREAM_TIMEOUT_SECONDS", "600");
+    // Much longer than the blocking path's timeout. A thinking-mode reply or multi-step
+    // autonomous repair can legitimately take minutes or hours during large package builds,
+    // and the whole point of streaming is that the user sees progress while it does.
+    const std::string raw = strings::getEnvOrDefault("STACKPILOT_AI_STREAM_TIMEOUT_SECONDS", "3600");
     try {
         const long parsed = std::stol(raw);
-        return parsed > 0 ? parsed : 600;
+        return parsed > 0 ? parsed : 3600;
     } catch (...) {
-        return 600;
+        return 3600;
     }
 }
 
@@ -79,11 +79,11 @@ void AiStreamProxy::stream(const std::string& path,
     struct curl_slist* headers = nullptr;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
-    if (const char* serviceToken = std::getenv("STACKPILOT_AI_SERVICE_TOKEN")) {
-        if (*serviceToken) {
-            const std::string tokenHeader = std::string("X-StackPilot-Service-Token: ") + serviceToken;
-            headers = curl_slist_append(headers, tokenHeader.c_str());
-        }
+    const char* serviceToken = std::getenv("STACKPILOT_AI_SERVICE_TOKEN");
+    const std::string effectiveToken = (serviceToken && *serviceToken) ? serviceToken : "";
+    if (!effectiveToken.empty()) {
+        const std::string tokenHeader = std::string("X-StackPilot-Service-Token: ") + effectiveToken;
+        headers = curl_slist_append(headers, tokenHeader.c_str());
     }
 
     StreamContext context{&onChunk, {}};
@@ -95,6 +95,12 @@ void AiStreamProxy::stream(const std::string& path,
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streamWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, streamTimeoutSeconds());
+    // Use an idle timeout (5 minutes with < 1 byte) rather than abruptly killing long streams
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 300L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 15L);
     // Without this curl buffers, which would defeat the entire exercise.
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 1024L);
 

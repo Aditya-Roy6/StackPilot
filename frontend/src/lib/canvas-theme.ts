@@ -227,27 +227,65 @@ export interface TerminalTheme {
   foreground: string;
   cursor: string;
   selectionBackground: string;
+  cursorAccent?: string;
+  black?: string;
+  red?: string;
+  green?: string;
+  yellow?: string;
+  blue?: string;
+  magenta?: string;
+  cyan?: string;
+  white?: string;
+  brightBlack?: string;
+  brightRed?: string;
+  brightGreen?: string;
+  brightYellow?: string;
+  brightBlue?: string;
+  brightMagenta?: string;
+  brightCyan?: string;
+  brightWhite?: string;
 }
 
-const TERMINAL_FALLBACK: TerminalTheme = {
-  background: "#050505",
+export const POWERSHELL_TERMINAL_THEME: TerminalTheme = {
+  background: "#0c0c0c",
   foreground: "#f4f4f5",
   cursor: "#f4f4f5",
-  selectionBackground: "rgba(244, 244, 245, 0.28)",
+  cursorAccent: "#0c0c0c",
+  selectionBackground: "rgba(255, 255, 255, 0.28)",
+  black: "#0c0c0c",
+  red: "#c50f1f",
+  green: "#13a10e",
+  yellow: "#c19c00",
+  blue: "#0037da",
+  magenta: "#881798",
+  cyan: "#3a96dd",
+  white: "#cccccc",
+  brightBlack: "#767676",
+  brightRed: "#e74856",
+  brightGreen: "#16c60c",
+  brightYellow: "#f9f1a5",
+  brightBlue: "#3b78ff",
+  brightMagenta: "#b4009e",
+  brightCyan: "#61d6d6",
+  brightWhite: "#f2f2f2",
 };
 
-export function readTerminalTheme(): TerminalTheme {
-  if (typeof document === "undefined") return TERMINAL_FALLBACK;
-  const ctx = document.createElement("canvas").getContext("2d");
-  if (!ctx) return TERMINAL_FALLBACK;
+const TERMINAL_FALLBACK: TerminalTheme = POWERSHELL_TERMINAL_THEME;
 
-  const foreground = normalizeColor(ctx, cssVar("--card-foreground"), TERMINAL_FALLBACK.foreground);
-  return {
-    // The terminal sits on a card, so it should match the card rather than the
-    // page background.
-    background: normalizeColor(ctx, cssVar("--card"), TERMINAL_FALLBACK.background),
-    foreground,
-    cursor: normalizeColor(ctx, cssVar("--ring"), TERMINAL_FALLBACK.cursor),
-    selectionBackground: withAlpha(foreground, 0.28),
-  };
+export function readTerminalTheme(): TerminalTheme {
+  if (typeof document !== "undefined") {
+    const isDark = document.documentElement.classList.contains("dark");
+    if (!isDark) {
+      return {
+        ...POWERSHELL_TERMINAL_THEME,
+        background: "#ffffff",
+        foreground: "#18181b",
+        cursor: "#18181b",
+        cursorAccent: "#ffffff",
+        selectionBackground: "rgba(0, 0, 0, 0.15)",
+        white: "#18181b",
+      };
+    }
+  }
+  return POWERSHELL_TERMINAL_THEME;
 }

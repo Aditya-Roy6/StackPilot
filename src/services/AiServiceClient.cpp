@@ -47,11 +47,11 @@ AiServiceResult performRequest(const std::string& url,
     // Shared secret proving the caller is the backend. ai-service enforces this
     // on every route except /health; without it anything on the docker network
     // could drive the model and reach its provider base_url SSRF sink.
-    if (const char* serviceToken = std::getenv("STACKPILOT_AI_SERVICE_TOKEN")) {
-        if (*serviceToken) {
-            const std::string tokenHeader = std::string("X-StackPilot-Service-Token: ") + serviceToken;
-            headers = curl_slist_append(headers, tokenHeader.c_str());
-        }
+    const char* serviceToken = std::getenv("STACKPILOT_AI_SERVICE_TOKEN");
+    const std::string effectiveToken = (serviceToken && *serviceToken) ? serviceToken : "";
+    if (!effectiveToken.empty()) {
+        const std::string tokenHeader = std::string("X-StackPilot-Service-Token: ") + effectiveToken;
+        headers = curl_slist_append(headers, tokenHeader.c_str());
     }
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());

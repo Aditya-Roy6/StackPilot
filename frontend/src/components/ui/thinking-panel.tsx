@@ -6,6 +6,8 @@ import { useTheme } from "next-themes";
 import { ThinkingOrb, type OrbState } from "thinking-orbs";
 
 import { cn } from "@/lib/utils";
+import { AnimatedMarkdown } from "@/components/ui/animated-markdown";
+import { AnimatedStreamingText } from "@/components/ui/animated-streaming-text";
 
 export interface ThinkingStats {
   latencyMs?: number;
@@ -50,7 +52,7 @@ export function ThinkingPanel({
   const [open, setOpen] = useState(true);
   const { resolvedTheme } = useTheme();
   const isDark = resolvedTheme === "dark";
-  const preRef = useRef<HTMLPreElement>(null);
+  const preRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (isGenerating && preRef.current) {
@@ -81,72 +83,149 @@ export function ThinkingPanel({
 
   if (!hasReasoning && chips.length === 0 && !isGenerating) return null;
 
+  const isExpanded = open && hasReasoning;
+
   return (
-    <div className={cn("mb-3 space-y-1.5", className)}>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+    <div className={cn("transition-[margin] duration-200", isExpanded ? "mb-2.5 space-y-1.5" : "mb-0 space-y-0", className)}>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-2">
         {(hasReasoning || isGenerating) && (
           <button
             type="button"
             onClick={() => setOpen((value) => !value)}
-            className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-0.5 hover:bg-accent hover:text-accent-foreground transition-colors"
+            className="-mx-1 inline-flex items-center gap-2 rounded-control px-2 py-0.5 hover:bg-hover-2 text-ink-2 transition-colors cursor-pointer select-none"
             aria-expanded={open}
           >
-            {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill={isGenerating ? "var(--ink-2)" : "var(--ink-3)"}
+              className={cn("shrink-0", isGenerating && "animate-pulse")}
+            >
+              <path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z" />
+            </svg>
+
             {isGenerating && orbStyle !== "off" && (
               <span className="inline-flex items-center transition-opacity duration-300">
                 <ThinkingOrb state={orbStyle || "solving"} size={20} theme={isDark ? "dark" : "light"} />
               </span>
             )}
-            <span>
-              {isGenerating
-                ? "Thinking..."
-                : open
-                ? `Hide thinking${rawBlocks.length > 1 ? ` (${rawBlocks.length} blocks)` : ""}`
-                : `Show thinking${rawBlocks.length > 1 ? ` (${rawBlocks.length} blocks)` : ""}`}
+
+            <span role="status" className="contents">
+              {isGenerating ? (
+                <span
+                  className="bg-clip-text text-[13px] font-medium whitespace-nowrap text-transparent"
+                  style={{
+                    backgroundImage:
+                      "linear-gradient(90deg, var(--ink-3) 35%, var(--ink) 50%, var(--ink-3) 65%)",
+                    backgroundSize: "200% 100%",
+                    animation: "shimmer-text 1.4s linear infinite",
+                  }}
+                >
+                  Thinking...
+                </span>
+              ) : (
+                <span
+                  className="text-[13px] font-medium whitespace-nowrap text-ink-2"
+                  style={{ animation: "fade-in 350ms ease-out both" }}
+                >
+                  {open
+                    ? `Hide thinking${rawBlocks.length > 1 ? ` (${rawBlocks.length} blocks)` : ""}`
+                    : `Show thinking${rawBlocks.length > 1 ? ` (${rawBlocks.length} blocks)` : ""}`}
+                </span>
+              )}
             </span>
+
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--ink-3)"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="transition-transform duration-300 shrink-0"
+              style={{ transform: open ? "rotate(180deg)" : "rotate(0)" }}
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
           </button>
         )}
         {chips.map((chip) => (
-          <span key={chip}>{chip}</span>
+          <span key={chip} className="font-mono text-[11px] text-ink-3">
+            {chip}
+          </span>
         ))}
       </div>
 
-      {open && hasReasoning && (
-        <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-3">
-          <p className="text-xs text-muted-foreground">
-            The model&apos;s working. This is not the answer, and it is often wrong on the way to being right.
-          </p>
+      <div
+        className={cn(
+          "grid transition-[grid-template-rows,opacity] duration-300 ease-out",
+          !isExpanded && "invisible h-0 opacity-0 pointer-events-none overflow-hidden"
+        )}
+        style={{
+          gridTemplateRows: isExpanded ? "1fr" : "0fr",
+          opacity: isExpanded ? 1 : 0,
+        }}
+      >
+        <div className="min-h-0 overflow-hidden">
+          <div className="relative mt-1 ml-[5px] pl-4">
+            <span
+              aria-hidden
+              className="absolute left-[3px] top-0 bottom-1 w-px bg-line"
+            />
+            <div className="rounded-lg border border-line bg-surface/60 p-3 space-y-2.5">
+              <p className="text-[11.5px] text-ink-3">
+                The model&apos;s working trace. Internal deliberation and diagnostics.
+              </p>
 
-          {rawBlocks.length === 1 ? (
-            <pre
-              ref={preRef}
-              className="max-h-96 overflow-y-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground"
-            >
-              {rawBlocks[0]}
-            </pre>
-          ) : (
-            <div className="space-y-2.5">
-              {rawBlocks.map((block, idx) => (
-                <div key={idx} className="rounded-md border border-border/60 bg-background/60 p-2.5">
-                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-foreground/80">
-                    <Sparkles className="h-3 w-3 text-amber-500" />
-                    <span>Thinking Block {idx + 1}</span>
-                  </div>
-                  <pre className="max-h-80 overflow-y-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-muted-foreground">
-                    {block}
-                  </pre>
+              {rawBlocks.length === 1 ? (
+                <div
+                  ref={preRef}
+                  className="max-h-96 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink-2"
+                >
+                  <AnimatedStreamingText
+                    content={rawBlocks[0]}
+                    isStreaming={isGenerating}
+                    animation="blurIn"
+                    animationDuration="0.32s"
+                  />
                 </div>
-              ))}
-            </div>
-          )}
+              ) : (
+                <div className="space-y-2">
+                  {rawBlocks.map((block, idx) => {
+                    const isLatestBlock = idx === rawBlocks.length - 1;
+                    return (
+                      <div key={idx} className="rounded-md border border-line/80 bg-field/40 p-2.5">
+                        <div className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-ink-2">
+                          <Sparkles className="h-3 w-3 text-amber-500" />
+                          <span>Thinking Block {idx + 1}</span>
+                        </div>
+                        <div className="max-h-80 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink-2">
+                          <AnimatedStreamingText
+                            content={block}
+                            isStreaming={isGenerating && isLatestBlock}
+                            animation="blurIn"
+                            animationDuration="0.32s"
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
-          {stats?.traceId && (
-            <p className="mt-2 font-mono text-[10px] text-muted-foreground/70">
-              trace {stats.traceId}
-            </p>
-          )}
+              {stats?.traceId && (
+                <p className="mt-2 font-mono text-[10px] text-ink-3">
+                  trace {stats.traceId}
+                </p>
+              )}
+            </div>
+          </div>
         </div>
-      )}
+      </div>
     </div>
   );
 }
+

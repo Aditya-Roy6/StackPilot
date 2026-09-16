@@ -1147,23 +1147,18 @@ export default function SettingsPage() {
 
       {terminalConnection && (
         <Dialog open={!!terminalConnection} onOpenChange={(open) => !open && setTerminalConnection(null)}>
-          <DialogContent className="!flex !h-[min(92dvh,900px)] !w-[min(96vw,78rem)] !max-w-[78rem] !flex-col overflow-hidden rounded-xl border-border bg-card p-0">
-            <DialogHeader className="shrink-0 border-b border-border px-5 py-3">
-              <DialogTitle className="flex items-center gap-2">
-                <AppIcon name="terminal" fallback={Terminal} className="h-5 w-5 text-primary"  />
-                {terminalConnection.name} Terminal
-              </DialogTitle>
-              <DialogDescription>
-                Connected as {terminalConnection.username}@{terminalConnection.host}.
-              </DialogDescription>
-            </DialogHeader>
-            <div className="min-h-0 flex-1 overflow-hidden p-3 md:p-4">
-              <RemoteSshTerminal
-                connectionId={terminalConnection.id}
-                cwd={terminalConnection.username === "root" ? "/root" : `/home/${terminalConnection.username}`}
-                className="h-full min-h-0"
-              />
-            </div>
+          <DialogContent 
+            showCloseButton={false}
+            className="!flex !h-[min(92dvh,900px)] !w-[min(96vw,78rem)] !max-w-[78rem] !flex-col overflow-hidden rounded-md border border-zinc-800 bg-[#0c0c0c] p-0 shadow-2xl"
+          >
+            <RemoteSshTerminal
+              connectionId={terminalConnection.id}
+              cwd={terminalConnection.username === "root" ? "/root" : `/home/${terminalConnection.username}`}
+              title={`${terminalConnection.name} Terminal`}
+              connectedInfo={`${terminalConnection.username}@${terminalConnection.host}`}
+              onClose={() => setTerminalConnection(null)}
+              className="h-full min-h-0 rounded-none border-0"
+            />
           </DialogContent>
         </Dialog>
       )}

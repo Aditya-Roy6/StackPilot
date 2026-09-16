@@ -32,9 +32,9 @@ struct MobileMetadata {
 };
 
 struct RepositoryArchetype {
-    std::string type = "standard_web";       // "standard_web", "expo_react_native", "flutter_mobile", "native_ios", "native_android", "windows_desktop_exe", "java_web", "library", "monorepo"
+    std::string type = "standard_web";       // "standard_web", "expo_react_native", "flutter_mobile", "native_ios", "native_android", "windows_desktop_exe", "desktop_compose_gui", "java_web", "library", "monorepo"
     std::string displayName = "Web Application";
-    std::string suggestedStrategy = "standard"; // "expo_web_preview", "flutter_web_preview", "wine_novnc_web_stream", "android_apk_download_server", "monorepo_subservice", "unsupported_native"
+    std::string suggestedStrategy = "standard"; // "expo_web_preview", "flutter_web_preview", "wine_novnc_web_stream", "desktop_novnc_web_stream", "android_apk_download_server", "monorepo_subservice", "unsupported_native"
     std::vector<std::string> subServices;
     std::string details;
     MobileMetadata mobileMetadata;
@@ -148,6 +148,11 @@ public:
                                         const std::vector<BuildEnvVar>& envVars = {},
                                         LogCallback onLogLine = nullptr) const;
 
+    bool ensureDockerfile(const std::filesystem::path& sourceDir,
+                          const std::filesystem::path& logFile,
+                          std::string& reason,
+                          LogCallback onLogLine = nullptr) const;
+
 private:
     std::filesystem::path workspaceRoot_;
     int maxLogBytes_;
@@ -178,10 +183,6 @@ private:
                                      const std::filesystem::path& logFile,
                                      std::string& reason,
                                      LogCallback onLogLine) const;
-    bool ensureDockerfile(const std::filesystem::path& sourceDir,
-                          const std::filesystem::path& logFile,
-                          std::string& reason,
-                          LogCallback onLogLine) const;
 
     static std::mutex buildPidsMutex_;
     static std::unordered_map<std::string, pid_t> activeBuildPids_;

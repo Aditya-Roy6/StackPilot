@@ -17,7 +17,12 @@ api.interceptors.response.use(
     if (error.response?.status === 401) {
       if (typeof window !== "undefined") {
         const currentPath = window.location.pathname;
-        if (!currentPath.startsWith("/auth/")) {
+        if (
+          !currentPath.startsWith("/auth/") &&
+          currentPath !== "/login" &&
+          currentPath !== "/register" &&
+          currentPath !== "/forgot-password"
+        ) {
           window.location.href = "/auth/login";
         }
       }

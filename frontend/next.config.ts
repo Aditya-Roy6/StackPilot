@@ -1,10 +1,42 @@
 import type { NextConfig } from "next";
-import path from "node:path";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  turbopack: {
-    root: path.resolve(__dirname),
+  turbopack: {},
+  allowedDevOrigins: [
+    "localhost:3000",
+    "127.0.0.1:3000",
+    "localhost",
+    "127.0.0.1",
+  ],
+
+  webpack: (config, { dev }) => {
+    if (dev) {
+      config.watchOptions = {
+        poll: 1000,
+        aggregateTimeout: 300,
+      };
+    }
+    return config;
+  },
+  async redirects() {
+    return [
+      {
+        source: "/login",
+        destination: "/auth/login",
+        permanent: false,
+      },
+      {
+        source: "/register",
+        destination: "/auth/register",
+        permanent: false,
+      },
+      {
+        source: "/forgot-password",
+        destination: "/auth/forgot-password",
+        permanent: false,
+      },
+    ];
   },
   async headers() {
     const isProduction = process.env.NODE_ENV === "production";

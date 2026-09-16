@@ -19,17 +19,13 @@ import {
   Wand2,
   AlertTriangle,
   CheckCircle2,
-  XCircle,
   RotateCcw,
   FileCode2,
   ShieldAlert,
-  ArrowRight,
   Loader2,
   MessageSquare,
   FolderGit2,
-  Check,
   Layers,
-  Cpu,
   Zap,
 } from "lucide-react";
 import { AppIcon } from "@/lib/custom-icons";
@@ -50,7 +46,7 @@ interface AiSreSelfHealingDialogProps {
       archetype?: string;
       archetype_details?: string;
       detected_subservices?: string[];
-      [key: string]: any;
+      [key: string]: unknown;
     };
   } | null;
 }
@@ -67,7 +63,7 @@ export function AiSreSelfHealingDialog({
     queryKey: ["deployment-rca", deployment?.id],
     queryFn: async () => {
       if (!deployment?.id) return null;
-      const res = await api.get(`/api/v1/deployments/${deployment.id}/rca`);
+      const res = await api.get(`/deployments/${deployment.id}/rca`);
       return res.data;
     },
     enabled: !!deployment?.id && open,
@@ -77,7 +73,7 @@ export function AiSreSelfHealingDialog({
   const repairMutation = useMutation({
     mutationFn: async () => {
       if (!deployment?.id) return;
-      const res = await api.post(`/api/v1/ai/deployments/${deployment.id}/repair`);
+      const res = await api.post(`/deployments/${deployment.id}/ai/repair`);
       return res.data;
     },
     onSuccess: () => {
@@ -85,24 +81,32 @@ export function AiSreSelfHealingDialog({
       queryClient.invalidateQueries({ queryKey: ["deployments"] });
       onClose();
     },
-    onError: (err: any) => {
-      toast.error(err?.response?.data?.error || "Failed to trigger AI repair");
+    onError: (err: unknown) => {
+      const message =
+        err && typeof err === "object" && "response" in err
+          ? (err as { response?: { data?: { error?: string } } }).response?.data?.error
+          : undefined;
+      toast.error(message || "Failed to trigger AI repair");
     },
   });
 
   const rollbackMutation = useMutation({
     mutationFn: async () => {
       if (!deployment?.id) return;
-      const res = await api.post(`/api/v1/deployments/${deployment.id}/rollback`);
+      const res = await api.post(`/deployments/${deployment.id}/rollback`);
       return res.data;
     },
-    onSuccess: (data: any) => {
+    onSuccess: (data: { message?: string } | undefined) => {
       toast.success(data?.message || "Successfully rolled back to healthy checkpoint!");
       queryClient.invalidateQueries({ queryKey: ["deployments"] });
       onClose();
     },
-    onError: (err: any) => {
-      toast.error(err?.response?.data?.error || "Rollback failed");
+    onError: (err: unknown) => {
+      const message =
+        err && typeof err === "object" && "response" in err
+          ? (err as { response?: { data?: { error?: string } } }).response?.data?.error
+          : undefined;
+      toast.error(message || "Rollback failed");
     },
   });
 

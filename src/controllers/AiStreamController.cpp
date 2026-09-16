@@ -12,6 +12,7 @@
 
 #include "../db/Database.h"
 #include "../services/AiStreamProxy.h"
+#include "../services/AiServiceClient.h"
 #include "../utils/BlockingTaskRunner.h"
 #include "../utils/JwtHelper.h"
 #include "../utils/StringUtils.h"
@@ -95,6 +96,8 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
     std::string deploymentId = body->isMember("deployment_id") ? (*body)["deployment_id"].asString() : "";
     std::string command = body->isMember("command") ? (*body)["command"].asString() : "";
 
+    std::string workflowType = body->isMember("workflow_type") ? (*body)["workflow_type"].asString() : "agent_chat";
+
     // Extract UUID from message if deploymentId or projectId not explicitly given
     std::string extractedUuid;
     {
@@ -108,7 +111,7 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
     // Build the upstream payload before the stream opens
     Json::Value payload(Json::objectValue);
     payload["message"] = userMessage;
-    payload["workflow_type"] = "agent_chat";
+    payload["workflow_type"] = workflowType;
     payload["user_id"] = userId;
     payload["model_mode"] = body->isMember("model_mode") ? (*body)["model_mode"].asString() : "fast";
     if (!command.empty()) payload["command"] = command;
@@ -119,11 +122,38 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
     if (body->isMember("runtime")) payload["runtime"] = (*body)["runtime"];
     if (body->isMember("agent_access_mode")) payload["agent_access_mode"] = (*body)["agent_access_mode"];
     if (body->isMember("remote_terminal")) payload["remote_terminal"] = (*body)["remote_terminal"];
+    if (body->isMember("images")) payload["images"] = (*body)["images"];
+    if (body->isMember("custom_url")) payload["custom_url"] = (*body)["custom_url"];
 
     // Persist session and user message in database
     try {
         auto conn = Database::getInstance().getConnection();
         pqxx::work txn(*conn);
+
+        // Session Context Resolution:
+        // When body contains session_id:
+        // If deployment_id is empty or project_id is empty, query ai_sessions in PostgreSQL:
+        // SELECT deployment_id, project_id, session_type FROM ai_sessions WHERE id = $1
+        // If found, populate deployment_id and project_id and workflow_type!
+        if (!sessionId.empty()) {
+            try {
+                auto sessRows = txn.exec_params(
+                    "SELECT deployment_id, project_id, session_type FROM ai_sessions WHERE id = $1 AND (user_id = $2 OR has_project_access(project_id, $2))",
+                    sessionId, userId);
+                if (!sessRows.empty()) {
+                    if (deploymentId.empty() && !sessRows[0]["deployment_id"].is_null()) {
+                        deploymentId = sessRows[0]["deployment_id"].as<std::string>();
+                    }
+                    if (projectId.empty() && !sessRows[0]["project_id"].is_null()) {
+                        projectId = sessRows[0]["project_id"].as<std::string>();
+                    }
+                    if (!sessRows[0]["session_type"].is_null() && !sessRows[0]["session_type"].as<std::string>().empty()) {
+                        workflowType = sessRows[0]["session_type"].as<std::string>();
+                        payload["workflow_type"] = workflowType;
+                    }
+                }
+            } catch (...) {}
+        }
 
         // If deploymentId is empty but an extracted UUID matched a deployment, resolve it
         if (deploymentId.empty() && !extractedUuid.empty()) {
@@ -139,8 +169,27 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
             }
         }
 
-        // If deploymentId is still empty but sessionId is active, inherit from prior tool calls or session context
-        if (deploymentId.empty() && !sessionId.empty()) {
+        // If projectId is provided but deploymentId is empty, find the latest running deployment for this specific project
+        if (deploymentId.empty() && !projectId.empty()) {
+            try {
+                auto dCheck = txn.exec_params(
+                    "SELECT id FROM deployments WHERE project_id = $1 AND status = 'running' ORDER BY created_at DESC LIMIT 1",
+                    projectId);
+                if (!dCheck.empty()) {
+                    deploymentId = dCheck[0]["id"].as<std::string>();
+                } else {
+                    auto dAny = txn.exec_params(
+                        "SELECT id FROM deployments WHERE project_id = $1 ORDER BY created_at DESC LIMIT 1",
+                        projectId);
+                    if (!dAny.empty()) {
+                        deploymentId = dAny[0]["id"].as<std::string>();
+                    }
+                }
+            } catch (...) {}
+        }
+
+        // Only inherit deployment from prior tool calls in session if BOTH deploymentId and projectId are empty
+        if (deploymentId.empty() && projectId.empty() && !sessionId.empty()) {
             try {
                 auto depInSession = txn.exec_params(
                     "SELECT (tc->'arguments'->>'deployment_id') as dep_id "
@@ -164,52 +213,61 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
             }
         }
 
-        // If projectId is still empty but sessionId is active, inherit from session
-        if (projectId.empty() && !sessionId.empty()) {
-            try {
-                auto sessProj = txn.exec_params(
-                    "SELECT project_id FROM ai_sessions WHERE id = $1 AND user_id = $2",
-                    sessionId, userId);
-                if (!sessProj.empty() && !sessProj[0]["project_id"].is_null()) {
-                    projectId = sessProj[0]["project_id"].as<std::string>();
-                }
-            } catch (...) {}
-        }
-
         // Populate deployment context if deployment_id is set
-        if (!deploymentId.empty() && !payload.isMember("deployment")) {
+        // SELECT d.id, d.status, d.logs, d.branch, p.id AS project_id, p.name AS project_name FROM deployments d JOIN projects p ON d.project_id = p.id WHERE d.id = $1
+        // Populate deployment JSON object (id, status, logs, branch) and project JSON object (id, name)
+        if (!deploymentId.empty()) {
             const auto dRows = txn.exec_params(
-                "SELECT d.id, d.status, d.logs, d.image_name, d.runtime_url, d.project_id "
+                "SELECT d.id, d.status, d.logs, d.branch, d.image_name, d.runtime_url, p.id AS project_id, p.name AS project_name "
                 "FROM deployments d JOIN projects p ON d.project_id = p.id "
                 "WHERE d.id = $1 AND (p.user_id = $2 OR has_project_access(p.id, $2))",
                 deploymentId, userId);
             if (!dRows.empty()) {
-                Json::Value dep(Json::objectValue);
+                Json::Value dep = payload.isMember("deployment") && payload["deployment"].isObject()
+                    ? payload["deployment"]
+                    : Json::Value(Json::objectValue);
                 dep["id"] = dRows[0]["id"].as<std::string>();
                 dep["status"] = dRows[0]["status"].is_null() ? "" : dRows[0]["status"].as<std::string>();
-                dep["image_name"] = dRows[0]["image_name"].is_null() ? "" : dRows[0]["image_name"].as<std::string>();
-                dep["runtime_url"] = dRows[0]["runtime_url"].is_null() ? "" : dRows[0]["runtime_url"].as<std::string>();
+                dep["logs"] = dRows[0]["logs"].is_null() ? "" : dRows[0]["logs"].as<std::string>();
+                dep["branch"] = dRows[0]["branch"].is_null() ? "" : dRows[0]["branch"].as<std::string>();
+                if (!dRows[0]["image_name"].is_null()) dep["image_name"] = dRows[0]["image_name"].as<std::string>();
+                if (!dRows[0]["runtime_url"].is_null()) dep["runtime_url"] = dRows[0]["runtime_url"].as<std::string>();
                 payload["deployment"] = dep;
+
                 if (!payload.isMember("logs") && !dRows[0]["logs"].is_null()) {
                     payload["logs"] = dRows[0]["logs"].as<std::string>();
                 }
                 if (projectId.empty()) {
                     projectId = dRows[0]["project_id"].as<std::string>();
                 }
+                if (!payload.isMember("project") || !payload["project"].isObject()) {
+                    Json::Value proj(Json::objectValue);
+                    proj["id"] = dRows[0]["project_id"].as<std::string>();
+                    proj["name"] = dRows[0]["project_name"].is_null() ? "" : dRows[0]["project_name"].as<std::string>();
+                    payload["project"] = proj;
+                } else {
+                    payload["project"]["id"] = dRows[0]["project_id"].as<std::string>();
+                    if (!payload["project"].isMember("name") || payload["project"]["name"].asString().empty()) {
+                        payload["project"]["name"] = dRows[0]["project_name"].is_null() ? "" : dRows[0]["project_name"].as<std::string>();
+                    }
+                }
             }
         }
 
+        payload["workflow_type"] = workflowType;
         payload["project_id"] = projectId;
         payload["deployment_id"] = deploymentId;
 
         // Populate project context if project_id is set
-        if (!projectId.empty() && !payload.isMember("project")) {
+        if (!projectId.empty()) {
             const auto pRows = txn.exec_params(
                 "SELECT id, name, description, repo_url, status, source_type, source_path "
                 "FROM projects WHERE id = $1 AND (user_id = $2 OR has_project_access(id, $2))",
                 projectId, userId);
             if (!pRows.empty()) {
-                Json::Value proj(Json::objectValue);
+                Json::Value proj = payload.isMember("project") && payload["project"].isObject()
+                    ? payload["project"]
+                    : Json::Value(Json::objectValue);
                 proj["id"] = pRows[0]["id"].as<std::string>();
                 proj["name"] = pRows[0]["name"].as<std::string>();
                 proj["description"] = pRows[0]["description"].is_null() ? "" : pRows[0]["description"].as<std::string>();
@@ -223,21 +281,51 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
 
         if (!sessionId.empty()) {
             const auto sessions = txn.exec_params(
-                "SELECT id, title, project_id FROM ai_sessions WHERE id = $1 AND user_id = $2",
+                "SELECT id, title, project_id, deployment_id, session_type FROM ai_sessions WHERE id = $1 AND (user_id = $2 OR has_project_access(project_id, $2))",
                 sessionId,
                 userId);
             if (sessions.empty()) {
                 sessionId.clear();
+            } else {
+                if (projectId.empty() && !sessions[0]["project_id"].is_null()) {
+                    projectId = sessions[0]["project_id"].as<std::string>();
+                    payload["project_id"] = projectId;
+                }
+                if (deploymentId.empty() && !sessions[0]["deployment_id"].is_null()) {
+                    deploymentId = sessions[0]["deployment_id"].as<std::string>();
+                    payload["deployment_id"] = deploymentId;
+                }
+                if (!sessions[0]["session_type"].is_null() && !sessions[0]["session_type"].as<std::string>().empty()) {
+                    workflowType = sessions[0]["session_type"].as<std::string>();
+                    payload["workflow_type"] = workflowType;
+                }
+            }
+        }
+
+        if (!deploymentId.empty() && !payload.isMember("deployment")) {
+            const auto dRows = txn.exec_params(
+                "SELECT id, status, logs FROM deployments WHERE id = $1", deploymentId);
+            if (!dRows.empty()) {
+                Json::Value dep(Json::objectValue);
+                dep["id"] = dRows[0]["id"].as<std::string>();
+                dep["status"] = dRows[0]["status"].as<std::string>();
+                dep["logs"] = dRows[0]["logs"].is_null() ? "" : dRows[0]["logs"].as<std::string>();
+                payload["deployment"] = dep;
+                if (!payload.isMember("logs") || payload["logs"].asString().empty()) {
+                    payload["logs"] = dep["logs"];
+                }
             }
         }
         if (sessionId.empty()) {
             const std::string title = streamChatTitle(userMessage);
             const auto rows = txn.exec_params(
-                "INSERT INTO ai_sessions (user_id, project_id, title, session_type) "
-                "VALUES ($1, NULLIF($2, '')::uuid, $3, 'agent_chat') RETURNING id",
+                "INSERT INTO ai_sessions (user_id, project_id, title, session_type, deployment_id) "
+                "VALUES ($1, NULLIF($2, '')::uuid, $3, $4, NULLIF($5, '')::uuid) RETURNING id",
                 userId,
                 projectId,
-                title);
+                title,
+                workflowType.empty() ? "agent_chat" : workflowType,
+                deploymentId);
             sessionId = rows[0][0].as<std::string>();
         }
 
@@ -372,8 +460,12 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
                             failure["type"] = "error";
                             failure["error"] = error;
                             writer->send(sseFrame(failure));
-                        } else if (!sessionId.empty() && (!assembledContent->empty() || !assembledReasoning->empty() || !assembledToolCalls->empty())) {
-                            // Persist assistant message in database with full reasoning and tool calls
+                        }
+
+                        // Persist assistant message in database with full reasoning and tool calls
+                        // even if the stream terminated prematurely (e.g. timeout, disconnect),
+                        // so user actions and diagnostics are not lost.
+                        if (!sessionId.empty() && (!assembledContent->empty() || !assembledReasoning->empty() || !assembledToolCalls->empty())) {
                             try {
                                 auto conn = Database::getInstance().getConnection();
                                 pqxx::work txn(*conn);
@@ -382,9 +474,17 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
                                 if (!assembledToolCalls->empty()) meta["tool_calls"] = *assembledToolCalls;
                                 if (!doneModel->empty()) meta["model"] = *doneModel;
                                 if (!doneUsage->empty()) meta["token_usage"] = *doneUsage;
-                                std::string finalContent = assembledContent->empty()
-                                    ? "Completed workspace actions and diagnostic inspection. See the tool activity above for details."
-                                    : *assembledContent;
+                                if (!ok) meta["interrupted_reason"] = error;
+
+                                std::string finalContent = *assembledContent;
+                                if (finalContent.empty()) {
+                                    finalContent = !ok
+                                        ? "Completed workspace actions and diagnostic inspection before stream closed: " + error
+                                        : "Completed workspace actions and diagnostic inspection. See the tool activity above for details.";
+                                } else if (!ok) {
+                                    finalContent += "\n\n*(Stream ended: " + error + ")*";
+                                }
+
                                 txn.exec_params(
                                     "INSERT INTO ai_messages (session_id, role, content, metadata) VALUES ($1, 'assistant', $2, $3::jsonb)",
                                     sessionId,
@@ -409,6 +509,38 @@ void AiController::chatAgentStream(const drogon::HttpRequestPtr& req,
     response->addHeader("Connection", "keep-alive");
     response->addHeader("X-Accel-Buffering", "no");
     callback(response);
+}
+
+void AiController::stopAgentStream(const drogon::HttpRequestPtr& req,
+                                   std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+    const Json::Value auth = JwtHelper::verifyRequestToken(req);
+    if (auth.isNull() || !auth.isMember("user_id")) {
+        Json::Value err;
+        err["error"] = "Unauthorized";
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(err);
+        resp->setStatusCode(drogon::k401Unauthorized);
+        callback(resp);
+        return;
+    }
+
+    std::string sessionId = "default";
+    const auto body = req->getJsonObject();
+    if (body && body->isMember("session_id")) {
+        sessionId = (*body)["session_id"].asString();
+    }
+
+    BlockingTaskRunner::run([sessionId, callback]() {
+        Json::Value stopPayload(Json::objectValue);
+        stopPayload["session_id"] = sessionId;
+
+        const auto result = AiServiceClient::instance().postWorkflow("/chat/agent/stop", stopPayload);
+
+        Json::Value out(Json::objectValue);
+        out["status"] = result.ok ? "ok" : "error";
+        out["message"] = result.ok ? "Stream and browser testing stopped" : result.error;
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(out);
+        callback(resp);
+    });
 }
 
 }  // namespace stackpilot

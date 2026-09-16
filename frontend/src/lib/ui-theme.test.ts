@@ -14,6 +14,7 @@ import {
 beforeEach(() => {
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-ui-theme");
+  document.documentElement.classList.remove("dark");
 });
 
 describe("theme registry", () => {
@@ -134,5 +135,38 @@ describe("UI_THEME_INIT_SCRIPT", () => {
     for (const theme of UI_THEMES) {
       expect(UI_THEME_INIT_SCRIPT).toContain(JSON.stringify(theme));
     }
+  });
+
+  it("adds dark class if theme is stored as dark", () => {
+    window.localStorage.setItem("theme", "dark");
+    runInitScript();
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+  });
+
+  it("adds dark class if no theme is stored but system prefers dark", () => {
+    const origMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(prefers-color-scheme: dark)",
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+
+    try {
+      runInitScript();
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
+    } finally {
+      window.matchMedia = origMatchMedia;
+    }
+  });
+
+  it("does not add dark class if theme is stored as light", () => {
+    window.localStorage.setItem("theme", "light");
+    runInitScript();
+    expect(document.documentElement.classList.contains("dark")).toBe(false);
   });
 });

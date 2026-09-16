@@ -864,12 +864,17 @@ class SupervisorAgent:
             if extra.get("approved_tool") == tool_name:
                 return True
 
-        # 5. Check user message
+        # 5. Check user message or command
+        cmd_name = (getattr(request_data, "command", "") or "").lower()
+        if cmd_name in {"/repair", "/fix", "/terminal", "/run"}:
+            return True
+
         msg = (getattr(request_data, "message", "") or "").lower()
         approval_phrases = [
             "accept & run", "accept and run", "approve", "approved", "confirmed",
             "confirm", "run command", "proceed", "execute command", "permission granted",
-            "i approve", "yes, execute", "yes execute"
+            "i approve", "yes, execute", "yes execute", "/repair", "/fix", "repair",
+            "fix this", "fix the", "heal", "rebuild", "autonomous", "auto repair"
         ]
         if any(phrase in msg for phrase in approval_phrases):
             return True

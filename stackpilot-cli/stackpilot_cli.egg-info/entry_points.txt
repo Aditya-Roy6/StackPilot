@@ -1,0 +1,2 @@
+[console_scripts]
+stackpilot = stackpilot_cli.cli:app
